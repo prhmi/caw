@@ -27,3 +27,20 @@ Clip named PdAuto, language Pure Data, text:
    (Lead1 reads it with  kP caw "input1"  and declares it with { chn: "input1", range: (...) } in its own <caw>).
  Moving automation points makes the next Run clip / Play render the clip again. Sends are recorded as extra wav channels, 10 ms is not exact: they are baked, not live.
  You can also write the patch itself under the <caw> block instead of the load: line.
+
+
+Copies and inputs p4, p5 ... (x box)  - examples/pd/PdUnison.pd
+Same idea as a Csound clip with <caw> {p: ...} lines. The clip's x box = number of copies, all play together from the clip start.
+Put [inlet] objects in the patch. The RIGHT-most inlet is p4, the one to its left is p5, and so on (Pd sends right to left,
+so p4 arrives first and the left-most inlet, the "hot" one, comes last - build your sound on the left inlet).
+Clip text (x = 3):
+
+   load: C:/Users/you/caw/examples/pd/PdUnison.pd
+   <caw>
+   {p: 4, from: 300, +100}     copy 1 = 300 Hz, copy 2 = 400 Hz, copy 3 = 500 Hz   -> right inlet
+   {p: 5, from: 0.05}          every copy 0.05                                       -> left inlet
+   </caw>
+
+Lines: {p: 5, from: 0.05}  same value for all | {p: 5, from: 0, to: 1}  spread first..last | {p: 4, from: 100, +100} (also - * /)
+A p-field without a line gets 0. Inlets with no p-line are not touched when no line exists at all.
+In a MIDI clip (midi: "on") every note starts x copies: p4 = pitch, p5 = velocity unless a p-line sets them.

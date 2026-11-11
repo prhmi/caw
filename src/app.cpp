@@ -24,6 +24,7 @@
 #include <map>
 #include <set>
 #include <iomanip>
+#include <locale>
 #include <functional>
 #include <regex>
 #include <sstream>
@@ -2247,7 +2248,12 @@ struct PdJob {
     std::vector<std::pair<std::string, std::vector<double>>> autos;          // automation lane -> [r name], sampled 100 times a second
     bool midi = false;                                                       // midi: "on": the notes below are played inside the render
     std::vector<MidiNote> notes;                                             // absolute timeline seconds (clipMidiNotes)
+    int copies = 1;                                                          // the clip's x box: that many copies of the patch / synth play together
+    std::map<int, std::vector<double>> pv;                                   // <caw> {p: 5, ...} lines: p-number -> value of every copy
 };
+
+// Text of a number for a Pd message box / SuperCollider script (no exponent surprises, no locale commas)
+std::string numText(double v) { std::ostringstream o; o.imbue(std::locale::classic()); o << std::setprecision(9) << v; return o.str(); }
 std::vector<PdJob> g_pdQueue;
 PdJob g_pdCurrent;
 bool g_pdBusy = false;
@@ -2334,15 +2340,31 @@ bool startScJob(const PdJob& job) {
     o << std::setprecision(9);
     o << "(\nvar dur, sr, nch, def, events, opts;\n";
     o << "dur = " << std::max(0.05, job.dur) << "; sr = " << sr << "; nch = " << nCh << ";\n";
+    const int copies = std::min(256, std::max(1, job.copies));
     o << "try {\n";
-    o << "def = SynthDef(\\cawsc, {\n  var sig = {\n" << job.code << "\n  }.value;\n";
+    // p4, p5 ... (the <caw> {p: ...} lines, or the MIDI pitch / velocity) and indx / iRun are plain variables inside the code
+    o << "def = SynthDef(\\cawsc, {\n  var sig = {\n" << scParamDeclarations(job.code, job.pv) << job.code << "\n  }.value;\n";
     o << "  sig = sig.asArray;\n  if(sig.size == 1, { sig = [sig[0], sig[0]] });\n";
     o << "  sig = (sig ++ (0 ! nch)).keep(nch);\n";
     o << "  sig = sig.collect({ |s| if(s.rate == \\control, { K2A.ar(s) }, { s }) });\n";
     o << "  Out.ar(0, sig);\n});\n";
     o << "events = List.new;\nevents.add([0.0, [\\d_recv, def.asBytes]]);\n";
-    if (!job.midi) {
+    auto uses = [&](const char* word) { return std::regex_search(job.code, std::regex(std::string("\\b") + word + "\\b")); };
+    const bool usesIndx = uses("indx"), usesIRun = uses("iRun"), usesP4 = uses("p4"), usesP5 = uses("p5");
+    // extra synth arguments of copy i: the p-lines, the copy number and the number of copies
+    auto copyArgs = [&](int i) {
+        std::string a;
+        for (const auto& kv : job.pv) a += ", \\p" + std::to_string(kv.first) + ", " + numText(kv.second[(size_t)std::min(i, (int)kv.second.size() - 1)]);
+        if (usesIndx) a += ", \\indx, " + std::to_string(i);
+        if (usesIRun) a += ", \\iRun, " + std::to_string(copies);
+        return a;
+    };
+    if (!job.midi && copies == 1 && job.pv.empty()) {
         o << "events.add([0.0, [\\s_new, \\cawsc, 1000, 0, 0]]);\n";
+    } else if (!job.midi) {
+        // copies: node 1000 is a group (automation n_set reaches every copy), copy i is synth 1001 + i
+        o << "events.add([0.0, [\\g_new, 1000, 0, 0]]);\n";
+        for (int i = 0; i < copies; ++i) o << "events.add([0.0, [\\s_new, \\cawsc, " << (1001 + i) << ", 0, 1000" << copyArgs(i) << "]]);\n";
     } else {
         // MIDI: node 1000 is a group (automation n_set reaches every note), each note is its own synth with the controls
         // note (0..127), vel (1..127) and gate (1 while held, 0 at the note end). It is freed kMidiTail seconds after the gate closes.
@@ -2350,10 +2372,15 @@ bool startScJob(const PdJob& job) {
         int id = 1001;
         for (const MidiNote& n : job.notes) {
             const double off = std::max(n.start, n.start + n.dur - 0.0005);   // a hair early: a note that ends where the next starts closes first
-            o << "events.add([" << n.start << ", [\\s_new, \\cawsc, " << id << ", 0, 1000, \\note, " << n.pitch << ", \\vel, " << n.velocity << ", \\gate, 1]]);\n";
-            o << "events.add([" << off << ", [\\n_set, " << id << ", \\gate, 0]]);\n";
-            o << "events.add([" << (n.start + n.dur + kMidiTail) << ", [\\n_free, " << id << "]]);\n";
-            ++id;
+            for (int i = 0; i < copies; ++i) {   // every note starts x copies; p4 = pitch and p5 = velocity unless a {p: 4 / 5, ...} line sets them
+                std::string a = copyArgs(i);
+                if (usesP4 && !job.pv.count(4)) a += ", \\p4, " + std::to_string(n.pitch);
+                if (usesP5 && !job.pv.count(5)) a += ", \\p5, " + std::to_string(n.velocity);
+                o << "events.add([" << n.start << ", [\\s_new, \\cawsc, " << id << ", 0, 1000, \\note, " << n.pitch << ", \\vel, " << n.velocity << ", \\gate, 1" << a << "]]);\n";
+                o << "events.add([" << off << ", [\\n_set, " << id << ", \\gate, 0]]);\n";
+                o << "events.add([" << (n.start + n.dur + kMidiTail) << ", [\\n_free, " << id << "]]);\n";
+                ++id;
+            }
         }
     }
     for (const auto& au : job.autos) {
@@ -2363,7 +2390,7 @@ bool startScJob(const PdJob& job) {
     }
     // sort by time (equal times keep their order: d_recv first, a note's s_new before its n_set)
     o << "events = events.collect({ |e, i| [e[0], i, e[1]] }).sort({ |a, b| (a[0] < b[0]) or: { (a[0] == b[0]) and: { a[1] <= b[1] } } }).collect({ |e| [e[0], e[2]] });\n";
-    o << "opts = ServerOptions.new;\nopts.numOutputBusChannels = nch;\nopts.numInputBusChannels = 0;\n";
+    o << "opts = ServerOptions.new;\nopts.numOutputBusChannels = nch;\nopts.numInputBusChannels = 0;\nopts.maxNodes = 16384;\n";
     o << "Score.recordNRT(events.asArray, \"" << fwd((dir / (job.name + ".osc")).string()) << "\", \"" << fwd((dir / (job.name + ".wav")).string())
       << "\", nil, sr, \"WAV\", \"float\", opts, \"\", dur, { 0.exit });\n";
     o << "} { |err| err.reportError; \"ERROR: SuperCollider code failed\".postln; 1.exit };\n)\n";
@@ -2405,6 +2432,16 @@ bool startPdJob(const PdJob& job) {
     auto add = [&](const std::string& text) { objs.push_back("#X " + text + ";"); return (int)objs.size() - 1; };
     auto link = [&](int a, int ao, int b, int bi) { conns.push_back("#X connect " + std::to_string(a) + " " + std::to_string(ao) + " " + std::to_string(b) + " " + std::to_string(bi) + ";"); };
     const int nCh = 2 + (int)job.sends.size();
+    // ---- copies: the clip's x box = number of instances of the patch. The patch is an abstraction; its [inlet] objects are p4, p5 ...
+    // numbered from the RIGHT: p4 = right-most inlet, p5 = the one on its left ... (Pd delivers right to left, so p4 arrives first
+    // and the left-most inlet, the hot one, comes last). Every copy gets its values at load, before the sound starts.
+    const int nCopies = std::min(256, std::max(1, job.copies));
+    const int nIn = pdInletCount(job.code);
+    for (const auto& kv : job.pv)
+        if (kv.first - 4 >= nIn) logLine("[caw] Pure Data " + job.name + ": {p: " + std::to_string(kv.first) + "} needs " + std::to_string(kv.first - 3) + " [inlet] objects in the patch, it has " + std::to_string(nIn) + " (that line is ignored).");
+    if (nIn == 0 && !job.pv.empty()) logLine("[caw] Pure Data " + job.name + ": the <caw> {p: ...} lines need [inlet] objects in the patch (right-most inlet = p4).");
+    const bool sendP4 = job.midi && nIn >= 1 && !job.pv.count(4);   // MIDI clip: p4 = pitch, p5 = velocity unless a p-line sets them
+    const bool sendP5 = job.midi && nIn >= 2 && !job.pv.count(5);
     const int loadbang = add("obj 10 10 loadbang");
     const int msgDsp = add("msg 10 80 \\; pd dsp 1");
     const int msgStart = add("msg 330 80 bang");
@@ -2462,15 +2499,43 @@ bool startPdJob(const PdJob& job) {
             const double off = std::max(n.start, n.start + n.dur - 0.0005);   // note-off a hair early so a note that ends where the next starts closes first
             const std::string p = std::to_string(n.pitch), v = std::to_string(n.velocity);
             const int dOn = add("obj 10 " + std::to_string(y) + " del " + ms3(n.start));
-            const int mOn = add("msg 160 " + std::to_string(y) + " \\; midinote " + p + " " + v + " \\; midipitch " + p + " \\; midivel " + v + " \\; midigate 1");
+            const int mOn = add("msg 160 " + std::to_string(y) + " \\; midinote " + p + " " + v + " \\; midipitch " + p + " \\; midivel " + v + " \\; midigate 1" +
+                                (sendP4 ? " \\; caw_p4 " + p : std::string()) + (sendP5 ? " \\; caw_p5 " + v : std::string()));
             const int dOff = add("obj 450 " + std::to_string(y) + " del " + ms3(off));
-            const int mOff = add("msg 600 " + std::to_string(y) + " \\; midinote " + p + " 0 \\; midivel 0 \\; midigate 0");
+            const int mOff = add("msg 600 " + std::to_string(y) + " \\; midinote " + p + " 0 \\; midivel 0 \\; midigate 0" + (sendP5 ? " \\; caw_p5 0" : std::string()));
             link(midiGo, 0, dOn, 0); link(dOn, 0, mOn, 0);
             link(midiGo, 0, dOff, 0); link(dOff, 0, mOff, 0);
         }
     }
-    // one trigger runs everything at load, right to left: fill tables, start recording, dsp on, clock, end timer
+    // the copies of the patch and their p-values: [msg p_last ... p4( -> [unpack f f ..] -> inlet k of the copy (unpack outlet k = inlet k)
+    std::vector<int> copyMsgs, copyObjs;
+    for (int i = 0; i < nCopies; ++i) {
+        const int inst = add("obj " + std::to_string(10 + 160 * (i % 5)) + " " + std::to_string(260 + 80 * (i / 5)) + " cawpd_" + job.name);
+        copyObjs.push_back(inst);
+        if (nIn > 0 && !job.pv.empty()) {
+            std::string vals, unp = "obj " + std::to_string(10 + 160 * (i % 5)) + " " + std::to_string(240 + 80 * (i / 5)) + " unpack";
+            for (int inlet = 0; inlet < nIn; ++inlet) {          // list order = inlet order (left to right)
+                const int pn = 4 + (nIn - 1 - inlet);
+                const auto f = job.pv.find(pn);
+                vals += (inlet ? " " : "") + numText(f == job.pv.end() ? 0.0 : f->second[(size_t)std::min(i, (int)f->second.size() - 1)]);
+                unp += " f";
+            }
+            const int mg = add("msg " + std::to_string(10 + 160 * (i % 5)) + " " + std::to_string(220 + 80 * (i / 5)) + " " + vals);
+            const int up = add(unp);
+            link(mg, 0, up, 0);
+            for (int inlet = 0; inlet < nIn; ++inlet) link(up, inlet, inst, inlet);
+            copyMsgs.push_back(mg);
+        }
+    }
+    if (sendP4 || sendP5) {   // MIDI notes: [r caw_p4] pitch, [r caw_p5] velocity to every copy
+        for (int k = 0; k < (sendP5 ? 2 : 1); ++k) {
+            const int r = add("obj " + std::to_string(700 + 100 * k) + " 40 r caw_p" + std::to_string(4 + k));
+            for (int inst : copyObjs) link(r, 0, inst, nIn - 1 - k);
+        }
+    }
+    // one trigger runs everything at load, right to left: fill tables, p-values of the copies, start recording, dsp on, clock, end timer
     std::vector<int> order = fillMsgs;                       // executed first ... last
+    for (int mg : copyMsgs) order.push_back(mg);
     order.push_back(msgStart); order.push_back(msgDsp);
     if (clock >= 0) order.push_back(clock);
     if (midiGo >= 0) order.push_back(midiGo);
@@ -2480,8 +2545,7 @@ bool startPdJob(const PdJob& job) {
     const int trigger = add(trig);
     link(loadbang, 0, trigger, 0);
     for (size_t k = 0; k < order.size(); ++k) link(trigger, (int)(order.size() - 1 - k), order[k], 0);
-    const int userPatch0 = add("obj 10 260 cawpd_" + job.name);
-    (void)userPatch0; (void)ox; (void)oy;
+    (void)ox; (void)oy;
     std::string main = "#N canvas 0 50 900 600 12;\n";
     for (const std::string& o : objs) main += o + "\n";
     for (const std::string& c : conns) main += c + "\n";
@@ -2563,11 +2627,17 @@ void ensurePdRendered(std::function<void()> after) {
             }
             std::string sendText;
             for (const std::string& sn : sends) sendText += sn + ",";
-            const size_t hash = std::hash<std::string>()("v3|" + std::to_string(c.lang) + "|" + patch + "|" + std::to_string(jobDur) + "|" + std::to_string(g_proj.cs.sr) + "|" + autoText + "|" + sendText + "|" + (midi ? "midi|" + noteText : std::string()));
+            const int copies = std::min(256, std::max(1, c.runs));
+            const std::map<int, std::vector<double>> pv = cawCopyValues(c.code, copies);
+            std::string pvText = "x" + std::to_string(copies) + ":";
+            for (const auto& kv : pv) { pvText += "p" + std::to_string(kv.first) + "="; for (double v : kv.second) pvText += numText(v) + ","; pvText += ";"; }
+            const size_t hash = std::hash<std::string>()("v4|" + pvText + "|" + std::to_string(c.lang) + "|" + patch + "|" + std::to_string(jobDur) + "|" + std::to_string(g_proj.cs.sr) + "|" + autoText + "|" + sendText + "|" + (midi ? "midi|" + noteText : std::string()));
             const auto done = g_pdDone.find(c.name);
             std::error_code ec;
             if (done != g_pdDone.end() && done->second == hash && std::filesystem::exists(pdWavPath(c.name), ec)) continue;
             PdJob job{c.name, patch, extra, jobDur, hash, sends, c.lang, std::move(autos), midi, std::move(notes)};
+            job.copies = copies;
+            job.pv = pv;
             g_pdQueue.push_back(std::move(job));
         }
     g_afterPd = std::move(after);
@@ -5399,9 +5469,9 @@ bool languageCombo(const char* id, Clip& clip) {
         ImGui::EndCombo();
     }
     if (ImGui::IsItemHovered() && clip.lang == 1)
-        ImGui::SetTooltip("Pure Data: write the patch text (.pd), or one line  load: C:/patches  to load <folder>/<instrument name>.pd. A <caw> block adds automation ([r name]) and sends to Csound. With  midi: \"on\"  in the <caw> block the MIDI lane plays the patch: [r midinote] (pitch velocity, velocity 0 = note off), [r midipitch], [r midivel], [r midigate]. Rendered offline to a wav, [dac~] goes to the clip. Pd path: Settings.");
+        ImGui::SetTooltip("Pure Data: write the patch text (.pd), or one line  load: C:/patches  to load <folder>/<instrument name>.pd. A <caw> block adds automation ([r name]) and sends to Csound. With  midi: \"on\"  in the <caw> block the MIDI lane plays the patch: [r midinote] (pitch velocity, velocity 0 = note off), [r midipitch], [r midivel], [r midigate]. Inputs p4, p5 ...: put [inlet] objects in the patch, the RIGHT-most inlet is p4, the next one to its left p5 ... (Pd sends right to left, so p4 arrives first and the left inlet last). Values come from <caw> lines like {p: 4, from: 60, +4}, one value per copy (the x box); in a MIDI clip p4 = pitch and p5 = velocity unless a p-line sets them. Rendered offline to a wav, [dac~] goes to the clip. Pd path: Settings.");
     if (ImGui::IsItemHovered() && clip.lang == 2)
-        ImGui::SetTooltip("SuperCollider: the code is the body of a function, the last value is the sound: [left, right] (or mono). More values after the second are control signals that a  send:  line in the <caw> block delivers to a Csound clip. Automation lane  chn: \"cutoff\"  = \\cutoff.kr(440) in the code. With  midi: \"on\"  in the <caw> block the MIDI lane plays the code: one synth per note with \\note.kr(60) (0..127), \\vel.kr(100) (1..127) and \\gate.kr(1) (0 when the note ends); end it with EnvGen.kr(Env.adsr, gate, doneAction: 2). Rendered offline (Score.recordNRT). Program path: Settings.");
+        ImGui::SetTooltip("SuperCollider: the code is the body of a function, the last value is the sound: [left, right] (or mono). More values after the second are control signals that a  send:  line in the <caw> block delivers to a Csound clip. Automation lane  chn: \"cutoff\"  = \\cutoff.kr(440) in the code. With  midi: \"on\"  in the <caw> block the MIDI lane plays the code: one synth per note with \\note.kr(60) (0..127), \\vel.kr(100) (1..127) and \\gate.kr(1) (0 when the note ends); end it with EnvGen.kr(Env.adsr, gate, doneAction: 2). Rendered offline (Score.recordNRT). Inputs: p4, p5 ... and indx (copy number), iRun (number of copies) are ready-made variables in the code; <caw> lines like {p: 4, from: 60, +4} give every copy (x box) its value; in a MIDI clip p4 = pitch and p5 = velocity unless a p-line sets them. Program path: Settings.");
     return changed;
 }
 
@@ -5539,7 +5609,7 @@ void drawEditor() {
                     int runs = clip.runs;
                     ImGui::SetNextItemWidth(S(60));
                     if (ImGui::InputInt("##clip_runs", &runs, 0, 0)) clip.runs = std::min(256, std::max(1, runs));
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("How many times the instrument runs. With a dawrun line in the code: that many copies start together at the clip start (restart Csound after changing it). Without dawrun: the clip is split into this many equal slots.");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("How many times the instrument runs. Csound: with a <caw> {p: ...} / dawrun line that many copies start together at the clip start (restart Csound after changing it), without: the clip is split into this many equal slots. Pure Data / SuperCollider: that many copies of the patch / synth play together; the <caw> {p: 4, ...} lines give every copy its p4, p5 ... (Pd: [inlet] objects, right-most inlet = p4. SuperCollider: variables p4, p5 ..., indx, iRun).");
                 }
                 {   // score options of this clip
                     ImGui::SameLine();

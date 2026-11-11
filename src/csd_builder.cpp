@@ -336,6 +336,116 @@ double midiWavLength(const Project& p, int clipId) {
     return end + kMidiTail;
 }
 
+
+std::map<int, std::vector<double>> cawCopyValues(const std::string& clipCode, int copies) {
+    std::map<int, std::vector<double>> out;
+    const size_t a = clipCode.find("<caw>"), b = clipCode.find("</caw>");
+    if (a == std::string::npos || b == std::string::npos || b < a) return out;
+    const std::string block = clipCode.substr(a + 5, b - (a + 5));
+    const int n = std::min(256, std::max(1, copies));
+    static const std::regex pLine(R"re(\{\s*p\s*:\s*(\d+)\s*,([^}]*)\})re");
+    static const std::regex attr(R"re((\w+)\s*:\s*([^,}]+))re");
+    static const std::regex opRe(R"re((?:^|,)\s*([-+*/])\s*([^,}]+))re");
+    auto num = [](std::string v, double& d) {
+        const size_t f = v.find_first_not_of(" \t"), l = v.find_last_not_of(" \t");
+        if (f == std::string::npos) return false;
+        v = v.substr(f, l - f + 1);
+        char* end = nullptr;
+        d = std::strtod(v.c_str(), &end);
+        return end && *end == '\0';
+    };
+    for (std::sregex_iterator it(block.begin(), block.end(), pLine), end; it != end; ++it) {
+        const int pn = std::atoi((*it)[1].str().c_str());
+        if (pn < 4 || pn > 60) continue;
+        const std::string rest = (*it)[2].str();
+        std::map<std::string, std::string> at;
+        for (std::sregex_iterator ai(rest.begin(), rest.end(), attr), aend; ai != aend; ++ai) at[(*ai)[1].str()] = (*ai)[2].str();
+        std::smatch om;
+        double from = 0.0, to = 0.0, step = 0.0;
+        const bool hasFrom = at.count("from") && num(at["from"], from);
+        std::vector<double> v((size_t)n, 0.0);
+        if (std::regex_search(rest, om, opRe)) {
+            const std::string op = om[1].str();
+            if (!num(om[2].str(), step)) continue;
+            if (!hasFrom) from = (op == "*" || op == "/") ? 1.0 : 0.0;
+            for (int i = 0; i < n; ++i)
+                v[(size_t)i] = op == "+" ? from + i * step : op == "-" ? from - i * step : op == "*" ? from * std::pow(step, i) : from / std::pow(step, i);
+        } else if (hasFrom && at.count("to") && num(at["to"], to)) {
+            for (int i = 0; i < n; ++i) v[(size_t)i] = from + (to - from) * i / std::max(n - 1, 1);
+        } else if (hasFrom) {
+            for (int i = 0; i < n; ++i) v[(size_t)i] = from;
+        } else continue;
+        out[pn] = std::move(v);
+    }
+    return out;
+}
+
+int pdInletCount(const std::string& patch) {
+    int depth = 0, count = 0;
+    size_t pos = 0;
+    while (pos < patch.size()) {
+        size_t e = pos;
+        while (e < patch.size() && !(patch[e] == ';' && (e == 0 || patch[e - 1] != '\\'))) ++e;
+        std::istringstream words(patch.substr(pos, e - pos));
+        std::vector<std::string> w;
+        for (std::string t; words >> t;) w.push_back(t);
+        pos = e + 1;
+        if (w.size() >= 2 && w[0] == "#N" && w[1] == "canvas") ++depth;
+        else if (w.size() >= 2 && w[0] == "#X" && w[1] == "restore") --depth;
+        else if (depth == 1 && w.size() >= 5 && w[0] == "#X" && w[1] == "obj" && (w[4] == "inlet" || w[4] == "inlet~")) ++count;
+    }
+    return count;
+}
+
+std::string scParamDeclarations(const std::string& code, const std::map<int, std::vector<double>>& copyValues) {
+    // comments out, so "// p4 = pitch" does not declare anything
+    std::string clean;
+    {
+        std::istringstream in(code);
+        for (std::string l; std::getline(in, l);) { const size_t c = l.find("//"); clean += (c == std::string::npos ? l : l.substr(0, c)) + "\n"; }
+    }
+    std::set<int> ks;
+    for (const auto& kv : copyValues) ks.insert(kv.first);
+    static const std::regex pRe(R"re(\bp(\d{1,2})\b)re");
+    for (std::sregex_iterator it(clean.begin(), clean.end(), pRe), end; it != end; ++it) {
+        const int k = std::atoi((*it)[1].str().c_str());
+        if (k >= 4 && k <= 60) ks.insert(k);
+    }
+    // names the code declares itself:  var a = 1, b;   arg x, y = 2;
+    std::set<std::string> own;
+    {
+        static const std::regex declRe(R"re(\b(?:var|arg)\b([^;]*);)re");
+        for (std::sregex_iterator it(clean.begin(), clean.end(), declRe), end; it != end; ++it) {
+            const std::string list = (*it)[1].str();
+            int depth = 0;
+            bool wantName = true;
+            for (size_t i = 0; i < list.size(); ++i) {
+                const char ch = list[i];
+                if (ch == '(' || ch == '[' || ch == '{') ++depth;
+                else if (ch == ')' || ch == ']' || ch == '}') --depth;
+                else if (ch == ',' && depth == 0) wantName = true;
+                else if (wantName && (std::isalpha((unsigned char)ch) || ch == '_')) {
+                    size_t j = i;
+                    while (j < list.size() && (std::isalnum((unsigned char)list[j]) || list[j] == '_')) ++j;
+                    own.insert(list.substr(i, j - i));
+                    wantName = false;
+                    i = j - 1;
+                }
+            }
+        }
+    }
+    auto declared = [&](const std::string& name) { return own.count(name) > 0; };
+    std::string parts;
+    auto addVar = [&](const std::string& name, const std::string& def) {
+        if (declared(name)) return;
+        parts += (parts.empty() ? "" : ", ") + name + " = " + def;
+    };
+    for (int k : ks) addVar("p" + std::to_string(k), "\\p" + std::to_string(k) + ".ir(0)");
+    if (std::regex_search(clean, std::regex(R"re(\bindx\b)re"))) addVar("indx", "\\indx.ir(0)");
+    if (std::regex_search(clean, std::regex(R"re(\biRun\b)re"))) addVar("iRun", "\\iRun.ir(1)");
+    return parts.empty() ? std::string() : "var " + parts + ";\n";
+}
+
 ParsedTrack parseClip(const Clip& c, bool taps) {
     if (c.lang >= 1) {
         // Pure Data / SuperCollider clip: the app renders the patch to a wav (see the Pd render in the app); this instrument plays it.

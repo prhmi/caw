@@ -1,0 +1,20 @@
+SuperCollider clip with copies (x box) and inputs p4, p5 ...
+
+Clip language: SuperCollider, x = 3. Clip text:
+
+// p4 = frequency, p5 = pan: ready-made variables, one value per copy
+// indx = copy number (0, 1, 2), iRun = number of copies
+<caw>
+{p: 4, from: 300, +100}
+{p: 5, from: -0.8, to: 0.8}
+</caw>
+var env = EnvGen.kr(Env([0, 1, 1, 0], [0.1, 0.8, 0.1] * 3), 1);
+var sig = SinOsc.ar(p4, 0, 0.08 / iRun) * env;
+Pan2.ar(sig, p5)
+
+Copy 1 = 300 Hz left, copy 2 = 400 Hz centre, copy 3 = 500 Hz right.
+You do not declare p4 / p5 / indx / iRun: Caw puts  var p4 = \p4.ir(0), ...  in front of your code
+(only for the ones your code uses). If you write your own  var p4 = ...  Caw leaves it alone.
+
+MIDI clip (midi: "on"): every note starts x copies. p4 = note pitch, p5 = velocity unless a {p: 4 / 5, ...} line sets them.
+\note, \vel and \gate still work as before.

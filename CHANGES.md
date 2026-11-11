@@ -147,3 +147,13 @@
 - Full score export: one .html with all pages inside (print it to PDF, A4 landscape), plus _score_full_pNN.svg files.
 - Top bar: Play / Play Csound / time stay on the left, the rest is in three tabs (Edit, Project, Score), and a status pill (Csound running / starting / stopped, rendering) is always visible on the right.
 - Project format 16 (tempo, meter, merge by name, written notes, dynamics).
+
+## Pure Data / SuperCollider: copies (x box) and inputs p4, p5 ...
+- The clip's **x** box now works for Pure Data and SuperCollider clips like for Csound clips with `<caw>` p-lines: x copies of the patch / synth play together from the clip start (they are mixed into the clip's wav).
+- `<caw>` p-lines are the same as in Csound: `{p: 4, from: 300, +100}`, `{p: 5, from: 0, to: 1}`, `{p: 6, from: 0.1}` (also `-`, `*`, `/`). One value per copy. Only plain numbers (no Csound maths).
+- **Pure Data**: the patch is used as an abstraction. Its `[inlet]` / `[inlet~]` objects are the inputs, numbered from the right: **right-most inlet = p4**, next to the left = p5, and so on. Pd delivers right to left, so p4 arrives first and the left (hot) inlet last. A p-field without a line gets 0. Values are sent at load, before the sound starts. See examples/pd/PdUnison.pd.
+- **SuperCollider**: `p4`, `p5` ... (only the ones the code uses or the p-lines name), `indx` (copy number) and `iRun` (number of copies) are ready-made variables in the code (`var p4 = \p4.ir(0)` is put in front of your code; your own `var p4` is respected). See examples/sc/ScUnison.txt.
+- **MIDI + copies**: with `midi: "on"` every note starts x copies. p4 = pitch and p5 = velocity (Pd: inlets, SuperCollider: variables) unless a p-line sets them. `[r midinote]` etc. and `\note`, `\vel`, `\gate` work as before. Pd note-off sends p5 = 0.
+- Pd / SuperCollider clips with x > 1 saved before this change now play x copies (they used to play one).
+- SuperCollider NRT server: up to 16384 nodes (many notes x copies).
+- File `examples/3min_score_example.caw`: 3 minute piece with clips, MIDI notes and automation to test the score export (File > Open project).

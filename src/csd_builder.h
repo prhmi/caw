@@ -30,7 +30,17 @@ double autoValueAt(const std::vector<AutoPoint>& points, double time, double fal
 constexpr double kMidiTail = 2.0;                                                // seconds rendered after the last note (release time)
 std::vector<MidiNote> clipMidiNotes(const Project& p, int clipId);
 double midiWavLength(const Project& p, int clipId);                              // end of the last note + kMidiTail
-std::string pdWavPath(const std::string& name);                                  // the wav a Pure Data clip is rendered to
+std::string pdWavPath(const std::string& name);
+
+// ---- Pure Data / SuperCollider clips: the clip's x box = number of copies, the <caw> p-lines give every copy its p4, p5 ... values
+// (same lines as for a Csound clip: {p: 5, from: 0, to: 1}  {p: 6, from: 400, +100}).
+// Returns p-number -> one value per copy. Lines whose numbers are not plain numbers (Csound maths) are skipped.
+std::map<int, std::vector<double>> cawCopyValues(const std::string& clipCode, int copies);
+// Pure Data: number of [inlet] / [inlet~] objects on the top level of the patch text. Inlets are numbered by their x position,
+// left to right. p4 goes to the RIGHT-most inlet, p5 to the one left of it, ... (Pd sends right to left, so p4 arrives first).
+int pdInletCount(const std::string& patch);
+// SuperCollider: "var p4 = \\p4.ir(0), p5 = ...;" for every p-field the code (or a <caw> p-line) uses, plus indx / iRun when used.
+std::string scParamDeclarations(const std::string& code, const std::map<int, std::vector<double>>& copyValues);                                  // the wav a Pure Data clip is rendered to
 ParsedTrack parseClip(const Clip& c, bool taps = false);                       // a clip = one independent instr
 // Lane summary: union of every clip's <caw> channels (plus the lane template), midiEnabled if any clip uses MIDI.
 // body is empty; use parseClip for real instrument code.
