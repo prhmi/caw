@@ -1,0 +1,10 @@
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\CMAKEFILES\95C03D8809BC65C868FFAB6CE3418EDE\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/myWork/codes/cpp/caw/17_score_4 -BD:/myWork/codes/cpp/caw/17_score_4/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/myWork/codes/cpp/caw/17_score_4/build/Caw.slnx
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

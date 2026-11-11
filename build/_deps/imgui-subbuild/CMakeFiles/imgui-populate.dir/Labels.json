@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui-subbuild/CMakeFiles/imgui-populate"
+		},
+		{
+			"file" : "D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui-subbuild/CMakeFiles/4a21b281503bb70466a8bd970fe8919d/imgui-populate.rule"
+		},
+		{
+			"file" : "D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui-subbuild/CMakeFiles/c224a6f5c8fea5b5e618c068f52ad769/imgui-populate-complete.rule"
+		},
+		{
+			"file" : "D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui-subbuild/CMakeFiles/d2b6b0c70e65e36d47eb90d919057370/imgui-populate-build.rule"
+		},
+		{
+			"file" : "D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui-subbuild/CMakeFiles/d2b6b0c70e65e36d47eb90d919057370/imgui-populate-configure.rule"
+		},
+		{
+			"file" : "D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui-subbuild/CMakeFiles/d2b6b0c70e65e36d47eb90d919057370/imgui-populate-download.rule"
+		},
+		{
+			"file" : "D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui-subbuild/CMakeFiles/d2b6b0c70e65e36d47eb90d919057370/imgui-populate-install.rule"
+		},
+		{
+			"file" : "D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui-subbuild/CMakeFiles/d2b6b0c70e65e36d47eb90d919057370/imgui-populate-mkdir.rule"
+		},
+		{
+			"file" : "D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui-subbuild/CMakeFiles/d2b6b0c70e65e36d47eb90d919057370/imgui-populate-patch.rule"
+		},
+		{
+			"file" : "D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui-subbuild/CMakeFiles/d2b6b0c70e65e36d47eb90d919057370/imgui-populate-test.rule"
+		},
+		{
+			"file" : "D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui-subbuild/CMakeFiles/d2b6b0c70e65e36d47eb90d919057370/imgui-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"imgui-populate"
+		],
+		"name" : "imgui-populate"
+	}
+}

@@ -1,0 +1,10 @@
+// SuperCollider clip with MIDI. Paste all of this into a clip whose language is "SuperCollider".
+<caw>
+midi: "on"
+</caw>
+var note = \note.kr(60);     // pitch 0..127
+var vel  = \vel.kr(100) / 127;
+var gate = \gate.kr(1);      // 1 while the note is held, 0 when it ends
+var env  = EnvGen.kr(Env.adsr(0.01, 0.1, 0.7, 0.4), gate, doneAction: 2);
+var s = Saw.ar(note.midicps) * env * vel * 0.2;
+[s, s]

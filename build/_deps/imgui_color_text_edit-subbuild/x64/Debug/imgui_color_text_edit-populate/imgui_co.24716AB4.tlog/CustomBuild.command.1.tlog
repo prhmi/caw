@@ -1,0 +1,150 @@
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\_DEPS\IMGUI_COLOR_TEXT_EDIT-SUBBUILD\CMAKEFILES\2627A562F9C6C114C954A2B26054C3E2\IMGUI_COLOR_TEXT_EDIT-POPULATE-MKDIR.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -Dcfgdir=/Debug -P D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/imgui_color_text_edit-populate-prefix/tmp/imgui_color_text_edit-populate-mkdirs.cmake
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/imgui_color_text_edit-populate-prefix/src/imgui_color_text_edit-populate-stamp/Debug/imgui_color_text_edit-populate-mkdir
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\_DEPS\IMGUI_COLOR_TEXT_EDIT-SUBBUILD\CMAKEFILES\2627A562F9C6C114C954A2B26054C3E2\IMGUI_COLOR_TEXT_EDIT-POPULATE-DOWNLOAD.RULE
+setlocal
+cd D:\myWork\codes\cpp\caw\17_score_4\build\_deps
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE -P D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/imgui_color_text_edit-populate-prefix/tmp/imgui_color_text_edit-populate-gitclone.cmake
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/imgui_color_text_edit-populate-prefix/src/imgui_color_text_edit-populate-stamp/Debug/imgui_color_text_edit-populate-download
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\_DEPS\IMGUI_COLOR_TEXT_EDIT-SUBBUILD\CMAKEFILES\2627A562F9C6C114C954A2B26054C3E2\IMGUI_COLOR_TEXT_EDIT-POPULATE-UPDATE.RULE
+setlocal
+cd D:\myWork\codes\cpp\caw\17_score_4\build\_deps\imgui_color_text_edit-src
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -Dcan_fetch=YES -DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE -P D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/imgui_color_text_edit-populate-prefix/tmp/imgui_color_text_edit-populate-gitupdate.cmake
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\_DEPS\IMGUI_COLOR_TEXT_EDIT-SUBBUILD\CMAKEFILES\2627A562F9C6C114C954A2B26054C3E2\IMGUI_COLOR_TEXT_EDIT-POPULATE-PATCH.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/imgui_color_text_edit-populate-prefix/src/imgui_color_text_edit-populate-stamp/Debug/imgui_color_text_edit-populate-patch
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\_DEPS\IMGUI_COLOR_TEXT_EDIT-SUBBUILD\CMAKEFILES\2627A562F9C6C114C954A2B26054C3E2\IMGUI_COLOR_TEXT_EDIT-POPULATE-CONFIGURE.RULE
+setlocal
+cd D:\myWork\codes\cpp\caw\17_score_4\build\_deps\imgui_color_text_edit-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/imgui_color_text_edit-populate-prefix/src/imgui_color_text_edit-populate-stamp/Debug/imgui_color_text_edit-populate-configure
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\_DEPS\IMGUI_COLOR_TEXT_EDIT-SUBBUILD\CMAKEFILES\2627A562F9C6C114C954A2B26054C3E2\IMGUI_COLOR_TEXT_EDIT-POPULATE-BUILD.RULE
+setlocal
+cd D:\myWork\codes\cpp\caw\17_score_4\build\_deps\imgui_color_text_edit-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/imgui_color_text_edit-populate-prefix/src/imgui_color_text_edit-populate-stamp/Debug/imgui_color_text_edit-populate-build
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\_DEPS\IMGUI_COLOR_TEXT_EDIT-SUBBUILD\CMAKEFILES\2627A562F9C6C114C954A2B26054C3E2\IMGUI_COLOR_TEXT_EDIT-POPULATE-INSTALL.RULE
+setlocal
+cd D:\myWork\codes\cpp\caw\17_score_4\build\_deps\imgui_color_text_edit-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/imgui_color_text_edit-populate-prefix/src/imgui_color_text_edit-populate-stamp/Debug/imgui_color_text_edit-populate-install
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\_DEPS\IMGUI_COLOR_TEXT_EDIT-SUBBUILD\CMAKEFILES\2627A562F9C6C114C954A2B26054C3E2\IMGUI_COLOR_TEXT_EDIT-POPULATE-TEST.RULE
+setlocal
+cd D:\myWork\codes\cpp\caw\17_score_4\build\_deps\imgui_color_text_edit-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/imgui_color_text_edit-populate-prefix/src/imgui_color_text_edit-populate-stamp/Debug/imgui_color_text_edit-populate-test
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\_DEPS\IMGUI_COLOR_TEXT_EDIT-SUBBUILD\CMAKEFILES\83ED803F6082A7F721AA97FE4954AC9D\IMGUI_COLOR_TEXT_EDIT-POPULATE-COMPLETE.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E make_directory D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/CMakeFiles/Debug
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/CMakeFiles/Debug/imgui_color_text_edit-populate-complete
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/imgui_color_text_edit-populate-prefix/src/imgui_color_text_edit-populate-stamp/Debug/imgui_color_text_edit-populate-done
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\_DEPS\IMGUI_COLOR_TEXT_EDIT-SUBBUILD\CMAKEFILES\922E69CC60843F77EDDB70E35B715588\IMGUI_COLOR_TEXT_EDIT-POPULATE.RULE
+setlocal
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\_DEPS\IMGUI_COLOR_TEXT_EDIT-SUBBUILD\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild -BD:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild --check-stamp-file D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

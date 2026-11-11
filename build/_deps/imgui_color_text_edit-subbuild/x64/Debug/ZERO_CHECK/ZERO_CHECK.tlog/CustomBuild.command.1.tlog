@@ -1,0 +1,10 @@
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\_DEPS\IMGUI_COLOR_TEXT_EDIT-SUBBUILD\CMAKEFILES\922E69CC60843F77EDDB70E35B715588\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild -BD:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/imgui_color_text_edit-populate.slnx
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

@@ -1,0 +1,5 @@
+D:/myWork/codes/cpp/caw/17_score_4/build/CMakeFiles/imgui.dir
+D:/myWork/codes/cpp/caw/17_score_4/build/CMakeFiles/imgui_color_text_edit.dir
+D:/myWork/codes/cpp/caw/17_score_4/build/CMakeFiles/caw.dir
+D:/myWork/codes/cpp/caw/17_score_4/build/CMakeFiles/ALL_BUILD.dir
+D:/myWork/codes/cpp/caw/17_score_4/build/CMakeFiles/ZERO_CHECK.dir

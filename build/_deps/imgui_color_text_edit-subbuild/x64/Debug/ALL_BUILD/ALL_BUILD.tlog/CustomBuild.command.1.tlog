@@ -1,0 +1,10 @@
+^D:\MYWORK\CODES\CPP\CAW\17_SCORE_4\BUILD\_DEPS\IMGUI_COLOR_TEXT_EDIT-SUBBUILD\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild -BD:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild --check-stamp-file D:/myWork/codes/cpp/caw/17_score_4/build/_deps/imgui_color_text_edit-subbuild/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
