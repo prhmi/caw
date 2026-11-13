@@ -1771,8 +1771,62 @@ void drawMainMenuBar() {
     }
 }
 
+// ---- Finding the programs (Csound, Pure Data, SuperCollider) on this PC ----
+// A path typed in Settings is used only if that file exists on THIS computer (a project made on another PC carries that PC's paths).
+// Otherwise: the usual install folders are scanned (any folder whose name starts with the program's name, the newest name first),
+// then PATH. Nothing found -> the bare name is returned and the console says what to do.
+bool looksLikeFilePath(const std::string& t) { return t.find('/') != std::string::npos || t.find('\\') != std::string::npos; }
+
+std::string findInstalledExe(const char* folderPrefix, const std::vector<std::string>& relPaths, const char* exeName) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    std::vector<std::string> roots;
+    for (const char* var : {"ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "LOCALAPPDATA", "APPDATA"}) {
+        char buf[MAX_PATH * 2] = {};
+        if (GetEnvironmentVariableA(var, buf, (DWORD)sizeof(buf)) == 0) continue;
+        std::string r = buf;
+        if (std::string(var) == "LOCALAPPDATA") r += "\\Programs";
+        roots.push_back(r);
+    }
+    roots.push_back("C:\\Program Files"); roots.push_back("C:\\Program Files (x86)"); roots.push_back("C:\\");
+    auto lower = [](std::string t) { for (char& c : t) c = (char)std::tolower((unsigned char)c); return t; };
+    const std::string prefix = lower(folderPrefix);
+    std::vector<std::pair<std::string, fs::path>> hits;   // folder name, exe path
+    std::set<std::string> seen;
+    for (const std::string& root : roots) {
+        if (!fs::is_directory(root, ec)) continue;
+        for (const auto& entry : fs::directory_iterator(root, ec)) {
+            if (!entry.is_directory(ec)) continue;
+            const std::string folder = entry.path().filename().string();
+            if (lower(folder).rfind(prefix, 0) != 0) continue;
+            for (const std::string& rel : relPaths) {
+                const fs::path exe = entry.path() / rel;
+                if (fs::exists(exe, ec) && seen.insert(lower(exe.string())).second) { hits.push_back({folder, exe}); break; }
+            }
+        }
+    }
+    if (!hits.empty()) {
+        std::sort(hits.begin(), hits.end(), [&](const auto& a, const auto& b) { return lower(a.first) > lower(b.first); });   // Csound7 before Csound6
+        return hits.front().second.string();
+    }
+    char found[MAX_PATH * 2] = {};
+    if (SearchPathA(nullptr, exeName, nullptr, (DWORD)sizeof(found), found, nullptr) > 0) return found;
+    return std::string();
+}
+
+// The program to start: typed path (if the file exists here), else the search above, else the bare name.
+std::string resolveProgram(const std::string& typed, const char* bareName, const char* folderPrefix, const std::vector<std::string>& relPaths, const char* exeName) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!typed.empty() && typed != bareName && looksLikeFilePath(typed) && fs::exists(typed, ec)) return typed;
+    const std::string found = findInstalledExe(folderPrefix, relPaths, exeName);
+    if (!found.empty()) return found;
+    return typed.empty() ? std::string(bareName) : typed;   // not found anywhere: the start error tells the user what to do
+}
+
 std::string csoundExePath() {
-    return g_proj.cs.csoundExe.empty() ? std::string("csound") : g_proj.cs.csoundExe;
+    static const std::vector<std::string> rel = {"bin\\csound.exe", "csound.exe", "bin\\csound7.exe"};
+    return resolveProgram(g_proj.cs.csoundExe, "csound", "Csound", rel, "csound.exe");
 }
 
 // One monitor frame from the engine's CawMon instrument (arrives over UDP, see pollMonitor).
@@ -2247,14 +2301,8 @@ std::string pdPatchDir() {
 
 // The Pd program: the path from Settings; if it is empty or just "pd", the usual install folders are tried first.
 std::string pdExePath() {
-    namespace fs = std::filesystem;
-    const std::string typed = g_proj.cs.pdExe;
-    if (!typed.empty() && typed != "pd") return typed;
-    std::error_code ec;
-    for (const char* candidate : {"C:/Program Files/Pd/bin/pd.exe", "C:/Program Files (x86)/Pd/bin/pd.exe", "C:/Program Files/pd/bin/pd.exe",
-                                  "C:/Pd/bin/pd.exe", "C:/pd/bin/pd.exe"})
-        if (fs::exists(candidate, ec)) return candidate;
-    return "pd";
+    static const std::vector<std::string> rel = {"bin\\pd.exe", "pd.exe"};
+    return resolveProgram(g_proj.cs.pdExe, "pd", "Pd", rel, "pd.exe");
 }
 
 // A Pd clip holds either the patch text, or one line   load: C:/patches   (a folder: the file is <folder>/<instrument name>.pd)
@@ -2287,18 +2335,8 @@ bool resolvePdCode(const Clip& c, std::string& patch, std::string& extraPath, st
 
 // SuperCollider: the program from Settings; if it is empty or just "sclang", the usual install folders are tried first.
 std::string scExePath() {
-    namespace fs = std::filesystem;
-    const std::string typed = g_proj.cs.scExe;
-    if (!typed.empty() && typed != "sclang") return typed;
-    std::error_code ec;
-    for (const char* root : {"C:/Program Files", "C:/Program Files (x86)"}) {
-        if (!fs::is_directory(root, ec)) continue;
-        for (const auto& entry : fs::directory_iterator(root, ec)) {
-            const std::string folder = entry.path().filename().string();
-            if (folder.rfind("SuperCollider", 0) == 0 && fs::exists(entry.path() / "sclang.exe", ec)) return (entry.path() / "sclang.exe").string();
-        }
-    }
-    return "sclang";
+    static const std::vector<std::string> rel = {"sclang.exe"};
+    return resolveProgram(g_proj.cs.scExe, "sclang", "SuperCollider", rel, "sclang.exe");
 }
 
 // Renders a SuperCollider clip offline (Score.recordNRT). The clip code is the body of a function whose last value is the signal:
@@ -6265,7 +6303,7 @@ void drawSettings() {
         row("Csound executable");
         ImGui::SetNextItemWidth(S(330));
         inputStr("##exe", s.csoundExe, 0);
-        ImGui::TextDisabled("Full path to csound.exe, or just  csound  if it is on PATH.\nExample: C:\\Program Files\\Csound7\\bin\\csound.exe");
+        ImGui::TextDisabled("Full path to csound.exe. Leave it as  csound  and CAW looks for Csound in the usual install folders and on PATH by itself.\nA path from another computer is ignored if the file is not here.");
         row("Pure Data executable");
         ImGui::SetNextItemWidth(S(330));
         inputStr("##pdexe", s.pdExe, 0);

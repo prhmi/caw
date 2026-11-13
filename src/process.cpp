@@ -67,8 +67,12 @@ bool ProcessRunner::start(const std::string& commandLine, bool withInput) {
         DWORD e = GetLastError();
         CloseHandle(rd);
         if (inWr) CloseHandle(inWr);
-        d->err = "could not start the program (Windows error " + std::to_string(e) +
-                 "). Check the Csound executable path in Settings.";
+        std::string prog = commandLine;
+        if (!prog.empty() && prog[0] == '"') { const size_t q = prog.find('"', 1); prog = prog.substr(1, q == std::string::npos ? std::string::npos : q - 1); }
+        else prog = prog.substr(0, prog.find(' '));
+        d->err = "could not start \"" + prog + "\" (Windows error " + std::to_string(e) +
+                 (e == 2 ? ": the program was not found" : "") +
+                 "). Install it, or set its full path in Settings (Csound / Pure Data / SuperCollider program).";
         return false;
     }
     CloseHandle(pi.hThread);
