@@ -1,0 +1,11 @@
+#N canvas 0 50 500 340 12;
+#X obj 30 20 osc~ 220;
+#X obj 30 60 csbridge~ echo.csd 1 2;
+#X obj 30 110 *~ 0.2;
+#X obj 30 150 dac~;
+#X msg 200 20 chn cutoff 800;
+#X connect 0 0 1 0;
+#X connect 1 0 2 0;
+#X connect 1 1 3 1;
+#X connect 2 0 3 0;
+#X connect 4 0 1 0;
