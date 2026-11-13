@@ -1208,6 +1208,18 @@ void refreshAudioDevices() {
     if (!outError.empty()) logLine("[caw] Audio output devices: " + outError);
     else logLine("[caw] Found " + std::to_string(g_outDevs.size()) + " Csound output device(s).");
     if (!inError.empty()) logLine("[caw] Audio input devices: " + inError);
+    // A device number saved in a project belongs to the PC it was made on. If it is not in this PC's list, use the system default,
+    // otherwise Csound opens the wrong device (or none) and there is no sound.
+    auto known = [](const std::vector<AudioDevice>& list, int id) { for (const AudioDevice& d : list) if (d.id == id) return true; return false; };
+    if (outError.empty() && g_proj.cs.outDev >= 0 && !known(g_outDevs, g_proj.cs.outDev)) {
+        logLine("[caw] Audio output device " + std::to_string(g_proj.cs.outDev) + " of this project does not exist on this computer - using the system default.");
+        g_proj.cs.outDev = -1;
+    }
+    if (inError.empty() && g_proj.cs.inDev >= 0 && !known(g_inDevs, g_proj.cs.inDev)) {
+        logLine("[caw] Audio input device " + std::to_string(g_proj.cs.inDev) + " of this project does not exist on this computer - using the system default.");
+        g_proj.cs.inDev = -1;
+    }
+    if (!g_proj.cs.options.empty()) syncOptionsFromSettings(g_proj.cs);   // the typed options line must not keep the old -odacN
 }
 
 // ---------------------------------------------------------------- undo / redo
@@ -2247,6 +2259,10 @@ void tickTimeline(float dt) {
     collectTimelineEvents(g_schedT, t1, false, g_play, out);
     g_schedT = t1;
     if (!out.empty() && !sendOsc(out)) logLine("[caw] Could not send timeline events to Csound (UDP socket error).");
+    static int sentLogged = 0;   // diagnostics: the first events of each Play (compare with the "i ..." lines Csound prints when it receives them)
+    if (g_play < 0.5 + dt) sentLogged = 0;
+    for (const OscMsg& m : out)
+        if (m.address == "/caw/i" && sentLogged < 8) { ++sentLogged; logLine("[caw] timeline -> Csound: " + m.name + " (in " + std::to_string(m.values.empty() ? 0.f : m.values[0]) + " s, for " + std::to_string(m.values.size() > 1 ? m.values[1] : 0.f) + " s)"); }
 }
 
 // Opcodes found in the code (opcode MyUdo, ...) or reported by "csound -z"; the editors refresh their colors when this grows.
