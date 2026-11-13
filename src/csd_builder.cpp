@@ -198,12 +198,18 @@ ParsedTrack parseCodeUncached(const std::string& instrName, const std::string& s
     std::string code = sourceCode;
 
     // 1) extract <caw> ... </caw>
+    std::string recVar;                 // <caw> { rec: kLfo }
     std::map<int, std::string> pMath;   // copies: p-field number -> Csound expression built from  {p: 6, from: 400, +100}  lines
     size_t a = code.find("<caw>"), b = code.find("</caw>");
     if (a != std::string::npos && b != std::string::npos && b > a) {
         std::string block = code.substr(a + 5, b - (a + 5));
         static const std::regex midiOn(R"re(midi\s*:\s*"on")re", std::regex_constants::icase);
         out.midiEnabled = std::regex_search(block, midiOn);
+        {   // { rec: kLfo }  = send this variable to the automation (Capture / Rec); same as  chnset kLfo, "rec"  at the end of the instrument
+            static const std::regex recVarRe(R"re(\{\s*rec\s*:\s*([A-Za-z_]\w*)\s*\})re");
+            std::smatch rm;
+            if (std::regex_search(block, rm, recVarRe)) recVar = rm[1].str();
+        }
         code.replace(a, (b + 6) - a, std::string((size_t)std::count(code.begin() + (long)a, code.begin() + (long)(b + 6), '\n'), '\n'));   // keep the line count: error lines match the editor
 
         // { chn: "input1", range: (0,127,0.1) }   or   { chn: "input1", range: (0,127,0.1), value: 60 }
@@ -274,7 +280,12 @@ ParsedTrack parseCodeUncached(const std::string& instrName, const std::string& s
         bool changed = false;
         while (std::getline(in, line)) {
             std::smatch m;
-            if (std::regex_match(line, m, scoreSend)) {
+            static const std::regex recSend(R"re(^(\s*chnset\s+)([^,;]+?)(\s*,\s*)"rec"(.*)$)re");
+            if (std::regex_match(line, m, recSend)) {
+                out.hasRec = true;
+                line = m[1].str() + m[2].str() + m[3].str() + "\"" + channelName(instrName, "rec") + "\"" + m[4].str();
+                changed = true;
+            } else if (std::regex_match(line, m, scoreSend)) {
                 const std::string expr = m[2].str();
                 const size_t f = expr.find_first_not_of(" \t");
                 const char ch = f == std::string::npos ? 'k' : expr[f];
@@ -286,6 +297,11 @@ ParsedTrack parseCodeUncached(const std::string& instrName, const std::string& s
             rebuilt += line + "\n";
         }
         if (changed) result = rebuilt;
+    }
+    if (!recVar.empty()) {
+        if (!result.empty() && result.back() != '\n') result += '\n';
+        result += "chnset " + recVar + ", \"" + channelName(instrName, "rec") + "\"\n";
+        out.hasRec = true;
     }
     if (!pMath.empty()) {   // the <caw> copies lines become one cawRun line on top of the code
         std::string line = "cawRun ";
@@ -516,6 +532,16 @@ ParsedTrack parseClip(const Clip& c, bool taps) {
             if (want) out.pdSends.push_back({"score", c.name, "score"});
             for (const PdSend& sd : out.pdSends) if (sd.name == "score" && sd.to == c.name && sd.chn == "score") out.scoreSig = 1;
         }
+        // automation data:  Pd  [s rec]  is found by itself;  Pd and SuperCollider  <caw> { send: "rec" }  sends the control values (after the second
+        // output, in the order of the sends) to the channel "rec" of this clip. Capture / Rec write them into an automation lane.
+        {
+            static const std::regex recOnly(R"re(\{\s*send:\s*"rec"\s*\})re");
+            static const std::regex pdRec(R"re(\bs\s+rec\b)re");
+            bool want = std::regex_search(block, recOnly) || (c.lang == 1 && std::regex_search(c.code, pdRec));
+            for (const PdSend& sd : out.pdSends) if (sd.name == "rec") want = false;
+            if (want) out.pdSends.push_back({"rec", c.name, "rec"});
+            for (const PdSend& sd : out.pdSends) if (sd.name == "rec" && sd.to == c.name && sd.chn == "rec") out.hasRec = true;
+        }
         // the wav holds L, R and one extra channel per send (control values as a signal, 32-bit float)
         std::string outs = "aPdL, aPdR";
         for (size_t k = 0; k < out.pdSends.size(); ++k) outs += ", aPdS" + std::to_string(k + 1);
@@ -560,6 +586,7 @@ ParsedTrack parseTrack(const Track& t) {
     }
     auto merge = [&out](const ParsedTrack& p) {
         out.midiEnabled = out.midiEnabled || p.midiEnabled;
+        out.hasRec = out.hasRec || p.hasRec;
         for (const CawParam& param : p.params) {
             const bool known = std::any_of(out.params.begin(), out.params.end(),
                 [&param](const CawParam& q) { return q.chn == param.chn; });
@@ -759,6 +786,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                     const double initial = it == t.automation.end() ? c.value : automationValueAt(it->second, fromTime, c.value);
                     o << "chnset " << initial << ", \"" << fullName << "\"\n";
                 }
+                if (pc.hasRec) o << "chn_k \"" << channelName(clip.name, "rec") << "\", 3\n";
                 o << "\ninstr " << clip.name << "\n";
                 if (spans) {
                     const std::string so = o.str();
@@ -1007,6 +1035,23 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
             }
             sendList("/caw/l", 0, scopeL);
             sendList("/caw/r", 0, scopeR);
+            {   // live Rec: the value each clip sends to its channel "rec", 50 times per second ("/caw/c": start index + values)
+                const std::vector<std::string> recNames = recClipNames(p);
+                if (!recNames.empty()) {
+                    mon << "kRecTrig metro 50\nkRecCnt init 0\nif kRecTrig == 1 then\nkRecCnt = kRecCnt + 1\nendif\n";
+                    std::vector<std::string> vars;
+                    for (size_t k = 0; k < recNames.size(); ++k) {
+                        mon << "kRecV" << k << " chnget \"" << channelName(recNames[k], "rec") << "\"\n";
+                        vars.push_back("kRecV" + std::to_string(k));
+                    }
+                    for (size_t i = 0; i < vars.size(); i += 16) {
+                        const size_t n = std::min<size_t>(16, vars.size() - i);
+                        mon << "OSCsend kRecCnt, \"127.0.0.1\", " << kCawMonPort << ", \"/caw/c\", \"i" << std::string(n, 'f') << "\", " << (int)i;
+                        for (size_t k = 0; k < n; ++k) mon << ", " << vars[i + k];
+                        mon << "\n";
+                    }
+                }
+            }
             mon << "endin\n\n";
             o << mon.str();
             score << "i \"CawMon\" 0 86400\n";   // the monitor runs for the whole engine session (it is the last instrument defined)
@@ -1057,6 +1102,34 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
     return o.str();
 }
 
+
+std::vector<std::string> recClipNames(const Project& p) {
+    std::vector<std::string> out;
+    for (const Track& t : p.tracks)
+        for (const Clip& c : t.clips)
+            if (parseClip(c).hasRec && std::find(out.begin(), out.end(), c.name) == out.end()) out.push_back(c.name);
+    return out;
+}
+
+std::string buildClipCaptureCsd(const Project& p, const Clip& clip, const std::string& outFile, double dur) {
+    const ParsedTrack pc = parseClip(clip, false);
+    std::string file = outFile;
+    for (char& ch : file) if (ch == '\\') ch = '/';
+    std::ostringstream o;
+    o << "<CsoundSynthesizer>\n<CsOptions>\n-n -d\n</CsOptions>\n<CsInstruments>\n" << buildHeader(p.cs) << "\n";
+    for (const CawParam& c : pc.params) {
+        const std::string fullName = channelName(clip.name, c.chn);
+        o << "chn_k \"" << fullName << "\", 3\n" << "chnset " << c.value << ", \"" << fullName << "\"\n";
+    }
+    const std::string rec = channelName(clip.name, "rec");
+    o << "chn_k \"" << rec << "\", 3\n\ninstr " << clip.name << "\n" << pc.body << "\nendin\n\n"
+      << "instr CawRec\nkRT times\nkRM metro 100\nkRV chnget \"" << rec << "\"\n"
+      << "if kRM == 1 then\nfprintks \"" << file << "\", \"%f %f\\n\", kRT, kRV\nendif\nendin\n"
+      << "</CsInstruments>\n<CsScore>\ni \"" << clip.name << "\" 0 " << dur;
+    if (pc.midiEnabled && clip.lang == 0) o << " 60 100";
+    o << "\ni \"CawRec\" 0 " << dur << "\ne\n</CsScore>\n</CsoundSynthesizer>\n";
+    return o.str();
+}
 
 // A CSD with only this clip's instrument, played once, no audio output (-n): a quick syntax / init check.
 std::string buildClipTestCsd(const Project& p, const Clip& clip, OrcSpan& span) {

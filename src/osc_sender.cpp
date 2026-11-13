@@ -83,6 +83,7 @@ void parseMonitorPacket(const char* d, size_t n, std::vector<MonPacket>& out) {
     else if (addr == "/caw/s") m.tag = 'S';
     else if (addr == "/caw/l") m.tag = 'L';
     else if (addr == "/caw/r") m.tag = 'R';
+    else if (addr == "/caw/c") m.tag = 'C';
     else return;
     bool first = true;
     for (char t : tags) {

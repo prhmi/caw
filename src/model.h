@@ -94,6 +94,7 @@ struct TrackMark {
     int size = 100;      // size of the box / shape in percent (40 .. 400)
     int ratio = 100;     // swell / fade shapes: curve of the edges in percent (30 .. 300, 100 = straight)
     int font = 0;        // font size of the text in the score and on the timeline (6 .. 40, 0 = default 9)
+    bool border = false; // graph track: draw a thin border around the item in the score (the timeline always shows it with a light background)
     int scorePos = 0;    // in the score: 0 not shown, 1 above the lane, 2 below the lane (marker track: its lane is the lane with the same name; graph track: its own lane)
 };
 

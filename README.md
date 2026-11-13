@@ -40,3 +40,14 @@ Offline / download fails: download these two from GitHub as zip, unpack them int
 - Graph items: a text box beside the shape (a few letters, with Font size), and a Ratio (30 to 300 %) that bends the edges of Swell, Fade and Swell and fade.
 - Marker type Span bracket: a horizontal line with 90 degree ends (down with the comment above, or up with the comment below), the comment centred on it. Length = drag on the timeline.
 - The text of a graph item starts right at the edge of its shape, so a note sign is followed directly by its letters (#A).
+
+## Automation: LFO and reshape
+- **Reshape dots**: select two or more dots (box-select), then double-click or right-click one. Depth start / end (a wave that slowly gets wider or narrower), time stretch, move up / down, and Wave (Square, Triangle, Sine, Soft square) with an Amount slider to morph the drawn wave into another one. Everything is live; Reset goes back to the dots as they were when the box opened.
+- The small arrow (left of +) folds the automation sub-tracks and the MIDI track.
+
+## Automation: waves, handles, Capture and Rec
+- **Wave...** (button in the clip editor, bottom row): pick the lane, shape (sine, triangle, square, saw up / down), rate, depth, centre and the time. A white ghost line shows the result on the lane; **Write dots** puts it there as normal dots (dots in that time are replaced) and selects them.
+- **Drag handles** (every time two or more dots are selected): top handle = depth (Shift while dragging = ramp, the wave slowly widens or narrows), right handle = time stretch, bottom handle = morph (up = towards square, down = towards triangle). The dots stay normal dots: edit them by hand afterwards.
+- **Send data to the automation** (inside `<caw>`): Csound `{ rec: kLfo }` (any k variable; `chnset kLfo, "rec"` in the code works too), Pure Data `{ send: "rec" }` (or an `[s rec]` object in the patch), SuperCollider `{ send: "rec" }` and return the value after left and right: `[l, r, lfo]`. With more than one send the extra values follow the order: your own `send ... to ...` lines, `score`, then `rec`.
+- **Capture...** (all three languages): runs the clip silently (as fast as possible) and writes the signal into a lane as dots, thinned to the shape (at most 1500 dots). Option: scale the signal to the lane range. Pd / SuperCollider clips are rendered first (Run or Play once).
+- **R button** on an automation sub-track (lanes of tracks whose code sends to "rec"): live Rec. Start Csound with Run, arm R, press Play. When you stop, the live values of the signal are written into the lane. Offline Capture is more exact; use Rec for things that happen live.

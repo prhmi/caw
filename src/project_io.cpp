@@ -28,7 +28,7 @@ bool readString(std::istream& in, std::string& value) {
 namespace {
 void writeProject(std::ostream& out, const Project& p) {
     const CsoundSettings& s = p.cs;
-    out << "CAW_PROJECT 28\n"
+    out << "CAW_PROJECT 29\n"
         << s.sr << ' ' << s.ksmps << ' ' << s.nchnls << ' ' << s.nchnlsIn << ' '
         << std::setprecision(17) << s.zdbfs << ' ' << s.a4 << ' ' << s.bufSW << ' ' << s.bufHW << ' '
         << s.outDev << ' ' << s.inDev << ' ' << s.renderFormat << ' ' << s.tail << ' '
@@ -190,6 +190,12 @@ void writeProject(std::ostream& out, const Project& p) {
         out << t.marks.size() << '\n';
         for (const TrackMark& m : t.marks) out << m.ratio << '\n';
     }
+    // version 29: border of the graph items in the score
+    out << "MARKS6\n";
+    for (const Track& t : p.tracks) {
+        out << t.marks.size() << '\n';
+        for (const TrackMark& m : t.marks) out << (m.border ? 1 : 0) << '\n';
+    }
     // version 27: automation points inside a Pen 2 stroke (no dot)
     out << "AUTOLINE\n";
     for (const Track& t : p.tracks)
@@ -266,7 +272,7 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
     Project candidate;
     std::string magic;
     int version = 0;
-    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 28)) {
+    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 29)) {
         error = "This is not a supported CAW project file.";
         return false;
     }
@@ -679,6 +685,19 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
             for (TrackMark& m : t.marks) {
                 if (!(in >> m.ratio)) { error = "A marker ratio is invalid."; return false; }
                 m.ratio = std::min(300, std::max(30, m.ratio));
+            }
+        }
+    }
+    if (version >= 29) {
+        std::string marker;
+        if (!(in >> marker) || marker != "MARKS6") { error = "The marker block (6) is invalid."; return false; }
+        for (Track& t : candidate.tracks) {
+            size_t n = 0;
+            if (!(in >> n) || n != t.marks.size()) { error = "A marker entry is invalid."; return false; }
+            for (TrackMark& m : t.marks) {
+                int b = 0;
+                if (!(in >> b)) { error = "A marker border is invalid."; return false; }
+                m.border = b != 0;
             }
         }
     }

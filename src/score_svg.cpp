@@ -600,7 +600,7 @@ struct Auto {
 struct SrcClip { const Track* t; const Clip* c; int row; };
 struct SrcMidi { const Track* t; const MidiClip* m; const Clip* c; };
 
-struct ScoreItem { double t, dur; std::string text, color; int kind, type, shape, lang, pos, size, font, ratio; };   // kind = track kind (1 marker, 2 graph)   // marker / graph track item shown above (1) or below (2) its lane
+struct ScoreItem { double t, dur; std::string text, color; int kind, type, shape, lang, pos, size, font, ratio; bool border = false; };   // kind = track kind (1 marker, 2 graph)   // marker / graph track item shown above (1) or below (2) its lane
 
 struct RLane {
     std::vector<ScoreItem> items;
@@ -814,7 +814,7 @@ struct Renderer {
                     it.t = mk.t; it.dur = std::max(0.2, mk.dur);
                     it.text = mk.text; for (char& ch : it.text) if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
                     it.color = hex((mk.color & 0xFFFFFF) ? (mk.color & 0xFFFFFF) : rgb);
-                    it.kind = t.kind; it.type = mk.type; it.shape = mk.shape; it.lang = mk.lang; it.pos = mk.scorePos; it.size = mk.size; it.font = mk.font; it.ratio = mk.ratio;
+                    it.kind = t.kind; it.type = mk.type; it.shape = mk.shape; it.lang = mk.lang; it.pos = mk.scorePos; it.size = mk.size; it.font = mk.font; it.ratio = mk.ratio; it.border = mk.border;
                     l.items.push_back(it);
                 }
             };
@@ -1276,6 +1276,7 @@ struct Renderer {
             const double y0 = yb + (band - hh) / 2, y1 = y0 + hh, ym = (y0 + y1) / 2;
             const std::string& c = it.color;
             if (it.kind == 2) {   // graph shape, with its text beside it
+                if (it.border) s.rect(xa - 1, y0 - 1, xb - xa + 2, hh + 2, "", 0.0, c, 0.9);   // optional thin border
                 drawPrims(it.shape, xa, y0, xb, y1, c, it.ratio / 100.0);
                 if (!it.text.empty()) { const double gfs = itemFont(it, 9.0); s.text(markgfx::shapeRight(it.shape, xa, y0, xb, y1, it.ratio / 100.0) + 4, y1 - (hh - gfs * 0.7) / 2, it.text, gfs, "#111111", false, "start", true); }
                 continue;

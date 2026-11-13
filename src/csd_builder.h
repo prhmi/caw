@@ -19,6 +19,7 @@ struct ParsedTrack {
     std::vector<int> lineMap;          // body line (0-based) -> line of the clip code (1-based, 0 = generated); kept in step with the meter taps
     std::vector<PdSend> pdSends;       // Pure Data clips: values the patch sends to a Csound instrument's <caw> channel
     int scoreSig = 0;                   // the code sends to the channel "score": 0 none, 1 number (k / i), 2 signal (a), 3 string
+    bool hasRec = false;                // the code sends to the channel "rec" (chnset kVal, "rec"): recorded into an automation lane (Capture / Rec)
     int outChannels = 0;                // output channels found in out / outs / outq / outch ... (only when taps are on)
 };
 
@@ -58,6 +59,10 @@ ParsedTrack parseTrack(const Track& t);
 inline int masterChannels(const CsoundSettings& s) { return s.nchnls < 1 ? 1 : (s.nchnls > 64 ? 64 : s.nchnls); }
 struct LaneMeterInfo { int trackId = 0; int first = 0; int channels = 0; };
 std::vector<LaneMeterInfo> meterLayout(const Project& p);
+// Clips (unique names, project order) whose code sends to the channel "rec": the engine monitor streams them to the app for the live Rec button.
+std::vector<std::string> recClipNames(const Project& p);
+// A CSD that runs ONE clip without audio (-n, as fast as possible) and writes "time value" lines of its "rec" channel (100 per second) to outFile.
+std::string buildClipCaptureCsd(const Project& p, const Clip& clip, const std::string& outFile, double dur);
 constexpr int kMeterBands = 64;     // spectrum bands sent by the monitor instrument (25 Hz .. 18 kHz, logarithmic)
 constexpr int kScopePoints = 128;    // scope points per channel
 

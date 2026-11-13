@@ -333,7 +333,7 @@ bool trackHasMidi(const Track& track) {
     for (const Clip& c : track.clips) if (parseClip(c).midiEnabled) return true;
     return false;
 }
-bool midiShown(const Track& track) { return !track.midiHidden && trackHasMidi(track); }
+bool midiShown(const Track& track) { return g_collapsedAuto.count(track.id) == 0 && !track.midiHidden && trackHasMidi(track); }   // the arrow folds the MIDI track too
 
 float automationHeightSum(const Track& track) {
     float total = 0.f;
@@ -749,6 +749,214 @@ void laneValueRange(const Track& track, const std::string& channel, double& lo, 
         initial = p.value;
         return;
     }
+}
+
+// ---------------------------------------------------------------- wave generator, drag handles, Capture and live Rec (helpers)
+struct RecBuf { int trackId = 0; std::string channel; std::vector<AutoPoint> s; };
+std::set<std::pair<int, std::string>> g_recArm;   // lanes armed with the R button (track id, channel)
+std::vector<RecBuf> g_recBufs;                    // dots being recorded while the timeline plays
+std::vector<std::string> g_recNames;              // clips that send to the channel "rec", in the order the engine monitor streams them
+
+struct CaptureJob { bool on = false; int trackId = 0, clipId = 0; std::string channel, file; bool fit = false; double start = 0.0, dur = 0.0; };
+CaptureJob g_cap;
+ProcessRunner g_capProc;
+
+struct WaveUi { int ch = 0; int shape = 0; float rate = 1.f, depth = 50.f, center = 50.f; bool whole = true; double t0 = 0.0, t1 = 4.0; };
+WaveUi g_waveUi;
+struct WavePreview { int frame = -1000; int trackId = -1; std::string channel; std::vector<AutoPoint> pts; };
+WavePreview g_wavePrev;   // ghost line of the wave that the Wave... box would write
+
+struct WaveHandleDrag {
+    bool active = false; int kind = 0;   // 1 depth, 2 time stretch, 3 wave shape
+    int trackId = 0; std::string channel; std::vector<int> idx; std::vector<AutoPoint> orig;
+    double center = 0.0, lo = 0.0, hi = 1.0; float handleY = 0.f, startY = 0.f;
+};
+WaveHandleDrag g_wh;
+
+void ensureAutoLane(Track& t, const std::string& channel) {
+    if (t.automation.find(channel) == t.automation.end()) {
+        t.automation.emplace(channel, std::vector<AutoPoint>{});
+        t.automationHeights[channel] = kAutomationLaneH;
+    }
+    t.hiddenAutomation.erase(channel);
+    g_collapsedAuto.erase(t.id);
+}
+
+void replaceDotsInRange(std::vector<AutoPoint>& lane, double t0, double t1, const std::vector<AutoPoint>& fresh) {
+    lane.erase(std::remove_if(lane.begin(), lane.end(), [&](const AutoPoint& p) { return p.t >= t0 - 1e-9 && p.t <= t1 + 1e-9; }), lane.end());
+    lane.insert(lane.end(), fresh.begin(), fresh.end());
+    std::stable_sort(lane.begin(), lane.end(), [](const AutoPoint& a, const AutoPoint& b) { return a.t < b.t; });
+}
+
+// the new dots are selected, so the drag handles show up right away
+void selectDotsInRange(const Track& t, const std::string& channel, double t0, double t1) {
+    const auto it = t.automation.find(channel);
+    if (it == t.automation.end()) return;
+    g_autoSel.clear(); g_autoSelMulti.clear();
+    g_autoSelTrackId = t.id; g_autoSelChannel = channel;
+    for (int i = 0; i < (int)it->second.size(); ++i)
+        if (it->second[(size_t)i].t >= t0 - 1e-9 && it->second[(size_t)i].t <= t1 + 1e-9) g_autoSel.insert(i);
+}
+
+// Ramer-Douglas-Peucker on the value axis: keeps the shape with as few dots as possible.
+void thinSamples(std::vector<AutoPoint>& s, double eps) {
+    const size_t n = s.size();
+    if (n < 3) return;
+    std::vector<char> keep(n, 0);
+    keep[0] = keep[n - 1] = 1;
+    std::vector<std::pair<size_t, size_t>> stack{{0, n - 1}};
+    while (!stack.empty()) {
+        const auto [a, b] = stack.back();
+        stack.pop_back();
+        if (b <= a + 1) continue;
+        double maxd = -1.0;
+        size_t mi = a;
+        const double span = s[b].t - s[a].t;
+        for (size_t i = a + 1; i < b; ++i) {
+            const double v = span > 1e-12 ? s[a].v + (s[b].v - s[a].v) * ((s[i].t - s[a].t) / span) : s[a].v;
+            const double d = std::fabs(s[i].v - v);
+            if (d > maxd) { maxd = d; mi = i; }
+        }
+        if (maxd > eps) { keep[mi] = 1; stack.push_back({a, mi}); stack.push_back({mi, b}); }
+    }
+    std::vector<AutoPoint> out;
+    for (size_t i = 0; i < n; ++i) if (keep[i]) out.push_back(s[i]);
+    s.swap(out);
+}
+void thinToLimit(std::vector<AutoPoint>& s, double eps, size_t maxPoints) {
+    std::vector<AutoPoint> work = s;
+    thinSamples(work, eps);
+    for (int guard = 0; work.size() > maxPoints && guard < 30; ++guard) { eps = std::max(eps * 1.6, 1e-9); work = s; thinSamples(work, eps); }
+    s.swap(work);
+}
+
+double waveUnit(int shape, double ph) {   // -1 .. 1 at the phase 0 .. 1
+    const double kPi = 3.14159265358979323846;
+    switch (shape) {
+        case 1: return ph < 0.25 ? 4.0 * ph : (ph < 0.75 ? 2.0 - 4.0 * ph : 4.0 * ph - 4.0);
+        case 2: return ph < 0.5 ? 1.0 : -1.0;
+        case 3: return 2.0 * ph - 1.0;
+        case 4: return 1.0 - 2.0 * ph;
+        default: return std::sin(2.0 * kPi * ph);
+    }
+}
+
+// shape 0 sine, 1 triangle, 2 square, 3 saw up, 4 saw down. amp = peak as a fraction of the full range.
+std::vector<AutoPoint> genWavePoints(int shape, double rate, double amp, double centerValue, double lo, double hi, double t0, double t1) {
+    std::vector<AutoPoint> out;
+    if (rate <= 1e-6 || t1 <= t0 + 1e-6) return out;
+    const double kPi = 3.14159265358979323846;
+    const double period = 1.0 / rate, peak = amp * (hi - lo) * 0.5;
+    const double cycles = (t1 - t0) / period;
+    const double e = std::min(0.004, period * 0.02) / period;   // width of a vertical edge (as a part of the cycle)
+    int ppc = 16;
+    if (cycles * ppc > 20000.0) ppc = std::max(4, (int)(20000.0 / cycles));
+    auto put = [&](double t, double w) {
+        AutoPoint p; p.t = t; p.v = std::min(hi, std::max(lo, centerValue + peak * w));
+        out.push_back(p);
+    };
+    for (long c = 0; c < (long)std::ceil(cycles) && out.size() < 40000; ++c) {
+        const double base = t0 + (double)c * period;
+        std::vector<std::pair<double, double>> bp;
+        switch (shape) {
+            case 1: bp = {{0.0, 0.0}, {0.25, 1.0}, {0.75, -1.0}}; break;
+            case 2: bp = {{0.0, 1.0}, {0.5 - e, 1.0}, {0.5, -1.0}, {1.0 - e, -1.0}}; break;
+            case 3: bp = {{0.0, -1.0}, {1.0 - e, 1.0}}; break;
+            case 4: bp = {{0.0, 1.0}, {1.0 - e, -1.0}}; break;
+            default: for (int k = 0; k < ppc; ++k) bp.push_back({(double)k / ppc, std::sin(2.0 * kPi * k / ppc)}); break;
+        }
+        for (const auto& b : bp) {
+            const double t = base + b.first * period;
+            if (t > t1 + 1e-9) break;
+            put(t, b.second);
+        }
+    }
+    if (out.empty() || out.back().t < t1 - 1e-6) put(t1, waveUnit(shape, std::fmod(cycles, 1.0)));
+    return out;
+}
+
+bool autoSelBounds(const std::vector<AutoPoint>& lane, const std::set<int>& sel, double& tMin, double& tMax, double& vMin, double& vMax) {
+    bool any = false;
+    for (int i : sel) {
+        if (i < 0 || i >= (int)lane.size()) continue;
+        const AutoPoint& p = lane[(size_t)i];
+        if (!any) { tMin = tMax = p.t; vMin = vMax = p.v; any = true; }
+        else { tMin = std::min(tMin, p.t); tMax = std::max(tMax, p.t); vMin = std::min(vMin, p.v); vMax = std::max(vMax, p.v); }
+    }
+    return any;
+}
+
+// depth (start -> end, 1 = as drawn), time stretch (1 = as drawn), morph (-1 triangle .. 0 as drawn .. +1 square), all from the original dots
+void reshapeDots(std::vector<AutoPoint>& lane, const std::vector<int>& idx, const std::vector<AutoPoint>& orig,
+                 double dStart, double dEnd, double stretch, double morph, double lo, double hi) {
+    if (orig.empty() || orig.size() != idx.size()) return;
+    const double kPi = 3.14159265358979323846;
+    double vMin = orig[0].v, vMax = orig[0].v;
+    for (const AutoPoint& q : orig) { vMin = std::min(vMin, q.v); vMax = std::max(vMax, q.v); }
+    const double center = (vMin + vMax) * 0.5, half = (vMax - vMin) * 0.5;
+    const double t0 = orig.front().t, span = orig.back().t - t0;
+    const double amt = std::fabs(morph);
+    for (size_t k = 0; k < idx.size(); ++k) {
+        if (idx[k] < 0 || idx[k] >= (int)lane.size()) continue;
+        const double x = span > 1e-9 ? (orig[k].t - t0) / span : 0.0;
+        const double depth = dStart + (dEnd - dStart) * x;
+        double n = half > 1e-12 ? (orig[k].v - center) / half : 0.0;
+        if (amt > 1e-6) {
+            const double w = morph > 0.0 ? (n >= 0.0 ? 1.0 : -1.0) : (2.0 / kPi) * std::asin(std::min(1.0, std::max(-1.0, n)));
+            n = n + (w - n) * amt;
+        }
+        AutoPoint& dst = lane[(size_t)idx[k]];
+        dst.v = std::min(hi, std::max(lo, center + n * half * depth));
+        dst.t = clampTimelineTime(t0 + (orig[k].t - t0) * stretch);
+    }
+}
+
+struct WaveHandles { ImVec2 depth, stretch, morph; };
+WaveHandles waveHandlePos(float x0, float x1, float yTop, float yBot, float yMid, float ly0, float ly1, float xMax) {
+    WaveHandles h;
+    const float cx = (x0 + x1) * 0.5f;
+    h.depth = ImVec2(cx, std::min(ly1 - S(8), std::max(ly0 + S(8), yTop - S(11))));
+    h.morph = ImVec2(cx, std::min(ly1 - S(8), std::max(ly0 + S(8), yBot + S(11))));
+    h.stretch = ImVec2(std::min(xMax - S(8), x1 + S(13)), std::min(ly1 - S(8), std::max(ly0 + S(8), yMid)));
+    return h;
+}
+void drawWaveHandles(ImDrawList* dl, const WaveHandles& h, int active) {
+    const ImU32 fill = IM_COL32(237, 128, 38, 255), line = IM_COL32(255, 255, 255, 255), ink = IM_COL32(20, 20, 24, 255);
+    auto knob = [&](ImVec2 c, int kind) {
+        dl->AddCircleFilled(c, S(7), active == kind ? IM_COL32(255, 190, 110, 255) : fill);
+        dl->AddCircle(c, S(7), line, 0, S(1.2f));
+        const float a = S(3);
+        if (kind == 1) {        // up and down
+            dl->AddTriangleFilled(ImVec2(c.x, c.y - a - S(1)), ImVec2(c.x - a, c.y - S(1)), ImVec2(c.x + a, c.y - S(1)), ink);
+            dl->AddTriangleFilled(ImVec2(c.x, c.y + a + S(1)), ImVec2(c.x - a, c.y + S(1)), ImVec2(c.x + a, c.y + S(1)), ink);
+        } else if (kind == 2) { // left and right
+            dl->AddTriangleFilled(ImVec2(c.x - a - S(1), c.y), ImVec2(c.x - S(1), c.y - a), ImVec2(c.x - S(1), c.y + a), ink);
+            dl->AddTriangleFilled(ImVec2(c.x + a + S(1), c.y), ImVec2(c.x + S(1), c.y - a), ImVec2(c.x + S(1), c.y + a), ink);
+        } else {                // a small wave
+            ImVec2 w[5] = {ImVec2(c.x - a * 1.4f, c.y), ImVec2(c.x - a * 0.7f, c.y - a), ImVec2(c.x, c.y), ImVec2(c.x + a * 0.7f, c.y + a), ImVec2(c.x + a * 1.4f, c.y)};
+            dl->AddPolyline(w, 5, ink, 0, S(1.4f));
+        }
+    };
+    knob(h.depth, 1); knob(h.stretch, 2); knob(h.morph, 3);
+}
+
+// live Rec: one value of the clip's channel "rec" arrived from the engine monitor
+void recFeed(int idx, float v) {
+    if (!g_playing || g_recArm.empty() || idx < 0 || idx >= (int)g_recNames.size() || !std::isfinite(v)) return;
+    const std::string& name = g_recNames[(size_t)idx];
+    for (Track& t : g_proj.tracks)
+        for (Clip& c : t.clips) {
+            if (c.name != name || g_play < c.start || g_play > c.start + c.dur + 0.05) continue;
+            for (const auto& arm : g_recArm) {
+                if (arm.first != t.id) continue;
+                RecBuf* buf = nullptr;
+                for (RecBuf& b : g_recBufs) if (b.trackId == arm.first && b.channel == arm.second) { buf = &b; break; }
+                if (!buf) { g_recBufs.push_back(RecBuf()); buf = &g_recBufs.back(); buf->trackId = arm.first; buf->channel = arm.second; }
+                if (!buf->s.empty() && g_play <= buf->s.back().t) continue;
+                AutoPoint p; p.t = g_play; p.v = v;
+                buf->s.push_back(p);
+            }
+        }
 }
 
 bool hasAutoSelection() {
@@ -1576,6 +1784,7 @@ void applyMonitor(char tag, int start, const std::vector<float>& values) {
     const float inv = 1.f / (float)std::max(0.0001, g_proj.cs.zdbfs);
     for (size_t i = 0; i < values.size(); ++i) {
         float v = values[i];
+        if (tag == 'C') { recFeed(start + (int)i, v); continue; }   // live Rec value of a clip: used as it is
         if (!std::isfinite(v)) v = 0.f;
         v *= inv;
         const int idx = start + (int)i;
@@ -1625,6 +1834,154 @@ void drainPlayOutput() {
     }
 }
 
+// ---- Capture: run one clip silently and turn the signal it sends to the channel "rec" into dots
+void startCapture(Track& lane, Clip& clip, const std::string& channel, bool fit) {
+    if (g_capProc.active()) { logLine("[caw] A capture is still running."); return; }
+    const double dur = std::min(600.0, std::max(0.05, clip.dur));
+    if (clip.lang >= 1 && !std::filesystem::exists(pdWavPath(clip.name))) { logLine("[caw] Capture: this clip is not rendered yet. Press Run (or Play) once, then capture again."); return; }
+    const std::string file = (workDir() / "caw_capture.txt").string();
+    const std::string csdPath = (workDir() / "caw_capture.csd").string();
+    std::error_code ec;
+    std::filesystem::remove(file, ec);
+    if (!writeTextFile(csdPath, buildClipCaptureCsd(g_proj, clip, file, dur))) { logLine("[caw] ERROR: could not write " + csdPath); return; }
+    g_cap = CaptureJob();
+    g_cap.on = true; g_cap.trackId = lane.id; g_cap.clipId = clip.id; g_cap.channel = channel; g_cap.file = file; g_cap.fit = fit;
+    g_cap.start = clip.start; g_cap.dur = dur;
+    logLine("[caw] Capture " + clip.name + " -> lane " + channel + " (silent run of " + std::to_string((int)dur) + " s)...");
+    if (!g_capProc.start("\"" + csoundExePath() + "\" \"" + csdPath + "\"", false)) { logLine("[caw] ERROR: " + g_capProc.lastError()); g_cap.on = false; }
+}
+
+void finishCapture() {
+    g_cap.on = false;
+    Track* t = findTrackById(g_cap.trackId);
+    if (!t) return;
+    std::vector<AutoPoint> s;
+    {
+        std::ifstream in(g_cap.file);
+        double tm = 0.0, v = 0.0;
+        while (in >> tm >> v) {
+            if (!std::isfinite(tm) || !std::isfinite(v) || tm < 0.0 || tm > g_cap.dur + 1e-6) continue;
+            AutoPoint p; p.t = tm; p.v = v;
+            s.push_back(p);
+        }
+    }
+    if (s.size() < 2) { logLine("[caw] Capture: no data. Does the clip send to \"rec\"?  (<caw> { rec: kVar } for Csound, <caw> { send: \"rec\" } for Pd / SuperCollider; see the errors above)"); return; }
+    double lo, hi, initial;
+    laneValueRange(*t, g_cap.channel, lo, hi, initial);
+    if (g_cap.fit) {
+        double vMin = s[0].v, vMax = s[0].v;
+        for (const AutoPoint& p : s) { vMin = std::min(vMin, p.v); vMax = std::max(vMax, p.v); }
+        for (AutoPoint& p : s) p.v = vMax - vMin > 1e-12 ? lo + (p.v - vMin) / (vMax - vMin) * (hi - lo) : (lo + hi) * 0.5;
+    }
+    for (AutoPoint& p : s) p.v = std::min(hi, std::max(lo, p.v));
+    thinToLimit(s, 0.003 * (hi - lo), 1500);
+    for (AutoPoint& p : s) p.t += g_cap.start;
+    ensureAutoLane(*t, g_cap.channel);
+    replaceDotsInRange(t->automation[g_cap.channel], g_cap.start, g_cap.start + g_cap.dur, s);
+    selectDotsInRange(*t, g_cap.channel, g_cap.start, g_cap.start + g_cap.dur);
+    logLine("[caw] Capture: " + std::to_string(s.size()) + " dots written into lane " + g_cap.channel + ". Drag the orange handles or the dots to shape it.");
+}
+
+// ---- live Rec: when the timeline stops, the recorded values become dots
+void updateRecording() {
+    if (g_playing) return;
+    for (RecBuf& b : g_recBufs) {
+        if (b.s.size() < 2) continue;
+        Track* t = findTrackById(b.trackId);
+        if (!t) continue;
+        double lo, hi, initial;
+        laneValueRange(*t, b.channel, lo, hi, initial);
+        for (AutoPoint& p : b.s) p.v = std::min(hi, std::max(lo, p.v));
+        const double from = b.s.front().t, to = b.s.back().t;
+        thinToLimit(b.s, 0.003 * (hi - lo), 1500);
+        ensureAutoLane(*t, b.channel);
+        replaceDotsInRange(t->automation[b.channel], from, to, b.s);
+        selectDotsInRange(*t, b.channel, from, to);
+        logLine("[caw] Rec: " + std::to_string(b.s.size()) + " dots written into lane " + b.channel + ".");
+    }
+    g_recBufs.clear();
+}
+
+bool trackHasRec(const Track& t) {
+    if (t.kind != 0) return false;
+    for (const Clip& c : t.clips) if (parseClip(c).hasRec) return true;
+    return false;
+}
+
+// ---- clip editor buttons: Wave... (write a wave as dots) and Capture... (record the code's own signal)
+void drawWavePopup(Track& lane, Clip& clip) {
+    const ParsedTrack pc = parseClip(clip);
+    if (pc.params.empty()) { ImGui::TextDisabled("Declare a <caw> channel in the code first."); return; }
+    WaveUi& w = g_waveUi;
+    if (ImGui::IsWindowAppearing()) { w.ch = 0; w.t0 = clip.start; w.t1 = clip.start + clip.dur; }
+    w.ch = std::min((int)pc.params.size() - 1, std::max(0, w.ch));
+    ImGui::TextDisabled("Write a wave into the automation lane as dots");
+    ImGui::SetNextItemWidth(S(190));
+    if (ImGui::BeginCombo("Lane##wave_ch", pc.params[(size_t)w.ch].chn.c_str())) {
+        for (int k = 0; k < (int)pc.params.size(); ++k)
+            if (ImGui::Selectable(pc.params[(size_t)k].chn.c_str(), k == w.ch)) w.ch = k;
+        ImGui::EndCombo();
+    }
+    ImGui::SetNextItemWidth(S(190));
+    ImGui::Combo("Shape##wave_shape", &w.shape, "Sine\0Triangle\0Square\0Saw up\0Saw down\0");
+    ImGui::SetNextItemWidth(S(190));
+    ImGui::DragFloat("Rate##wave_rate", &w.rate, 0.02f, 0.01f, 60.f, "%.3f Hz");
+    w.rate = std::max(0.01f, w.rate);
+    ImGui::SetNextItemWidth(S(190));
+    ImGui::SliderFloat("Depth##wave_depth", &w.depth, 0.f, 100.f, "%.0f %% of range");
+    ImGui::SetNextItemWidth(S(190));
+    ImGui::SliderFloat("Centre##wave_center", &w.center, 0.f, 100.f, "%.0f %% of range");
+    ImGui::Checkbox("Whole clip##wave_whole", &w.whole);
+    if (w.whole) { w.t0 = clip.start; w.t1 = clip.start + clip.dur; }
+    else {
+        ImGui::SetNextItemWidth(S(110)); ImGui::InputDouble("From##wave_t0", &w.t0, 0.0, 0.0, "%.3f s");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(S(110)); ImGui::InputDouble("To##wave_t1", &w.t1, 0.0, 0.0, "%.3f s");
+        w.t0 = clampTimelineTime(w.t0); w.t1 = std::max(w.t0 + 0.01, clampTimelineTime(w.t1));
+    }
+    const CawParam& prm = pc.params[(size_t)w.ch];
+    const double lo = prm.min, hi = prm.max > prm.min ? prm.max : prm.min + 1.0;
+    const std::vector<AutoPoint> pts = genWavePoints(w.shape, w.rate, w.depth / 100.0, lo + (hi - lo) * w.center / 100.0, lo, hi, w.t0, w.t1);
+    g_wavePrev.frame = ImGui::GetFrameCount(); g_wavePrev.trackId = lane.id; g_wavePrev.channel = prm.chn; g_wavePrev.pts = pts;
+    ImGui::TextDisabled("%d dots, %.1f cycles. Existing dots in that time are replaced.", (int)pts.size(), w.rate * (w.t1 - w.t0));
+    if (ImGui::Button("Write dots##wave_go") && pts.size() >= 2) {
+        ensureAutoLane(lane, prm.chn);
+        replaceDotsInRange(lane.automation[prm.chn], w.t0, w.t1, pts);
+        selectDotsInRange(lane, prm.chn, w.t0, w.t1);
+        g_wavePrev.frame = -1000;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel##wave_cancel")) { g_wavePrev.frame = -1000; ImGui::CloseCurrentPopup(); }
+    ImGui::TextDisabled("Then drag the orange handles on the lane\n(depth, time, square / triangle).");
+}
+
+void drawCapturePopup(Track& lane, Clip& clip) {
+    const ParsedTrack pc = parseClip(clip);
+    static int ch = 0;
+    static bool fit = false;
+    if (pc.params.empty()) { ImGui::TextDisabled("Declare a <caw> channel in the code first."); return; }
+    if (!pc.hasRec) {
+        ImGui::TextDisabled("Send the signal you want to the automation, inside <caw>:");
+        if (clip.lang == 0) ImGui::TextDisabled("    Csound:  { rec: kLfo }");
+        else if (clip.lang == 1) ImGui::TextDisabled("    Pd:  { send: \"rec\" }   (or an [s rec] object)");
+        else ImGui::TextDisabled("    SuperCollider:  { send: \"rec\" }   and return it\n    after left and right: [l, r, lfo]");
+        return;
+    }
+    ch = std::min((int)pc.params.size() - 1, std::max(0, ch));
+    ImGui::TextDisabled("Run this clip silently and write what it sends to \"rec\" into a lane");
+    ImGui::SetNextItemWidth(S(190));
+    if (ImGui::BeginCombo("Lane##cap_ch", pc.params[(size_t)ch].chn.c_str())) {
+        for (int k = 0; k < (int)pc.params.size(); ++k)
+            if (ImGui::Selectable(pc.params[(size_t)k].chn.c_str(), k == ch)) ch = k;
+        ImGui::EndCombo();
+    }
+    ImGui::Checkbox("Scale to the lane range##cap_fit", &fit);
+    if (ImGui::IsItemHovered()) helpTip("Off: the values are used as they are (and cut at the range). On: the lowest value becomes the bottom of the lane, the highest the top.");
+    if (g_capProc.active()) ImGui::TextDisabled("Capturing...");
+    else if (ImGui::Button("Capture now##cap_go")) { startCapture(lane, clip, pc.params[(size_t)ch].chn, fit); ImGui::CloseCurrentPopup(); }
+}
+
 // Display smoothing of every meter (called once per frame).
 void updateMeters(float dt) {
     g_monAge += dt;
@@ -1663,6 +2020,7 @@ void startPlaybackNow(bool liveMode) {
         return;
     }
     g_engineMeters = meterLayout(g_proj);
+    g_recNames = recClipNames(g_proj);
     {
         g_engineMaster = masterChannels(g_proj.cs);
         int top = g_engineMaster;
@@ -2672,6 +3030,10 @@ std::string clipLineMessage(const std::string& l) {
 
 void pollTestAndScan(float dt) {
     if (g_runLeft > 0.0) g_runLeft -= dt;
+    if (g_capProc.active()) {
+        for (const std::string& l : g_capProc.takeOutput()) logCsoundLine(l);
+        if (g_capProc.finished()) { g_capProc.stop(); if (g_cap.on) finishCapture(); }
+    }
     pollPdJob(dt);
     if (g_testProc.active()) {
         for (const std::string& l : g_testProc.takeOutput()) {
@@ -3143,6 +3505,8 @@ void drawMarkItem(ImDrawList* dl, int trackIdx, const Track& track, const TrackM
         const float tw = mk.text.empty() ? 0.f : font->CalcTextSizeA(fs, FLT_MAX, 0.f, mk.text.c_str()).x + S(8);
         const float textX = (float)markgfx::shapeRight(mk.shape, x0, sTop, x1, sBot, mk.ratio / 100.0) + S(4);
         dl->PushClipRect(ImVec2(x0, std::min(top, sTop)), ImVec2(std::max(std::max(x1, x0 + h) + S(2), textX + tw), std::max(bot, sBot)), true);
+        dl->AddRectFilled(ImVec2(x0, top), ImVec2(x1, bot), trackColor(trackIdx, 26, rgb), S(3));   // always shown on the timeline: light background + thin border
+        dl->AddRect(ImVec2(x0, top), ImVec2(x1, bot), trackColor(trackIdx, 110, rgb), S(3), 0, S(1.f));
         drawShapePrims(dl, mk.shape, x0, sTop, x1, sBot, line, soft, mk.ratio / 100.0);
         if (!mk.text.empty()) dl->AddText(font, fs, ImVec2(textX, (top + bot) * 0.5f - fs * 0.5f), IM_COL32(235, 236, 240, 255), mk.text.c_str());
         dl->PopClipRect();
@@ -3217,8 +3581,8 @@ void drawArrange(float belowH, float rightW) {
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     const float sb = S(12);  // scrollbar thickness
     if (g_drag == Drag::ResizeHeader && ImGui::IsMouseDown(0))
-        g_headerW = std::min(900.f, std::max(60.f, (io.MousePos.x - org.x) / g_ui));
-    const float headerW = std::min(S(g_headerW), std::max(S(60), avail.x - S(160))), rulerH = S(26);
+        g_headerW = std::min(900.f, std::max(120.f, (io.MousePos.x - org.x) / g_ui));
+    const float headerW = std::min(std::max(S(g_headerW), S(120)), std::max(S(120), avail.x - S(160))), rulerH = S(26);
     const ImVec2 bodyMin(org.x + headerW, org.y + rulerH);
     const ImVec2 bodyMax(org.x + avail.x - sb, org.y + avail.y - sb);
     const ImVec2 rulerMin(bodyMin.x, org.y), rulerMax(bodyMax.x, bodyMin.y);
@@ -3418,6 +3782,61 @@ void drawArrange(float belowH, float rightW) {
         return y1 - autoPadY - (float)norm * usable;
     };
     validateAutoSelection();
+    {   // ---- drag handles of the selected dots: depth (top), time stretch (right), square / triangle morph (bottom). Shift on depth = ramp (wave slowly widens)
+        if (g_wh.active) {
+            int whTi = -1;
+            Track* whTrack = findTrackById(g_wh.trackId, &whTi);
+            auto whLane = whTrack ? whTrack->automation.find(g_wh.channel) : std::map<std::string, std::vector<AutoPoint>>::iterator();
+            if (!whTrack || whLane == whTrack->automation.end() || !ImGui::IsMouseDown(0)) {
+                if (whTrack && whLane != whTrack->automation.end()) sortLaneKeepSelection(whLane->second, g_autoSel);
+                g_wh.active = false;
+            } else {
+                consumed = true;
+                float ly0 = 0.f, ly1 = 0.f;
+                autoLaneGeometry(*whTrack, whTi, g_wh.channel, ly0, ly1);
+                const float yC = yOfValue(g_wh.center, ly0, ly1, g_wh.lo, g_wh.hi);
+                const float x0px = tx(g_wh.orig.front().t), x1px = tx(g_wh.orig.back().t);
+                double dS = 1.0, dE = 1.0, st = 1.0, mo = 0.0;
+                if (g_wh.kind == 1) {
+                    const float denom = std::max(S(12), yC - g_wh.handleY);
+                    dE = std::min(4.0, std::max(0.0, (double)((yC - m.y) / denom)));
+                    dS = io.KeyShift ? 1.0 : dE;
+                    ImGui::SetTooltip(io.KeyShift ? "Depth ramp: 100 %% -> %.0f %%" : "Depth %.0f %%", dE * 100.0);
+                } else if (g_wh.kind == 2) {
+                    st = std::min(20.0, std::max(0.05, (double)((m.x - S(13) - x0px) / std::max(S(4), x1px - x0px))));
+                    ImGui::SetTooltip("Time %.0f %%", st * 100.0);
+                } else {
+                    mo = std::min(1.0, std::max(-1.0, (double)((g_wh.startY - m.y) / S(60))));
+                    if (std::fabs(mo) < 0.02) ImGui::SetTooltip("Wave as drawn");
+                    else ImGui::SetTooltip(mo > 0 ? "Towards square %.0f %%" : "Towards triangle %.0f %%", std::fabs(mo) * 100.0);
+                }
+                reshapeDots(whLane->second, g_wh.idx, g_wh.orig, dS, dE, st, mo, g_wh.lo, g_wh.hi);
+            }
+        } else if (inBody && !consumed && ImGui::IsMouseClicked(0) && g_autoSel.size() >= 2 && g_autoMode == AutoMode::None) {
+            int whTi = -1;
+            Track* whTrack = findTrackById(g_autoSelTrackId, &whTi);
+            auto whLane = whTrack ? whTrack->automation.find(g_autoSelChannel) : std::map<std::string, std::vector<AutoPoint>>::iterator();
+            double tMin, tMax, vMin, vMax;
+            if (whTrack && whLane != whTrack->automation.end() && autoShown(*whTrack, g_autoSelChannel) && autoSelBounds(whLane->second, g_autoSel, tMin, tMax, vMin, vMax)) {
+                float ly0 = 0.f, ly1 = 0.f;
+                autoLaneGeometry(*whTrack, whTi, g_autoSelChannel, ly0, ly1);
+                double lo, hi, initial;
+                laneValueRange(*whTrack, g_autoSelChannel, lo, hi, initial);
+                const WaveHandles wh = waveHandlePos(tx(tMin), tx(tMax), yOfValue(vMax, ly0, ly1, lo, hi), yOfValue(vMin, ly0, ly1, lo, hi),
+                                                     yOfValue((vMin + vMax) * 0.5, ly0, ly1, lo, hi), ly0, ly1, bodyMax.x);
+                auto onKnob = [&](ImVec2 c) { return std::hypot(m.x - c.x, m.y - c.y) <= S(9); };
+                int kind = onKnob(wh.depth) ? 1 : onKnob(wh.stretch) ? 2 : onKnob(wh.morph) ? 3 : 0;
+                if (kind) {
+                    g_wh = WaveHandleDrag();
+                    g_wh.active = true; g_wh.kind = kind; g_wh.trackId = whTrack->id; g_wh.channel = g_autoSelChannel;
+                    for (int idx : g_autoSel) if (idx >= 0 && idx < (int)whLane->second.size()) { g_wh.idx.push_back(idx); g_wh.orig.push_back(whLane->second[(size_t)idx]); }
+                    g_wh.center = (vMin + vMax) * 0.5; g_wh.lo = lo; g_wh.hi = hi;
+                    g_wh.handleY = kind == 1 ? wh.depth.y : wh.morph.y; g_wh.startY = m.y;
+                    consumed = true;
+                }
+            }
+        }
+    }
     if (inBody && !consumed && (ImGui::IsMouseClicked(0) || ImGui::IsMouseClicked(1))) {
         g_autoSelMulti.clear();
         for (int ti = 0; ti < nT && !consumed; ++ti) {
@@ -3942,6 +4361,10 @@ void drawArrange(float belowH, float rightW) {
                     if (ImGui::SliderInt("Font size##mark_font", &fnt, 6, 40, "%d pt")) mk.font = fnt;
                     if (ImGui::IsItemHovered()) helpTip("Size of the text, on the timeline and in the score.");
                 }
+                if (graphItem) {
+                    ImGui::Checkbox("Border in score##mark_border", &mk.border);
+                    if (ImGui::IsItemHovered()) helpTip("Draws a thin border around this item in the score. On the timeline the border and a light background are always shown.");
+                }
                 if (graphItem && mk.shape >= 3 && mk.shape <= 5) {
                     int rt = mk.ratio;
                     ImGui::SetNextItemWidth(S(190));
@@ -4327,8 +4750,6 @@ void drawArrange(float belowH, float rightW) {
         if (track.kind == 1 || track.kind == 2) {   // marker track: comment boxes; graph track: the same items in its first row
             const float top = yTop[(size_t)i] + S(6), bot = baseBottom[(size_t)i] - S(6);
             if (baseBottom[(size_t)i] >= bodyMin.y && yTop[(size_t)i] <= bodyMax.y) {
-                if (track.marks.empty() && track.kind == 1)
-                    dl->AddText(ImVec2(bodyMin.x + S(8), yTop[(size_t)i] + S(6)), IM_COL32(122, 124, 133, 255), "Marker track: double-click to add a marker (comment, letter box, cue Q, code or span bracket). Drag to move, drag the right edge to change the length, right-click for more.");
                 for (size_t k = 0; k < track.marks.size(); ++k) {
                     const TrackMark& mk = track.marks[k];
                     const float x0 = tx(mk.t), x1 = std::max(tx(mk.t + mk.dur), x0 + S(24));
@@ -4339,8 +4760,6 @@ void drawArrange(float belowH, float rightW) {
             }
             if (track.kind == 1) continue;
         }
-        if (track.kind == 2 && track.marks.empty() && baseBottom[(size_t)i] >= bodyMin.y && yTop[(size_t)i] <= bodyMax.y)
-            dl->AddText(ImVec2(bodyMin.x + S(8), yTop[(size_t)i] + S(6)), IM_COL32(122, 124, 133, 255), "Graph: double-click here to add graphic-score shapes (clouds, glissandi, swells...). Drag to move, drag the right edge to change the length, right-click for size and shape. One lane in the score with up to 8 lines (use + on the left). It makes no sound.");
         int automationLaneIndex = 0;
         for (const auto& [channel, points] : track.automation) {
             if (!autoShown(track, channel)) continue;
@@ -4368,9 +4787,6 @@ void drawArrange(float belowH, float rightW) {
             if (points.empty()) {
                 const float y = valueY(initial);
                 dl->AddLine(ImVec2(a.x, y), ImVec2(b.x, y), trackColor(i, 200, laneColor), S(1.5f));
-                dl->AddText(ImVec2(a.x + S(8), laneY + S(3)), IM_COL32(135, 135, 144, 255),
-                            isPenTool() ? "Pen: press and drag to write automation"
-                                                        : "Click to add a dot | drag to box-select | Pen tool (8) to draw");
             } else {
                 std::vector<ImVec2> poly;
                 poly.reserve(points.size());
@@ -4389,7 +4805,10 @@ void drawArrange(float belowH, float rightW) {
                         const auto multi = g_autoSelMulti.find({track.id, channel});
                         picked = multi != g_autoSelMulti.end() && multi->second.count(pi) > 0;
                     }
-                    if (picked) {
+                    const bool denseHere = pi > 0 && pi + 1 < (int)poly.size() && std::fabs(point.x - poly[(size_t)pi - 1].x) < S(9) && std::fabs(poly[(size_t)pi + 1].x - point.x) < S(9);
+                    if (picked && denseHere) {
+                        dl->AddCircleFilled(point, S(2.5f), IM_COL32(255, 255, 255, 255));   // many selected dots (a wave): small, so the line stays readable
+                    } else if (picked) {
                         dl->AddCircleFilled(point, S(6), IM_COL32(255, 255, 255, 255));
                         dl->AddCircle(point, S(8), trackColor(i, 255, laneColor), 0, S(2));
                     } else {
@@ -4403,6 +4822,20 @@ void drawArrange(float belowH, float rightW) {
                         dl->AddCircleFilled(point, S(4), trackColor(i, 255, laneColor));
                         dl->AddCircle(point, S(6), IM_COL32(255, 255, 255, 150), 0, S(1));
                     }
+                }
+            }
+            if (g_wavePrev.frame >= ImGui::GetFrameCount() - 2 && g_wavePrev.trackId == track.id && g_wavePrev.channel == channel && g_wavePrev.pts.size() >= 2) {
+                std::vector<ImVec2> pv;   // ghost of the wave that Wave... would write
+                for (const AutoPoint& q : g_wavePrev.pts) pv.push_back(ImVec2(tx(q.t), valueY(q.v)));
+                dl->AddPolyline(pv.data(), (int)pv.size(), IM_COL32(255, 255, 255, 190), 0, S(1.5f));
+            }
+            if (selectedLane && g_autoSel.size() >= 2 && !points.empty()) {   // drag handles of the selected dots
+                double tMin, tMax, vMin, vMax;
+                if (autoSelBounds(points, g_autoSel, tMin, tMax, vMin, vMax)) {
+                    const float hx0 = tx(tMin), hx1 = tx(tMax);
+                    const WaveHandles wh = waveHandlePos(hx0, hx1, valueY(vMax), valueY(vMin), valueY((vMin + vMax) * 0.5), laneY, laneY1, bodyMax.x);
+                    dl->AddRect(ImVec2(hx0 - S(3), valueY(vMax) - S(3)), ImVec2(hx1 + S(3), valueY(vMin) + S(3)), IM_COL32(255, 255, 255, 60), S(2));
+                    drawWaveHandles(dl, wh, g_wh.active ? g_wh.kind : 0);
                 }
             }
             laneY = laneY1;
@@ -4447,8 +4880,6 @@ void drawArrange(float belowH, float rightW) {
                 dl->AddRectFilled(a, b, trackColor(i, 230, clipRgb), S(2));
             }
         }
-        if (!anyNotes && track.midiClips.empty())
-            dl->AddText(ImVec2(midiA.x + S(8), midiY + S(4)), IM_COL32(122, 124, 133, 255), "MIDI: drag to box-select, double-click to add a MIDI clip (free position, linked to a Csound clip)");
     }
     {   // selection boxes go on top of every lane (clips, automation, MIDI)
         auto box = [&](ImVec2 a, ImVec2 b) {
@@ -4538,20 +4969,50 @@ void drawArrange(float belowH, float rightW) {
 
         const float fh = ImGui::GetFrameHeight();
         // the panel hides elements as it gets narrower; the meter stays, the name gives way
-        const bool showM = headerW >= S(80), showS = headerW >= S(105);
+        // row 2 buttons are placed left to right; each one shows only if it still ends before the meter, so they vanish one after another from the right
+        const float rowRight = r1.x - meterReserve;   // the meter's left edge (+ a small gap)
+        const float btnGap = S(8);
+        const ImGuiStyle& gst = ImGui::GetStyle();
+        auto smallBtnW = [&](const char* label, float padX) { return ImGui::CalcTextSize(label, nullptr, true).x + padX * 2.f; };
+        float prevRight = r0.x;   // right edge of the last placed button (set right after each button, before any popup)
+        bool rowFull = false;   // once one button does not fit, all the later ones are hidden too
+        auto fitsRow = [&](float w) {   // after the previous item (SameLine) is there room for a button of width w before the meter?
+            if (rowFull) return false;
+            const float nx = prevRight + btnGap;
+            if (nx + w > rowRight) { rowFull = true; return false; }
+            return true;
+        };
         const float nameRoom = headerW - S(22) - meterReserve;
-        const float nameW = std::min(S(170), nameRoom);
+        const float nameW = std::max(S(48), std::min(S(170), nameRoom));   // the title never disappears
         ImGui::PushID(i);
-        if (nameRoom >= S(30)) {
+        {
             ImGui::SetCursorScreenPos(ImVec2(r0.x + S(16), y0 + S(6)));
             ImGui::SetNextItemWidth(nameW);
             if (inputStr("##name", t.name, 0, nameFilter)) g_selTrack = i;
             if (!ImGui::IsItemActive()) ensureUniqueInstrumentName(i);
             if (ImGui::IsItemHovered()) helpTip(t.kind == 2 ? "Name of the graph (its lane name in the score). Right-click the track for more." : t.kind == 1 ? "Name of the marker track. Right-click the track for more." : "Lane name. Every clip on the lane is its own instr (right-click a clip to rename it). Right-click the track for more.", t.name.c_str());
         }
-        if (headerW >= S(50)) {   // second row: + (lanes), M, S
+        if (r0.x + S(18) + smallBtnW("+", gst.FramePadding.x) <= rowRight) {   // second row: + (lanes), M, S
             ImGui::SetCursorScreenPos(ImVec2(r0.x + S(18), y0 + S(6) + fh + S(4)));
-            if (ImGui::SmallButton("+")) ImGui::OpenPopup("add_automation_lane");
+            {   // fold arrow, left of (+): hides / shows the automation sub-tracks and the MIDI track
+                const float asz = ImGui::GetFontSize();
+                const bool foldable = t.kind != 1 && (!t.automation.empty() || trackHasMidi(t));
+                if (foldable && r0.x + S(18) + asz + S(6) + smallBtnW("+", gst.FramePadding.x) <= rowRight) {
+                    const bool folded = g_collapsedAuto.count(t.id) > 0;
+                    const ImVec2 ap = ImGui::GetCursorScreenPos();
+                    if (ImGui::InvisibleButton("##fold_auto", ImVec2(asz, asz))) { if (folded) g_collapsedAuto.erase(t.id); else g_collapsedAuto.insert(t.id); clearAutoSelection(); }
+                    prevRight = ImGui::GetItemRectMax().x;
+                    const ImU32 ac = ImGui::IsItemHovered() ? IM_COL32(255, 255, 255, 255) : IM_COL32(170, 172, 182, 255);
+                    const float cx = ap.x + asz * 0.5f, cy = ap.y + asz * 0.5f, r = asz * 0.26f;
+                    if (folded) ImGui::GetWindowDrawList()->AddTriangleFilled(ImVec2(cx - r * 0.7f, cy - r), ImVec2(cx - r * 0.7f, cy + r), ImVec2(cx + r, cy), ac);
+                    else ImGui::GetWindowDrawList()->AddTriangleFilled(ImVec2(cx - r, cy - r * 0.7f), ImVec2(cx + r, cy - r * 0.7f), ImVec2(cx, cy + r), ac);
+                    if (ImGui::IsItemHovered()) helpTip(folded ? "Show the automation sub-tracks and the MIDI track" : "Hide all the automation sub-tracks and the MIDI track (the data stays)");
+                    ImGui::SameLine(0, S(6));
+                }
+            }
+            const bool plusClicked = ImGui::SmallButton("+");
+            prevRight = ImGui::GetItemRectMax().x;
+            if (plusClicked) ImGui::OpenPopup("add_automation_lane");
             if (ImGui::IsItemHovered()) helpTip("Show / add automation lanes and the MIDI lane");
             if (ImGui::BeginPopup("add_automation_lane")) {
                 const ParsedTrack parsed = parseTrack(t);
@@ -4576,45 +5037,37 @@ void drawArrange(float belowH, float rightW) {
                 }
                 if (laneHasMidi) {
                     ImGui::Separator();
-                    if (ImGui::MenuItem("MIDI piano roll", nullptr, !t.midiHidden)) t.midiHidden = !t.midiHidden;
+                    if (ImGui::MenuItem("MIDI track", nullptr, !t.midiHidden)) t.midiHidden = !t.midiHidden;
                 }
                 ImGui::EndPopup();
             }
-            if (showM) {
+            if (fitsRow(smallBtnW("M", gst.FramePadding.x))) {
                 ImGui::SameLine(0, S(8));
                 if (t.muted) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.48f, 0.20f, 0.18f, 1.f));
-                if (ImGui::SmallButton("M")) t.muted = !t.muted;
+                const bool mClicked = ImGui::SmallButton("M");
+                prevRight = ImGui::GetItemRectMax().x;
+                if (mClicked) t.muted = !t.muted;
                 if (t.muted) ImGui::PopStyleColor();
                 if (ImGui::IsItemHovered()) helpTip(t.muted ? "Unmute track" : "Mute track");
             }
-            if (showS) {
+            if (fitsRow(smallBtnW("S", gst.FramePadding.x))) {
                 ImGui::SameLine(0, S(8));
                 if (t.solo) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.42f, 0.24f, 1.f));
-                if (ImGui::SmallButton("S")) t.solo = !t.solo;
+                const bool sClicked = ImGui::SmallButton("S");
+                prevRight = ImGui::GetItemRectMax().x;
+                if (sClicked) t.solo = !t.solo;
                 if (t.solo) ImGui::PopStyleColor();
                 if (ImGui::IsItemHovered()) helpTip(t.solo ? "Unsolo track" : "Solo track");
             }
-            if (headerW >= S(135)) {
+            if (fitsRow(smallBtnW("sco", S(7)))) {
                 ImGui::SameLine(0, S(8));
                 { ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(S(7), 0.f));
-                  if (ImGui::SmallButton("sco##trk")) ImGui::OpenPopup("track_score_popup");
+                  const bool scoClicked = ImGui::SmallButton("sco##trk");
+                  prevRight = ImGui::GetItemRectMax().x;
+                  if (scoClicked) ImGui::OpenPopup("track_score_popup");
                   ImGui::PopStyleVar(); }
                 if (ImGui::IsItemHovered()) helpTip(t.kind == 2 ? "Score: the lane of the whole graph. Give it the same name as another track and the graph is drawn in that track's lane (overlap or separated)." : "Score: the name of this track lane (the same name = the same lane) and how it shows");
                 if (ImGui::BeginPopup("track_score_popup")) { drawTrackScoreMenu(t); ImGui::EndPopup(); }
-            }
-            if (headerW >= S(165) && t.kind != 1 && !t.automation.empty()) {   // arrow: fold / unfold all the automation sub-tracks
-                ImGui::SameLine(0, S(8));
-                const bool folded = g_collapsedAuto.count(t.id) > 0;
-                const float asz = ImGui::GetFontSize();   // small arrow, same height as the M / S / sco buttons
-                const ImVec2 ap = ImGui::GetCursorScreenPos();
-                if (ImGui::InvisibleButton("##fold_auto", ImVec2(asz, asz))) { if (folded) g_collapsedAuto.erase(t.id); else g_collapsedAuto.insert(t.id); clearAutoSelection(); }
-                {
-                    const ImU32 ac = ImGui::IsItemHovered() ? IM_COL32(255, 255, 255, 255) : IM_COL32(170, 172, 182, 255);
-                    const float cx = ap.x + asz * 0.5f, cy = ap.y + asz * 0.5f, r = asz * 0.26f;
-                    if (folded) ImGui::GetWindowDrawList()->AddTriangleFilled(ImVec2(cx - r * 0.7f, cy - r), ImVec2(cx - r * 0.7f, cy + r), ImVec2(cx + r, cy), ac);
-                    else ImGui::GetWindowDrawList()->AddTriangleFilled(ImVec2(cx - r, cy - r * 0.7f), ImVec2(cx + r, cy - r * 0.7f), ImVec2(cx, cy + r), ac);
-                }
-                if (ImGui::IsItemHovered()) helpTip(folded ? "Show the automation sub-tracks" : "Hide all the automation sub-tracks (the data stays)");
             }
         }
         ImGui::PopID();
@@ -4632,40 +5085,68 @@ void drawArrange(float belowH, float rightW) {
                 dl->AddRectFilled(la, lb, IM_COL32(26, 27, 31, 255));
                 dl->AddRectFilled(ImVec2(la.x + S(5), la.y), ImVec2(la.x + S(7), lb.y), trackColor(i, 230, laneColor));
                 dl->AddLine(la, ImVec2(lb.x, laneTop), IM_COL32(12, 12, 14, 255));
-                dl->AddText(ImVec2(la.x + S(16), laneTop + S(3)), IM_COL32(195, 195, 205, 255), (headerW >= S(260) ? "Automation: " + channel : channel).c_str());
+                dl->AddText(ImVec2(la.x + S(16), laneTop + S(3)), IM_COL32(195, 195, 205, 255), channel.c_str());
                 ImGui::PushID(i);
                 ImGui::PushID(channel.c_str());
+                // buttons sit at fixed offsets from the right edge; the one furthest left hides first when it would touch the lane name
+                const float nameEnd = org.x + S(16) + ImGui::CalcTextSize(channel.c_str()).x + S(8);
+                auto roomAt = [&](float off) { return bodyMin.x - S(off) >= nameEnd; };
+                const bool showGM = t.kind == 2 && roomAt(136);
+                const bool showGS = t.kind == 2 && roomAt(106);
+                const bool showAutoSco = t.kind != 2 && roomAt(118);
+                const bool showCol = roomAt(76);
+                const bool showMinus = headerW >= S(90);
+                const float leftBtnOff = showGM ? 136.f : showAutoSco ? 118.f : showGS ? 106.f : showCol ? 76.f : showMinus ? 40.f : 0.f;
+                // R = live Rec: while the timeline plays, the value the code sends to "rec" is written into this lane as dots
+                const bool showRec = t.kind == 0 && trackHasRec(t) && nameEnd + S(24) <= bodyMin.x - S(std::max(40.f, leftBtnOff)) - S(4);
+                if (showRec) {
+                    const std::pair<int, std::string> armKey(t.id, channel);
+                    const bool armed = g_recArm.count(armKey) > 0;
+                    ImGui::SetCursorScreenPos(ImVec2(nameEnd, laneTop + S(2)));
+                    if (armed) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.78f, 0.16f, 0.14f, 1.f));
+                    if (ImGui::Button("R##rec_arm", ImVec2(S(20), 0))) { if (armed) g_recArm.erase(armKey); else g_recArm.insert(armKey); }
+                    if (armed) ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered()) helpTip("Rec: start Csound with Run, arm this lane, press Play. The signal your clip sends to the automation (<caw> { rec: ... } or { send: \"rec\" }) is written into this lane as dots when you stop.");
+                }
                 float rgb[3] = {((laneColor >> 16) & 0xFF) / 255.f, ((laneColor >> 8) & 0xFF) / 255.f, (laneColor & 0xFF) / 255.f};
                 ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(76), laneTop + S(2)));
-                if (headerW >= S(200) && ImGui::ColorEdit3("##automation_color", rgb, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_NoTooltip)) {
+                if (showCol && ImGui::ColorEdit3("##automation_color", rgb, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_NoTooltip)) {
                     t.automationColors[channel] = 0x01000000u |
                         ((uint32_t)std::lround(rgb[0] * 255.f) << 16) |
                         ((uint32_t)std::lround(rgb[1] * 255.f) << 8) |
                         (uint32_t)std::lround(rgb[2] * 255.f);
                 }
-                if (headerW >= S(200) && ImGui::IsItemHovered()) helpTip("Automation lane color");
-                if (headerW >= S(90)) {
+                if (showCol && ImGui::IsItemHovered()) helpTip("Automation lane color");
+                if (showMinus) {
                     ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(40), laneTop + S(2)));
                     if (ImGui::Button("-", ImVec2(S(24), 0))) { removeAutoTrack = i; removeAutoChannel = channel; }
                     if (ImGui::IsItemHovered()) helpTip("Hide this automation lane (data is kept, use + to show it again)");
                 }
                 const float graphComboW = 0.f;
-                if (t.kind == 2 && headerW >= S(240)) {   // graph line: row 2 = shape and how it joins the other lines; row 1 right = M S color -
+                if (t.kind == 2) {   // graph line: row 2 = shape and how it joins the other lines; row 1 right = M S color -
                     const float rowY = laneTop + S(4) + ImGui::GetFrameHeight() + S(6);
                     const auto shIt = t.scoreAutoShape.find(channel);
                     int gshape = shIt == t.scoreAutoShape.end() ? 0 : shIt->second;
-                    const float gcw = std::min(S(118), std::max(S(70), (headerW - S(16 + 8 + 6 + 28 + 10)) / 2.f));
+                    const float gcw = S(104);
+                    const float wallR = bodyMin.x - S(8);   // right wall: W hides first, then the second combo, then the first
+                    const bool showShapeCb = org.x + S(16) + gcw <= wallR;
+                    const bool showMergeCb = showShapeCb && org.x + S(16 + 8) + gcw * 2.f <= wallR;
+                    const bool showLookBtn = showMergeCb && org.x + S(16 + 8 + 8) + gcw * 2.f + S(28) <= wallR;
+                    if (showShapeCb) {
                     ImGui::SetCursorScreenPos(ImVec2(org.x + S(16), rowY));
                     ImGui::SetNextItemWidth(gcw);
                     if (ImGui::Combo("##graph_shape", &gshape, "Curve\0Steps\0Straight\0Line, no dots\0Dashed\0Mirror smooth\0Mirror boxes\0Hairpin < >\0Bars\0")) t.scoreAutoShape[channel] = gshape;
                     if (ImGui::IsItemHovered()) helpTip("Shape of this line in the score");
+                    }
                     const auto mgIt = t.scoreAutoMerge.find(channel);
                     int gmerge = mgIt == t.scoreAutoMerge.end() ? 0 : mgIt->second;
+                    if (showMergeCb) {
                     ImGui::SetCursorScreenPos(ImVec2(org.x + S(16 + 8) + gcw, rowY));
                     ImGui::SetNextItemWidth(gcw);
                     if (ImGui::Combo("##graph_merge", &gmerge, "Combine\0Half combine\0Separated\0")) t.scoreAutoMerge[channel] = gmerge;
                     if (ImGui::IsItemHovered()) helpTip("How this line joins the other lines of the graph in the score:\nCombine = one shape together with the other combined lines.\nHalf combine = drawn over them at 50%.\nSeparated = a strip of its own.");
-                    {   // look: stroke width and shape ratio
+                    }
+                    if (showLookBtn) {   // look: stroke width and shape ratio
                         ImGui::SetCursorScreenPos(ImVec2(org.x + S(16 + 8 + 8) + gcw * 2.f, rowY));
                         const bool customLook = t.scoreAutoStroke.count(channel) > 0 || t.scoreAutoCurve.count(channel) > 0;
                         if (customLook) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.93f, 0.50f, 0.15f, 0.85f));
@@ -4679,8 +5160,8 @@ void drawArrange(float belowH, float rightW) {
                         }
                     }
                     {   // Y = how tall the line is in the score (how far it goes up and down)
-                        const float yx = org.x + S(16) + ImGui::CalcTextSize(headerW >= S(260) ? ("Automation: " + channel).c_str() : channel.c_str()).x + S(10);
-                        if (yx + S(70) < bodyMin.x - S(140)) {
+                        const float yx = org.x + S(16) + ImGui::CalcTextSize(channel.c_str()).x + S(10);
+                        if (yx + S(70) < bodyMin.x - S(std::max(140.f, leftBtnOff + 4.f))) {
                             const auto ysIt = t.scoreAutoYSize.find(channel);
                             int ypct = ysIt == t.scoreAutoYSize.end() ? 100 : ysIt->second;
                             ImGui::SetCursorScreenPos(ImVec2(yx, laneTop + S(2)));
@@ -4689,20 +5170,26 @@ void drawArrange(float belowH, float rightW) {
                             if (ImGui::IsItemHovered()) helpTip("Y size: how tall this line is in the score, so how far it goes up and down (100% = normal). Drag to change.");
                         }
                     }
+                }
+                {
                     // M = hide this line in the score, S = show only the soloed lines
                     const bool gm = t.scoreAutoMuted.count(channel) > 0, gs = t.scoreAutoSolo.count(channel) > 0;
+                    if (showGM) {
                     ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(136), laneTop + S(2)));
                     if (gm) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.48f, 0.20f, 0.18f, 1.f));
                     if (ImGui::Button("M##gm", ImVec2(S(24), 0))) { if (gm) t.scoreAutoMuted.erase(channel); else t.scoreAutoMuted.insert(channel); }
                     if (gm) ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered()) helpTip(gm ? "Show this line in the score again" : "Hide this line in the score");
+                    }
+                    if (showGS) {
                     ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(106), laneTop + S(2)));
                     if (gs) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.42f, 0.24f, 1.f));
                     if (ImGui::Button("S##gs", ImVec2(S(24), 0))) { if (gs) t.scoreAutoSolo.erase(channel); else t.scoreAutoSolo.insert(channel); }
                     if (gs) ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered()) helpTip(gs ? "Unsolo this line" : "Show only the soloed lines in the score");
+                    }
                 }
-                if (t.kind != 2 && headerW >= S(240)) {   // put this automation in the printed score
+                if (showAutoSco) {   // put this automation in the printed score
                     ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(118), laneTop + S(2)));
                     const auto sm = t.scoreAuto.find(channel);
                     const int smode = sm == t.scoreAuto.end() ? 1 : sm->second;
@@ -4716,9 +5203,9 @@ void drawArrange(float belowH, float rightW) {
                     auto laneIt = t.automation.find(channel);
                     if (laneIt != t.automation.end() && *g_autoSel.rbegin() < (int)laneIt->second.size()) {
                         // the value box sits between the lane name and the buttons on the right (Sc, color, -), never under them
-                        const std::string laneLabel = (headerW >= S(260) ? "Automation: " + channel : channel);
-                        const float leftX = org.x + S(16) + ImGui::CalcTextSize(laneLabel.c_str()).x + S(10) + (t.kind == 2 ? S(78) : 0.f) + graphComboW;
-                        const float rightX = bodyMin.x - (headerW >= S(240) ? (t.kind == 2 ? S(136) : S(118)) : (headerW >= S(200) ? S(76) : S(40))) - S(8);
+                        const std::string laneLabel = channel;
+                        const float leftX = org.x + S(16) + ImGui::CalcTextSize(laneLabel.c_str()).x + S(10) + (t.kind == 2 ? S(78) : 0.f) + graphComboW + (showRec ? S(26) : 0.f);
+                        const float rightX = bodyMin.x - S(leftBtnOff > 0.f ? leftBtnOff : 40.f) - S(8);
                         if (rightX - leftX >= S(56)) {
                             double lo, hi, initial;
                             laneValueRange(t, channel, lo, hi, initial);
@@ -4747,8 +5234,9 @@ void drawArrange(float belowH, float rightW) {
             dl->AddRectFilled(ml0, ml1, IM_COL32(26, 27, 31, 255));
             dl->AddRectFilled(ImVec2(ml0.x + S(5), ml0.y), ImVec2(ml0.x + S(7), ml1.y), trackColor(i, 170, t.color));
             dl->AddLine(ml0, ImVec2(ml1.x, midiTop), IM_COL32(12, 12, 14, 255));
-            dl->AddText(ImVec2(ml0.x + S(16), midiTop + S(4)), IM_COL32(195, 195, 205, 255), "MIDI piano roll");
-            if (headerW >= S(130)) {
+            dl->AddText(ImVec2(ml0.x + S(16), midiTop + S(4)), IM_COL32(195, 195, 205, 255), "MIDI track");
+            const float midiTitleEnd = ml0.x + S(16) + ImGui::CalcTextSize("MIDI track").x + S(8);
+            if (bodyMin.x - S(80) >= midiTitleEnd) {
                 ImGui::PushID(i);
                 ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(80), midiTop + S(2)));
                 if (ImGui::Button("sco##midi_score", ImVec2(S(34), 0))) ImGui::OpenPopup("midi_score_popup");
@@ -4756,7 +5244,7 @@ void drawArrange(float belowH, float rightW) {
                 if (ImGui::BeginPopup("midi_score_popup")) { drawMidiScoreMenu(t); ImGui::EndPopup(); }
                 ImGui::PopID();
             }
-            if (headerW >= S(90)) {
+            if (bodyMin.x - S(40) >= midiTitleEnd) {
                 ImGui::PushID(i);
                 ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(40), midiTop + S(2)));
                 if (ImGui::Button("-##hide_midi", ImVec2(S(24), 0))) t.midiHidden = true;
@@ -4942,6 +5430,68 @@ void drawArrange(float belowH, float rightW) {
                 if (ImGui::Button("Set all")) {
                     groupValue = std::min(hi, std::max(lo, groupValue));
                     for (int idx : g_autoSel) (*lane)[(size_t)idx].v = groupValue;
+                }
+                // ---- reshape the selected dots (live, from the dots as they were when this box opened)
+                {
+                    static std::vector<int> rsIdx;
+                    static std::vector<AutoPoint> rsOrig;
+                    static float rsDepthStart, rsDepthEnd, rsStretch, rsAmount, rsShift;
+                    static int rsWave;
+                    const bool fresh = ImGui::IsWindowAppearing() || rsIdx.size() != g_autoSel.size() || !std::equal(rsIdx.begin(), rsIdx.end(), g_autoSel.begin());
+                    if (fresh) {
+                        rsIdx.assign(g_autoSel.begin(), g_autoSel.end());
+                        rsOrig.clear();
+                        for (int idx : rsIdx) rsOrig.push_back((*lane)[(size_t)idx]);
+                        rsDepthStart = rsDepthEnd = 100.f; rsStretch = 100.f; rsAmount = 0.f; rsShift = 0.f; rsWave = 0;
+                    }
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Reshape the %d selected dots", (int)rsIdx.size());
+                    bool changed = false;
+                    ImGui::SetNextItemWidth(S(190));
+                    changed |= ImGui::SliderFloat("Depth start##rs_d0", &rsDepthStart, 0.f, 300.f, "%.0f %%");
+                    if (ImGui::IsItemHovered()) helpTip("How big the wave is at the first selected dot (100 % = as drawn, 0 % = flat in the middle).");
+                    ImGui::SetNextItemWidth(S(190));
+                    changed |= ImGui::SliderFloat("Depth end##rs_d1", &rsDepthEnd, 0.f, 300.f, "%.0f %%");
+                    if (ImGui::IsItemHovered()) helpTip("How big the wave is at the last selected dot. Start 100 % and end 300 % = a wave that slowly becomes wider.");
+                    ImGui::SetNextItemWidth(S(190));
+                    changed |= ImGui::SliderFloat("Time stretch##rs_st", &rsStretch, 25.f, 400.f, "%.0f %%");
+                    if (ImGui::IsItemHovered()) helpTip("Stretches or squeezes the selected dots in time, from the first dot.");
+                    ImGui::SetNextItemWidth(S(190));
+                    changed |= ImGui::SliderFloat("Move up / down##rs_sh", &rsShift, -100.f, 100.f, "%.0f %% of range");
+                    ImGui::SetNextItemWidth(S(190));
+                    changed |= ImGui::Combo("Wave##rs_wave", &rsWave, "Keep\0Square\0Triangle\0Sine\0Soft square\0");
+                    if (ImGui::IsItemHovered()) helpTip("Re-shapes the dots into another wave: a sine becomes a square (Square, Soft square) or a triangle. Triangle also turns a triangle into a sine.");
+                    if (rsWave != 0) {
+                        ImGui::SetNextItemWidth(S(190));
+                        changed |= ImGui::SliderFloat("Amount##rs_am", &rsAmount, 0.f, 100.f, "%.0f %%");
+                        if (ImGui::IsItemHovered()) helpTip("0 % = the drawn wave, 100 % = fully the chosen wave. Move slowly from 0 to 100 to morph.");
+                    }
+                    if (ImGui::Button("Reset##rs_reset")) {
+                        rsDepthStart = rsDepthEnd = 100.f; rsStretch = 100.f; rsAmount = 0.f; rsShift = 0.f; rsWave = 0;
+                        changed = true;
+                    }
+                    if (changed && rsOrig.size() == rsIdx.size() && !rsOrig.empty()) {
+                        double vMin = rsOrig[0].v, vMax = rsOrig[0].v;
+                        for (const AutoPoint& q : rsOrig) { vMin = std::min(vMin, q.v); vMax = std::max(vMax, q.v); }
+                        const double center = (vMin + vMax) * 0.5, half = (vMax - vMin) * 0.5;
+                        const double t0 = rsOrig.front().t, tSpan = rsOrig.back().t - t0;
+                        const double amt = rsAmount / 100.0;
+                        const double kPi = 3.14159265358979323846;
+                        for (size_t k = 0; k < rsIdx.size(); ++k) {
+                            const double x = tSpan > 1e-9 ? (rsOrig[k].t - t0) / tSpan : 0.0;
+                            const double depth = (rsDepthStart + (rsDepthEnd - rsDepthStart) * x) / 100.0;
+                            double n = half > 1e-12 ? (rsOrig[k].v - center) / half : 0.0;   // -1 .. 1
+                            double w = n;
+                            if (rsWave == 1) w = n >= 0.0 ? 1.0 : -1.0;
+                            else if (rsWave == 2) w = (2.0 / kPi) * std::asin(std::min(1.0, std::max(-1.0, n)));
+                            else if (rsWave == 3) w = std::sin(kPi * 0.5 * std::min(1.0, std::max(-1.0, n)));
+                            else if (rsWave == 4) w = std::tanh(6.0 * n) / std::tanh(6.0);
+                            n = rsWave == 0 ? n : n + (w - n) * amt;
+                            AutoPoint& dst = (*lane)[(size_t)rsIdx[k]];
+                            dst.v = std::min(hi, std::max(lo, center + n * half * depth + rsShift / 100.0 * (hi - lo)));
+                            dst.t = clampTimelineTime(t0 + (rsOrig[k].t - t0) * rsStretch / 100.0);
+                        }
+                    }
                 }
             }
             if (ImGui::Button("Delete selected dots")) {
@@ -6130,6 +6680,18 @@ void drawEditor() {
                     if (ImGui::IsItemHovered()) helpTip("How this clip appears in the printed score: shape, overall or detail, role, language");
                     if (ImGui::BeginPopup("clip_score_popup")) { drawClipScoreMenu(clip, &lane); ImGui::EndPopup(); }
                 }
+                {   // wave generator and capture of the code's own signal
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Wave...")) ImGui::OpenPopup("clip_wave_popup");
+                    if (ImGui::IsItemHovered()) helpTip("Write a sine / triangle / square / saw into an automation lane as dots, then drag it into the shape you need");
+                    if (ImGui::BeginPopup("clip_wave_popup")) { drawWavePopup(lane, clip); ImGui::EndPopup(); }
+                    {
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Capture...")) ImGui::OpenPopup("clip_capture_popup");
+                        if (ImGui::IsItemHovered()) helpTip("Record the signal your code sends to the automation (<caw> { rec: kLfo } in Csound, <caw> { send: \"rec\" } in Pd / SuperCollider) into an automation lane");
+                        if (ImGui::BeginPopup("clip_capture_popup")) { drawCapturePopup(lane, clip); ImGui::EndPopup(); }
+                    }
+                }
                 ImGui::SetWindowFontScale(1.f);
                 if (g_codeFonts[style]) ImGui::PopFont();
             }
@@ -6887,6 +7449,7 @@ void appFrame(float dt) {
         if (plain || withCtrl) toggleTimelinePlay();
     }
     updateMeters(dt);
+    updateRecording();
     {   // idle layout (meters of the current project while Csound is off)
         static int tick = 0;
         if (!g_liveCsound && (tick++ % 30) == 0) g_idleMeters = meterLayout(g_proj);
