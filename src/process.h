@@ -13,6 +13,7 @@ public:
 
     bool start(const std::string& commandLine, bool withInput = false);   // false -> see lastError(); withInput opens a stdin pipe
     bool writeInput(const std::string& text);     // text for the program's stdin (needs withInput)
+    void setHighPriority(bool on);                // the next start() runs the program at high CPU priority (the real-time audio engine: fewer dropouts)
     void stop();                                  // kills the process if needed and cleans up
     bool active() const;                          // started and not yet stopped
     bool running() const;                         // process is still alive

@@ -33,8 +33,10 @@ double autoValueAt(const std::vector<AutoPoint>& points, double time, double fal
 // MIDI for Pure Data / SuperCollider clips: the notes of every MIDI clip aimed at the clip, in absolute timeline seconds (sorted by start,
 // pitch and velocity clamped, a note never runs past its MIDI clip). The clip is rendered once with these notes baked in (wav from 0 s).
 constexpr double kMidiTail = 2.0;                                                // seconds rendered after the last note (release time)
+bool clipHasMidiNotes(const Project& p, int clipId);                                // the clip has MIDI notes in a MIDI clip
 std::vector<MidiNote> clipMidiNotes(const Project& p, int clipId);
-double midiWavLength(const Project& p, int clipId);                              // end of the last note + kMidiTail
+double midiWavOrigin(const Project& p, int clipId);                              // timeline second where the wav of a Pd / SC clip with midi: "on" starts: the clip start, or an earlier first note
+double midiWavLength(const Project& p, int clipId);                              // length of that wav: from the origin to the end of the clip / last note + kMidiTail
 // Folder for the files CAW makes while it runs (generated .csd files, Pd / SuperCollider renders): a CAW folder in the system temp folder.
 std::filesystem::path workDir();
 std::string pdWavPath(const std::string& name);

@@ -7,7 +7,7 @@ Installer coming later.
 
 ## Use
 - File > New project starts an empty project, File > Open project loads a `.caw` file.
-- **Csound / Pd / SC / Run all** (top bar): start only that language, or all three. The timeline (Play) triggers the languages that are running.
+- **Csound / Pd / SC / Run all** (top bar): start only that language, or all three. **Pd and SC do not start Csound**: their clips are rendered to wav files (only Pd / sclang needed) and played by a built-in player. Play never starts an engine, it only triggers the languages that are running. A clip with `midi: "on"` plays from its timeline box and its MIDI clips add their notes on top. Pd / SC with `midi: "on"` render one wav from the clip start (or the first note).
 - In a clip editor, **Run** runs only that clip, in its own language.
 - The master meter is the right panel (drag its left edge to resize). Right-click the spectrum for drawing detail, the signal display for the time window (x range).
 - Pure Data clips: build the patch in Pd (Edit in Pd, then Reload). The code editor shows the objects as readable text where you can change arguments.

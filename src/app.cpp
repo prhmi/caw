@@ -5,6 +5,7 @@
 #include "osc_sender.h"
 #include "pd_text.h"
 #include "process.h"
+#include "wavbridge.h"
 #include "project_io.h"
 #include "score_svg.h"
 #include "TextEditor.h"
@@ -14,8 +15,10 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdarg>
+#include <chrono>
 #include <cmath>
 #include <cctype>
+#include <deque>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -46,6 +49,7 @@ bool g_playing = false;
 int g_runMask = 7;                       // languages the engine and the timeline run: bit 0 Csound, bit 1 Pure Data, bit 2 SuperCollider
 bool langOn(int lang) { return ((g_runMask >> std::min(2, std::max(0, lang))) & 1) != 0; }
 bool g_liveCsound = false;
+bool g_bridgeLive = false;   // Pd / SC run on their own: the built-in wav player plays the rendered clips, Csound is not started (and not needed)
 float g_pps = 80.f;           // pixels per second (zoom)
 float g_scrollX = 0.f;        // seconds
 float g_scrollY = 0.f;        // pixels
@@ -1887,10 +1891,22 @@ bool handleMonitorLine(const std::string& l) {
     return true;
 }
 
+double engineOutputLatency();
+
+// The meters, scope and spectrum are measured when Csound COMPUTES the sound, which is one output buffer before you hear it.
+// The frames are held back by the same output latency (plus the sync offset from Settings), so the meters move with the sound.
 void pollMonitor() {
+    static std::deque<std::pair<std::chrono::steady_clock::time_point, MonPacket>> held;
     std::vector<MonPacket> packets;
     monitorPoll(packets);
-    for (const MonPacket& pk : packets) applyMonitor(pk.tag, pk.start, pk.values);
+    const auto now = std::chrono::steady_clock::now();
+    const auto delay = std::chrono::microseconds((long long)(engineOutputLatency() * 1e6));
+    for (MonPacket& pk : packets) held.emplace_back(now + delay, std::move(pk));
+    while (!held.empty() && held.front().first <= now) {
+        applyMonitor(held.front().second.tag, held.front().second.start, held.front().second.values);
+        held.pop_front();
+    }
+    if (held.size() > 4000) held.clear();
 }
 
 void drainPlayOutput() {
@@ -2059,10 +2075,34 @@ void updateMeters(float dt) {
     }
 }
 
+// ---- engine bridge: one place that knows who plays the timeline events (the Csound engine over OSC, or the built-in Pd / SC player)
+bool engineIsUp() { return g_bridgeLive || (g_liveCsound && !g_playWaiting && g_playProc.running()); }
+const Clip* findClipByName(const std::string& name) {
+    for (const Track& t : g_proj.tracks) for (const Clip& c : t.clips) if (c.name == name) return &c;
+    return nullptr;
+}
+bool sendEngine(const std::vector<OscMsg>& msgs) {
+    if (!g_bridgeLive) return sendOsc(msgs);
+    bool ok = true;
+    for (const OscMsg& m : msgs) {
+        if (m.address == "/caw/off") { wavbridge::off(m.name); continue; }
+        if (m.address != "/caw/i") continue;                       // automation of Csound channels: nothing to do without Csound
+        const Clip* c = findClipByName(m.name);
+        if (!c || c->lang < 1) continue;                           // a Csound clip cannot play without Csound
+        const double delay = m.values.size() > 0 ? m.values[0] : 0.0;
+        const double dur = m.values.size() > 1 ? m.values[1] : 0.0;
+        const double offset = m.values.size() > 2 ? m.values[2] : 0.0;   // Pd / SC clip: p4 = seconds already played
+        std::string err;
+        if (!wavbridge::play(pdWavPath(c->name), c->name, delay, dur, offset, err)) { logLine("[caw] " + std::string(c->lang == 2 ? "SuperCollider" : "Pure Data") + " player: " + err); ok = false; }
+    }
+    return ok;
+}
+
 // Stops the Csound engine only. The timeline (Play) is independent and keeps its own state.
 void stopPlayback() {
     g_playProc.stop();
     drainPlayOutput();
+    if (g_bridgeLive) { wavbridge::stop(); g_bridgeLive = false; }
     g_playing = false;
     g_liveCsound = false;
     g_playWaiting = false;
@@ -2073,6 +2113,17 @@ void stopPlayback() {
 void startPlaybackNow(bool liveMode) {
     if (g_renderActive) { logLine("[caw] A render is running - wait for it or cancel it first."); return; }
     diagClearAll();
+    if (liveMode && (g_runMask & 1) == 0) {
+        // Pd and / or SuperCollider only: no Csound needed. The rendered wav files are played by the built-in player.
+        std::string err;
+        if (!wavbridge::start(std::max(8000, g_proj.cs.sr), err)) { logLine("[caw] ERROR: " + err); return; }
+        g_bridgeLive = true;
+        g_liveCsound = false;
+        g_playWaiting = false;
+        g_resync = 1;
+        logLine(std::string("[caw] ") + (g_runMask == 2 ? "Pure Data" : g_runMask == 4 ? "SuperCollider" : "Pure Data + SuperCollider") + " runs on its own (Csound is not started). The timeline (Play) plays the rendered clips.");
+        return;
+    }
     const std::string csdPath = (workDir() / "caw_play.csd").string();
     if (!writeTextFile(csdPath, buildCsd(g_proj, liveMode ? "engine" : "dac", g_play, &g_orcSpans))) {
         logLine("[caw] ERROR: could not write " + csdPath);
@@ -2081,6 +2132,7 @@ void startPlaybackNow(bool liveMode) {
     const std::string cmd = "\"" + csoundExePath() + "\" \"" + csdPath + "\"";
     logLine(liveMode ? "[caw] Run (engine runs like CsoundQt until Stop; the timeline only triggers instruments): " + cmd
                      : "[caw] Play from " + std::to_string(g_play) + " s: " + cmd);
+    g_playProc.setHighPriority(true);   // the live engine must not be starved by the UI or other programs
     if (!g_playProc.start(cmd, false)) {
         logLine("[caw] ERROR: " + g_playProc.lastError());
         return;
@@ -2166,21 +2218,23 @@ void collectTimelineEvents(double t0, double t1, bool active, double now, std::v
         for (const Clip& clip : t.clips) {
             if (clip.muted || !langOn(clip.lang)) continue;
             const ParsedTrack pc = parseClip(clip);
-            if (pc.midiEnabled) {
-                // played by its MIDI clips below
-            } else {
+            if (pc.midiEnabled && clip.lang >= 1) {
+                // Pd / SuperCollider with midi: "on": ONE wav (the patch itself + its MIDI notes) that starts where the clip starts on the timeline
+                if (pdMidiStarted.insert(clip.id).second) {
+                    const double org = midiWavOrigin(g_proj, clip.id);
+                    emit(clip.name, org, org + midiWavLength(g_proj, clip.id), 0.f, 0.f, true);
+                }
+            } else {   // a Csound clip always plays from its box; with midi: "on" its MIDI clips add their notes on top (below)
                 const int runs = (pc.launcher || clip.lang >= 1) ? 1 : std::min(256, std::max(1, clip.runs));   // a Pd clip is one piece of wav: never split
                 for (int r = 0; r < runs; ++r)
-                    emit(clip.name, clip.start + clip.dur * (double)r / runs, clip.start + clip.dur * (double)(r + 1) / runs, 0.f, 0.f, clip.lang >= 1);
+                    emit(clip.name, clip.start + clip.dur * (double)r / runs, clip.start + clip.dur * (double)(r + 1) / runs,
+                         pc.midiEnabled && clip.lang == 0 ? 60.f : 0.f, pc.midiEnabled && clip.lang == 0 ? 100.f : 0.f, clip.lang >= 1);   // midi: "on" without notes: the box plays like the editor Run (p4 60, p5 100)
             }
         }
         for (const MidiClip& mc : t.midiClips) {
             const Clip* target = findClip(mc.clipId);
             if (!target || target->muted || !langOn(target->lang)) continue;
-            if (target->lang >= 1) {   // Pure Data / SuperCollider: the notes are inside the rendered wav (timeline 0 s = wav 0 s), start it once
-                if (pdMidiStarted.insert(target->id).second) emit(target->name, 0.0, midiWavLength(g_proj, target->id), 0.f, 0.f, true);
-                continue;
-            }
+            if (target->lang >= 1) continue;   // Pure Data / SuperCollider: the notes are inside the wav that the clip itself starts (above)
             const double mcEnd = mc.start + mc.dur;
             for (const MidiNote& n : mc.notes) {
                 if (n.start >= mc.dur) continue;
@@ -2231,7 +2285,15 @@ void silenceEngine() {
     for (const Track& t : g_proj.tracks) for (const Clip& c : t.clips) names.insert(c.name);
     std::vector<OscMsg> out;
     for (const std::string& n : names) { OscMsg m; m.address = "/caw/off"; m.name = n; out.push_back(m); }
-    if (!out.empty()) sendOsc(out);
+    if (!out.empty()) sendEngine(out);
+}
+
+// How long a sound needs from the moment the engine starts it until it comes out of the speakers (hardware buffer -B, or the Pd / SC player).
+// The timeline sends events this much EARLIER, so the sound is heard when the playhead is at the event, not one buffer later.
+double engineOutputLatency() {
+    const double sync = (double)g_proj.cs.syncMs / 1000.0;   // Settings > Audio > Sound sync: tuned by ear / eye until the sound meets the playhead
+    if (g_bridgeLive) return std::max(0.0, std::min(1.0, wavbridge::latencyMs() / 1000.0 + sync));
+    return std::max(0.0, std::min(1.0, (double)std::max(0, g_proj.cs.bufHW) / (double)std::max(1000, g_proj.cs.sr) + sync));
 }
 
 void tickTimeline(float dt) {
@@ -2239,7 +2301,7 @@ void tickTimeline(float dt) {
     // It never starts Csound by itself: that is the job of the "Run" button.
     const double lookahead = 0.06;
     if (g_drag == Drag::Playhead) { g_resync = 2; return; }  // wait until the playhead is released
-    const bool engineUp = g_liveCsound && !g_playWaiting && g_playProc.running();
+    const bool engineUp = engineIsUp();
     if (!engineUp) {
         g_play += dt;            // silent playhead move; sync with the engine as soon as it is up
         g_schedT = g_play;
@@ -2255,10 +2317,11 @@ void tickTimeline(float dt) {
     } else {
         g_play += dt;
     }
-    const double t1 = g_play + lookahead;
-    collectTimelineEvents(g_schedT, t1, false, g_play, out);
+    const double lat = engineOutputLatency();
+    const double t1 = g_play + lat + lookahead;   // events are sent `lat` early: their delay is counted from where the sound will be heard
+    collectTimelineEvents(g_schedT, t1, false, g_play + lat, out);
     g_schedT = t1;
-    if (!out.empty() && !sendOsc(out)) logLine("[caw] Could not send timeline events to Csound (UDP socket error).");
+    if (!out.empty() && !sendEngine(out)) logLine(g_bridgeLive ? "[caw] Could not send timeline events to the Pd / SC player." : "[caw] Could not send timeline events to Csound (UDP socket error).");
     static int sentLogged = 0;   // diagnostics: the first events of each Play (compare with the "i ..." lines Csound prints when it receives them)
     if (g_play < 0.5 + dt) sentLogged = 0;
     for (const OscMsg& m : out)
@@ -2656,11 +2719,12 @@ void ensurePdRendered(std::function<void()> after, const std::string& only) {
             for (const PdSend& sd : pc.pdSends) sends.push_back(sd.name);
             const bool midi = pc.midiEnabled;                                   // MIDI clip: wav from timeline 0 s, long as the notes
             const double jobDur = midi ? midiWavLength(g_proj, c.id) : c.dur;
-            const double jobStart = midi ? 0.0 : c.start;
+            const double jobStart = midi ? midiWavOrigin(g_proj, c.id) : c.start;   // midi: the wav starts where the clip (or its first note) starts on the timeline
             std::vector<MidiNote> notes;
             std::string noteText;
             if (midi) {
                 notes = clipMidiNotes(g_proj, c.id);
+                for (MidiNote& n : notes) n.start = std::max(0.0, n.start - jobStart);   // note times inside the wav are relative to its origin
                 for (const MidiNote& n : notes) noteText += std::to_string(n.start) + ":" + std::to_string(n.dur) + ":" + std::to_string(n.pitch) + ":" + std::to_string(n.velocity) + ",";
             }
             std::vector<std::pair<std::string, std::vector<double>>> autos;   // automation of this lane, sampled every 10 ms from the clip start
@@ -2682,7 +2746,7 @@ void ensurePdRendered(std::function<void()> after, const std::string& only) {
             const std::map<int, std::vector<double>> pv = cawCopyValues(c.code, copies);
             std::string pvText = "x" + std::to_string(copies) + ":";
             for (const auto& kv : pv) { pvText += "p" + std::to_string(kv.first) + "="; for (double v : kv.second) pvText += numText(v) + ","; pvText += ";"; }
-            const size_t hash = std::hash<std::string>()("v4|" + pvText + "|" + std::to_string(c.lang) + "|" + patch + "|" + std::to_string(jobDur) + "|" + std::to_string(g_proj.cs.sr) + "|" + autoText + "|" + sendText + "|" + (midi ? "midi|" + noteText : std::string()));
+            const size_t hash = std::hash<std::string>()("v4|" + pvText + "|" + std::to_string(c.lang) + "|" + patch + "|" + std::to_string(jobDur) + "|" + std::to_string(g_proj.cs.sr) + "|" + autoText + "|" + sendText + "|" + (midi ? "midi|" + std::to_string(jobStart) + "|" + noteText : std::string()));
             const auto done = g_pdDone.find(c.name);
             std::error_code ec;
             if (done != g_pdDone.end() && done->second == hash && std::filesystem::exists(pdWavPath(c.name), ec)) continue;
@@ -2832,6 +2896,13 @@ void describeHits(LogLine& row, const std::string& clipName, const std::vector<L
     }
 }
 
+// sclang prints problems of the USER'S OWN SuperCollider installation while it compiles its class library, before the clip is even read:
+// a Quark folder that is gone ("Could not open directory ... downloaded-quarks"), or a Quark that extends a class the SuperCollider version no
+// longer has ("Class extension for nonexistent class 'Document'", MKtl...). They are not errors of the clip and do not stop the render.
+bool isScInstallNoise(const std::string& l) {
+    return l.find("Could not open directory") != std::string::npos || l.find("Class extension for nonexistent class") != std::string::npos;
+}
+
 // One output line of a Pure Data / SuperCollider render.
 void logPdLine(const std::string& raw) {
     const bool sc = g_pdCurrent.lang == 2;
@@ -2846,6 +2917,15 @@ void logPdLine(const std::string& raw) {
         if (t == "... couldn't create" && !g_pdPrevText.empty()) l = g_pdPrevText + " ... couldn't create";
         else g_pdPrevText = t;
     } else {
+        if (isScInstallNoise(l)) {   // detail only (hidden with the default filter), not an error of the clip
+            static bool hinted = false;
+            if (!hinted) {
+                hinted = true;
+                logLine("[caw] SuperCollider prints warnings about its own installation (a missing Quark folder or a Quark for a class this version does not have, e.g. Document / MKtl). They do not affect CAW. To remove them: in SuperCollider run Quarks.gui and uninstall the Quark, or delete the stale folders under AppData\\Local\\SuperCollider\\downloaded-quarks.");
+            }
+            LogLine d = classifyLog(prefix + l); d.level = kLogDetail; pushLog(std::move(d));
+            return;
+        }
         if (l.rfind("RECEIVER:", 0) == 0 || l.find("CALL STACK:") != std::string::npos) g_scSkip = true;
         if (l.rfind("^^", 0) == 0) {   // end of the call stack: repeats the error line
             g_scSkip = false;
@@ -2948,7 +3028,8 @@ void pollPdJob(float dt) {
     for (const std::string& l : g_pdProc.takeOutput()) {
         std::string low = l;
         std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-        if (low.find("error") != std::string::npos || low.find("couldn't create") != std::string::npos || low.find("unknown option") != std::string::npos) g_pdErrorSeen = true;
+        if (!(g_pdCurrent.lang == 2 && isScInstallNoise(l)) &&
+            (low.find("error") != std::string::npos || low.find("couldn't create") != std::string::npos || low.find("unknown option") != std::string::npos)) g_pdErrorSeen = true;
         logPdLine(l);
     }
     const bool timeout = g_pdT > g_pdCurrent.dur + 60.0;
@@ -2963,7 +3044,7 @@ void pollPdJob(float dt) {
             logLine(std::string("[caw] ") + (g_pdCurrent.lang == 2 ? "SuperCollider: " : "Pure Data: ") + g_pdCurrent.name + " rendered.");
         } else {
             if (ok) g_pdDone[g_pdCurrent.name] = g_pdCurrent.hash;
-            logLine(std::string("[caw] ") + (g_pdCurrent.lang == 2 ? "SuperCollider: " : "Pure Data: ") + g_pdCurrent.name + (ok ? " rendered, but Pd printed errors (see above)." : (timeout ? " timed out, no sound was written." : " failed, no sound was written - see messages above.")));
+            logLine(std::string("[caw] ") + (g_pdCurrent.lang == 2 ? "SuperCollider: " : "Pure Data: ") + g_pdCurrent.name + (ok ? (g_pdCurrent.lang == 2 ? " rendered, but SuperCollider printed errors (see above)." : " rendered, but Pd printed errors (see above).") : (timeout ? " timed out, no sound was written." : " failed, no sound was written - see messages above.")));
             if (!ok) { g_pdQueue.clear(); g_afterPd = nullptr; return; }
         }
         startNextPdJob();
@@ -2985,7 +3066,7 @@ void runClip(const Clip& clip) {
 
 void runClipNow(const Clip& clip) {
     if (g_renderActive) { logLine("[caw] A render is running - wait for it or cancel it first."); return; }
-    if (g_liveCsound && !g_playWaiting && g_playProc.running()) {   // "Run" is running: play the whole clip in that engine
+    if (engineIsUp() && (!g_bridgeLive || clip.lang >= 1)) {   // "Run" is running: play the whole clip in that engine
         const ParsedTrack pc = parseClip(clip);
         OscMsg m;
         m.address = "/caw/i";
@@ -2994,9 +3075,23 @@ void runClipNow(const Clip& clip) {
         m.values = {0.f, pdMidi ? (float)midiWavLength(g_proj, clip.id) : (float)clip.dur, pc.midiEnabled && clip.lang == 0 ? 60.f : 0.f, pc.midiEnabled && clip.lang == 0 ? 100.f : 0.f, 0.f};
         std::vector<OscMsg> one;
         one.push_back(std::move(m));
-        if (sendOsc(one)) g_runName = clip.name, g_runLeft = clip.dur;
+        if (sendEngine(one)) g_runName = clip.name, g_runLeft = clip.dur;
         if (g_runLeft > 0.0 && g_runName == clip.name) logLine("[caw] Run clip " + clip.name + ": playing the whole clip (" + std::to_string(clip.dur) + " s) in the running Csound. Restart Run if you changed the code since it started.");
         else logLine("[caw] Could not send the clip to Csound (UDP socket error).");
+        return;
+    }
+    if (clip.lang >= 1 && !g_liveCsound) {   // Pd / SuperCollider clip and no engine: play it with the built-in player (no Csound needed)
+        if (!g_bridgeLive) {
+            std::string err;
+            if (!wavbridge::start(std::max(8000, g_proj.cs.sr), err)) { logLine("[caw] ERROR: " + err); return; }
+            g_bridgeLive = true;
+            g_runMask = 1 << clip.lang;
+        }
+        OscMsg m;
+        m.address = "/caw/i";
+        m.name = clip.name;
+        m.values = {0.f, (float)clip.dur, 0.f, 0.f, 0.f};
+        if (sendEngine(std::vector<OscMsg>{m})) { g_runName = clip.name; g_runLeft = clip.dur; logLine("[caw] Run clip " + clip.name + ": playing (" + std::to_string(clip.dur) + " s), Csound is not needed."); }
         return;
     }
     diagClearClip(clip.name);
@@ -3027,7 +3122,7 @@ void stopClipRun(const Clip& clip) {
         OscMsg m;
         m.address = "/caw/off";
         m.name = clip.name;
-        sendOsc(std::vector<OscMsg>{m});
+        sendEngine(std::vector<OscMsg>{m});
         g_runLeft = 0.0;
     }
     if (g_testProc.active() && g_test.name == clip.name) g_testProc.stop();
@@ -3132,6 +3227,17 @@ void pollProcesses(float dt) {
             if (handleMonitorLine(l)) { g_sectionSeen = true; continue; }
             logCsoundLine(l);
             if (l.find("SECTION 1") != std::string::npos) g_sectionSeen = true;
+            {   // the sound card could not be opened: the engine never starts, so the timeline has nobody to play the clips
+                std::string low = l;
+                std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+                static bool hinted = false;
+                if (!g_playWaiting && !g_sectionSeen) hinted = false;
+                if (!hinted && (low.find("unable to open") != std::string::npos || low.find("error opening") != std::string::npos || low.find("portaudio error") != std::string::npos ||
+                                low.find("failed to initialise") != std::string::npos || low.find("failed to initialize") != std::string::npos || low.find("audio device") != std::string::npos)) {
+                    hinted = true;
+                    logLine("[caw] Csound could not open the sound card at " + std::to_string(g_proj.cs.sr) + " Hz. Set the sample rate in Settings to the rate of your Windows output device (usually 48000) and the right output device, then press Run again.");
+                }
+            }
         }
         if (!g_scopeDivSent && g_liveCsound && !g_playWaiting) {   // tell the engine how long one scope screen is
             OscMsg m;
@@ -3277,7 +3383,7 @@ bool timelinePlaying() { return g_timelineRun; }
 void toggleTimelinePlay() {
     if (g_timelineRun) {
         g_timelineRun = false;
-        if (g_liveCsound && g_playProc.running()) silenceEngine();
+        if (engineIsUp()) silenceEngine();
     } else {
         g_timelineRun = true;
         g_resync = 1;
@@ -3361,13 +3467,15 @@ void drawTransport() {
     char statusText[96];
     ImVec4 statusCol(0.55f, 0.55f, 0.60f, 1.f);
     if (g_renderActive) { std::snprintf(statusText, sizeof statusText, "Rendering..."); statusCol = ImVec4(0.95f, 0.60f, 0.20f, 1.f); }
-    else if (g_playing && g_playWaiting) { std::snprintf(statusText, sizeof statusText, "Starting Csound..."); statusCol = ImVec4(0.95f, 0.60f, 0.20f, 1.f); }
-    else if (g_liveCsound) {
-        const char* what = g_runMask == 1 ? "Csound" : g_runMask == 2 ? "Pd" : g_runMask == 4 ? "SuperCollider" : "Csound + Pd + SC";
-        std::snprintf(statusText, sizeof statusText, "%s running", what);
+    else if (g_playing && g_playWaiting) { std::snprintf(statusText, sizeof statusText, "Csound is starting..."); statusCol = ImVec4(0.95f, 0.60f, 0.20f, 1.f); }
+    else if (g_pdBusy || !g_pdQueue.empty()) { std::snprintf(statusText, sizeof statusText, "Preparing Pd / SC clips..."); statusCol = ImVec4(0.95f, 0.60f, 0.20f, 1.f); }
+    else if (g_liveCsound || g_bridgeLive) {
+        const char* what = g_runMask == 1 ? "Csound live" : g_runMask == 2 ? "Pd live (no Csound)" : g_runMask == 4 ? "SuperCollider live (no Csound)" :
+                           g_runMask == 6 ? "Pd + SC live (no Csound)" : g_runMask == 3 ? "Csound + Pd live" : g_runMask == 5 ? "Csound + SC live" : "All engines live: Csound, Pd, SC";
+        std::snprintf(statusText, sizeof statusText, "%s", what);
         statusCol = ImVec4(0.40f, 0.85f, 0.50f, 1.f);
     }
-    else { std::snprintf(statusText, sizeof statusText, "Stopped"); }
+    else { std::snprintf(statusText, sizeof statusText, "Engines off"); }
     char engineText[96];
     std::snprintf(engineText, sizeof engineText, "%d Hz | ksmps %d | %d ch", cs.sr, cs.ksmps, cs.nchnls);
     const float dotW = S(14);
@@ -3404,19 +3512,19 @@ void drawTransport() {
     {   // one engine button per language, and one for all three. The running one turns into Stop.
         struct Run { const char* label; int mask; const char* tip; };
         static const Run runs[] = {
-            {"Csound", 1, "Run only the Csound clips"}, {"Pd", 2, "Run only the Pure Data clips"},
-            {"SC", 4, "Run only the SuperCollider clips"}, {"Run all", 7, "Run Csound, Pure Data and SuperCollider together"}};
+            {"Csound", 1, "Run only the Csound clips"}, {"Pd", 2, "Run only the Pure Data clips (Csound is not needed)"},
+            {"SC", 4, "Run only the SuperCollider clips (Csound is not needed)"}, {"Run all", 7, "Run Csound, Pure Data and SuperCollider together"}};
         for (const Run& r : runs) {
-            const bool on = g_liveCsound && g_runMask == r.mask;
+            const bool on = (g_liveCsound || g_bridgeLive) && g_runMask == r.mask;
             if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.42f, 0.24f, 1.f));
             std::string label = (on ? "Stop " : "") + std::string(r.label);
             if (ImGui::Button(label.c_str())) {
-                const bool wasLive = g_liveCsound;
+                const bool wasLive = g_liveCsound || g_bridgeLive;
                 if (wasLive) stopPlayback();
                 if (!(on && wasLive)) { g_runMask = r.mask; startPlayback(true); }
             }
             if (on) ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered()) helpTip("%s. The orchestra stays alive until you press Stop; the timeline (Play) only triggers the languages that are running.", r.tip);
+            if (ImGui::IsItemHovered()) helpTip("%s. It stays alive until you press Stop; the timeline (Play) only triggers the languages that are running.", r.tip);
             ImGui::SameLine(0, S(3));
         }
     }
@@ -6141,7 +6249,7 @@ bool devCombo(const char* label, int& idx, const std::vector<AudioDevice>& list)
 
 // ---- engine settings as typed text: ONE box holds the Csound options line and the header values
 //      -odac -+rtaudio=portaudio -b1024 -B4096 -d
-//      sr = 44100
+//      sr = 48000
 //      ksmps = 32 ...
 std::string engineSettingsToText(const CsoundSettings& s) {
     std::ostringstream o;
@@ -6223,128 +6331,199 @@ std::string engineTextProblems(const std::string& text) {
 
 void drawSettings() {
     if (!g_settingsOpen) return;
-    ImGui::SetNextWindowSize(ImVec2(S(520), S(560)), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(S(600), S(560)), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(S(260), S(90)), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Csound settings", &g_settingsOpen)) {
+    if (ImGui::Begin("Settings", &g_settingsOpen)) {
         CsoundSettings& s = g_proj.cs;
-        const float labelW = S(150);
+        const float labelW = S(170);
         auto row = [&](const char* name) {
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted(name);
             ImGui::SameLine(labelW);
-            ImGui::SetNextItemWidth(S(240));
+            ImGui::SetNextItemWidth(S(260));
         };
+        const ImVec4 head(0.95f, 0.60f, 0.20f, 1.f);
+        if (ImGui::BeginTabBar("##settings_tabs")) {
 
-        ImGui::TextColored(ImVec4(0.95f, 0.60f, 0.20f, 1.f), "AUDIO DEVICE");
-        row("Csound audio module");
-        if (s.rtaudio == "asio" || s.rtaudio == "wasapi" || s.rtaudio == "dsound" || s.rtaudio == "directsound") s.rtaudio = "portaudio";
-        if (s.rtaudio == "winmm") s.rtaudio = "winmme";
-        const char* backendLabel = s.rtaudio == "winmme" ? "Windows MME (winmme)" : s.rtaudio == "jack" ? "JACK" : "PortAudio";
-        if (ImGui::BeginCombo("##rt", backendLabel)) {
-            const std::pair<const char*, const char*> backends[] = {
-                {"PortAudio (ASIO / WASAPI / DirectSound devices)", "portaudio"},
-                {"Windows MME (winmme)", "winmme"}, {"JACK", "jack"}};
-            for (const auto& backend : backends) {
-                if (ImGui::Selectable(backend.first, s.rtaudio == backend.second)) {
-                    s.rtaudio = backend.second;
-                    s.outDev = s.inDev = -1;
-                    syncOptionsFromSettings(s);
-                    refreshAudioDevices();
+            // ---------------------------------------------------------- Audio: sound card, sample rate, buffers, latency
+            if (ImGui::BeginTabItem("Audio")) {
+                ImGui::TextColored(head, "SOUND CARD");
+                row("Driver type");
+                if (s.rtaudio == "asio" || s.rtaudio == "wasapi" || s.rtaudio == "dsound" || s.rtaudio == "directsound") s.rtaudio = "portaudio";
+                if (s.rtaudio == "winmm") s.rtaudio = "winmme";
+                const char* backendLabel = s.rtaudio == "winmme" ? "Windows MME" : s.rtaudio == "jack" ? "JACK" : "PortAudio (ASIO, WASAPI, DirectSound)";
+                if (ImGui::BeginCombo("##rt", backendLabel)) {
+                    const std::pair<const char*, const char*> backends[] = {
+                        {"PortAudio (ASIO, WASAPI, DirectSound)", "portaudio"}, {"Windows MME", "winmme"}, {"JACK", "jack"}};
+                    for (const auto& backend : backends) {
+                        if (ImGui::Selectable(backend.first, s.rtaudio == backend.second)) {
+                            s.rtaudio = backend.second;
+                            s.outDev = s.inDev = -1;
+                            syncOptionsFromSettings(s);
+                            refreshAudioDevices();
+                        }
+                    }
+                    ImGui::EndCombo();
                 }
+                if (ImGui::IsItemHovered()) helpTip("ASIO is a PortAudio device type on Windows: keep PortAudio and pick your ASIO device below.");
+                row("Output device");
+                if (devCombo("##out", s.outDev, g_outDevs)) syncOptionsFromSettings(s);
+                if (ImGui::IsItemHovered()) helpTip("The device that plays the sound (-odac). System default or None are possible.");
+                row("Input device");
+                if (devCombo("##in", s.inDev, g_inDevs)) syncOptionsFromSettings(s);
+                if (ImGui::IsItemHovered()) helpTip("The device Csound records from (-iadc), only needed if instruments use inch / in.");
+                row("");
+                if (ImGui::Button("Refresh device list")) refreshAudioDevices();
+
+                ImGui::Spacing();
+                ImGui::TextColored(head, "ENGINE");
+                row("Sample rate");
+                {
+                    static const int rates[] = {44100, 48000, 88200, 96000, 192000};
+                    if (ImGui::BeginCombo("##sr", (std::to_string(s.sr) + " Hz").c_str())) {
+                        for (int r : rates) if (ImGui::Selectable((std::to_string(r) + " Hz").c_str(), s.sr == r)) s.sr = r;
+                        ImGui::EndCombo();
+                    }
+                    if (ImGui::IsItemHovered()) helpTip("Use the sample rate of your sound card / ASIO driver (see its control panel). A different rate makes Windows or the driver convert, which can crackle.");
+                }
+                row("Control period (ksmps)");
+                ImGui::InputInt("##ksmps", &s.ksmps, 0, 0);
+                s.ksmps = std::min(4096, std::max(1, s.ksmps));
+                row("Output channels (nchnls)");
+                ImGui::InputInt("##nchnls", &s.nchnls, 1, 1);
+                s.nchnls = std::min(64, std::max(1, s.nchnls));
+                ImGui::TextDisabled("kr = sr / ksmps = %.1f Hz", (double)s.sr / std::max(1, s.ksmps));
+
+                ImGui::Spacing();
+                ImGui::TextColored(head, "BUFFER AND LATENCY");
+                {
+                    row("Audio buffer size");
+                    {
+                        static const int sizes[] = {32, 64, 128, 256, 512, 1024, 2048, 4096};
+                        const double srv = (double)std::max(1000, s.sr);
+                        char cur[64];
+                        std::snprintf(cur, sizeof cur, "%d samples (%.1f ms)", s.bufSW, 1000.0 * s.bufSW / srv);
+                        if (ImGui::BeginCombo("##bufsize", cur)) {
+                            for (int n : sizes) {
+                                char item[64];
+                                std::snprintf(item, sizeof item, "%d samples (%.1f ms)", n, 1000.0 * n / srv);
+                                if (ImGui::Selectable(item, s.bufSW == n)) { s.bufSW = n; s.bufHW = n * 2; syncOptionsFromSettings(s); }
+                            }
+                            ImGui::EndCombo();
+                        }
+                        if (ImGui::IsItemHovered()) helpTip("Like the buffer size in Cabbage: ONE number. With ASIO choose the buffer size of your ASIO driver (its control panel); the hardware buffer is set to twice that.\nSmaller = less latency but more risk of crackling.");
+                    }
+                    row("Sound sync (ms)");
+                    ImGui::SliderInt("##syncms", &s.syncMs, -100, 400, "%d ms");
+                    if (ImGui::IsItemHovered()) helpTip("The timeline and the meters are moved by the output latency so that you hear a note when the playhead reaches it.\nASIO drivers often have more latency than the buffer size says: raise this until the sound meets the playhead. Also moves the meters.");
+                    const double srv = (double)std::max(1000, s.sr);
+                    const double outMs = 1000.0 * (double)s.bufHW / srv;
+                    ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.60f, 1.f), "Output latency about %.1f ms (+ %d ms sync) | Pd / SC player (no Csound) %.1f ms", outMs, s.syncMs, wavbridge::latencyMs());
+                    if (ImGui::TreeNode("Advanced buffers (-b / -B)")) {
+                        row("Software buffer (-b)");
+                        if (ImGui::InputInt("##bufsw", &s.bufSW, 64, 256)) { s.bufSW = std::min(16384, std::max(16, s.bufSW)); syncOptionsFromSettings(s); }
+                        row("Hardware buffer (-B)");
+                        if (ImGui::InputInt("##bufhw", &s.bufHW, 256, 1024)) { s.bufHW = std::min(65536, std::max(16, s.bufHW)); syncOptionsFromSettings(s); }
+                        ImGui::TextDisabled("Input latency about %.1f ms | round trip %.1f ms", outMs, outMs * 2.0);
+                        ImGui::TreePop();
+                    }
+                    if (s.bufHW < s.bufSW) ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.3f, 1.f), "-B should be at least as large as -b");
+                    else if (s.bufHW % std::max(1, s.bufSW) != 0) ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1.f), "-B should be a multiple of -b (e.g. 2 times), otherwise the sound can glitch");
+                    if (s.bufSW < s.ksmps) ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.3f, 1.f), "-b should be at least ksmps");
+                    else if (s.bufSW % std::max(1, s.ksmps) != 0) ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1.f), "-b should be a multiple of ksmps");
+                }
+                ImGui::Spacing();
+                ImGui::Checkbox("Send meter data from Csound (master, scope, spectrum, track meters)", &s.monitorFeed);
+                if (ImGui::IsItemHovered()) helpTip("Adds a small monitor instrument to the engine. Untick it if Csound reports an error about it, or to give a slow computer more room (less crackling). Applies on the next Run.");
+                ImGui::EndTabItem();
             }
-            ImGui::EndCombo();
-        }
-        ImGui::TextDisabled("ASIO is a PortAudio host API on Windows, not a Csound -+rtaudio module. Pick an ASIO, WASAPI, or DirectSound device below.");
-        row("Output soundcard");
-        if (devCombo("##out", s.outDev, g_outDevs)) syncOptionsFromSettings(s);
-        if (ImGui::IsItemHovered()) helpTip("Csound -odac<N>: the device that plays the sound. System default = -odac. None = no soundcard is opened (Csound still runs in real time, you hear nothing)");
-        row("Input soundcard");
-        if (devCombo("##in", s.inDev, g_inDevs)) syncOptionsFromSettings(s);
-        if (ImGui::IsItemHovered()) helpTip("Csound -iadc<N>: the device Csound records from (only needed if instruments use inch / in). None = no input device");
-        row("");
-        if (ImGui::Button("Refresh Csound devices")) refreshAudioDevices();
-        ImGui::TextDisabled("Device labels and IDs come directly from the selected Csound audio module.");
 
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.95f, 0.60f, 0.20f, 1.f), "EDITOR APPEARANCE");
-        row("Font size");
-        ImGui::SliderFloat("##editor_font_size", &g_proj.cs.editorFontSize, 10.f, 30.f, "%.0f px");
-        row("Font style");
-        const char* editorStyles[] = {"Regular", "Bold", "Italic"};
-        g_proj.cs.editorFontStyle = std::min(2, std::max(0, g_proj.cs.editorFontStyle));
-        if (ImGui::BeginCombo("##editor_font_style", editorStyles[g_proj.cs.editorFontStyle])) {
-            for (int i = 0; i < 3; ++i)
-                if (ImGui::Selectable(editorStyles[i], g_proj.cs.editorFontStyle == i)) g_proj.cs.editorFontStyle = i;
-            ImGui::EndCombo();
-        }
-        ImGui::TextDisabled("Source is syntax-highlighted live while you edit.");
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.95f, 0.60f, 0.20f, 1.f), "CSOUND OPTIONS + ENGINE (type here)");
-        {
-            static std::string text;
-            static bool editing = false;
-            if (!editing) text = engineSettingsToText(s);
-            const ImVec2 boxSize(-FLT_MIN, S(190));
-            if (inputMulti("##engine_text", text, boxSize, 0)) applyEngineText(s, text);
-            editing = ImGui::IsItemActive();
-            if (ImGui::IsItemHovered())
-                helpTip("This is the only box: type the Csound options (any line starting with -) and the header values.\nChanges apply as you type. The device lists above also write into it.");
-            const std::string problems = engineTextProblems(text);
-            if (!problems.empty()) ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.3f, 1.f), "%s", problems.c_str());
-            const std::string effective = s.options.empty() ? defaultOptions(s) : s.options;
-            if (effective.find("-odac") == std::string::npos && effective.find("-o") == std::string::npos)
-                ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1.f), "No -odac in the options: Csound will not play to the sound card.");
-            if (s.bufHW < s.bufSW) ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.3f, 1.f), "-B should be at least as large as -b");
-            if (s.bufSW < s.ksmps) ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.3f, 1.f), "-b should be at least ksmps");
-            ImGui::TextDisabled("kr = sr / ksmps = %.2f Hz", (double)s.sr / std::max(1, s.ksmps));
-            ImGui::Checkbox("Send meter data from Csound (master, scope, spectrum, track meters)", &s.monitorFeed);
-            if (ImGui::IsItemHovered()) helpTip("Adds a small monitor instrument to the engine. Untick it if Csound reports an error about it. Applies on the next Run.");
-            ImGui::TextDisabled(
-                "Options: any Csound flag, e.g.  -odac -+rtaudio=portaudio -b1024 -B4096 -d  (one line or several lines)\n"
-                "sr        audio sample rate in Hz (44100, 48000 ...)\n"
-                "ksmps     samples per control period; control rate kr = sr / ksmps (you may type kr = ... instead)\n"
-                "nchnls    number of output channels (2 = stereo), the master meter shows one bar per channel\n"
-                "nchnls_i  number of input channels (leave out to use nchnls)\n"
-                "0dbfs     value of digital full scale (1 = floating point -1..1, 32768 = 16-bit style)\n"
-                "A4        tuning of A4 in Hz (440 default)\n"
-                "-b N / -B N   software / hardware buffer in sample frames; -odacN picks the output device");
-        }
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.95f, 0.60f, 0.20f, 1.f), "CSOUND PROGRAM + RENDER");
-        row("Csound executable");
-        ImGui::SetNextItemWidth(S(330));
-        inputStr("##exe", s.csoundExe, 0);
-        ImGui::TextDisabled("Full path to csound.exe. Leave it as  csound  and CAW looks for Csound in the usual install folders and on PATH by itself.\nA path from another computer is ignored if the file is not here.");
-        row("Pure Data executable");
-        ImGui::SetNextItemWidth(S(330));
-        inputStr("##pdexe", s.pdExe, 0);
-        ImGui::TextDisabled("Full path to pd.exe, or just  pd  if it is on PATH. Used by Pure Data clips (rendered offline, needs Pd 0.51 or newer).");
-        row("SuperCollider executable");
-        ImGui::SetNextItemWidth(S(330));
-        inputStr("##scexe", s.scExe, 0);
-        ImGui::TextDisabled("Full path to sclang.exe, or just  sclang  if it is on PATH. Used by SuperCollider clips (rendered offline with Score.recordNRT).");
-        row("Render file");
-        ImGui::SetNextItemWidth(S(330));
-        inputStr("##rf", s.renderFile, 0);
-        row("Render format");
-        {
-            static const char* fmts[] = {"WAV 16-bit", "WAV 24-bit", "WAV 32-bit float"};
-            s.renderFormat = std::min(2, std::max(0, s.renderFormat));
-            if (ImGui::BeginCombo("##fmt", fmts[s.renderFormat])) {
-                for (int i = 0; i < 3; ++i)
-                    if (ImGui::Selectable(fmts[i], s.renderFormat == i)) s.renderFormat = i;
-                ImGui::EndCombo();
+            // ---------------------------------------------------------- Programs
+            if (ImGui::BeginTabItem("Programs")) {
+                ImGui::TextColored(head, "PROGRAMS");
+                ImGui::TextDisabled("Leave a name as it is and CAW looks in the usual install folders and on PATH. Each language needs only its own program.");
+                ImGui::Spacing();
+                row("Csound");
+                ImGui::SetNextItemWidth(S(330));
+                inputStr("##exe", s.csoundExe, 0);
+                ImGui::TextDisabled("csound.exe. Needed only for Csound clips (and Run all).");
+                row("Pure Data");
+                ImGui::SetNextItemWidth(S(330));
+                inputStr("##pdexe", s.pdExe, 0);
+                ImGui::TextDisabled("pd.exe (Pd 0.51 or newer). Needed only for Pure Data clips.");
+                row("SuperCollider");
+                ImGui::SetNextItemWidth(S(330));
+                inputStr("##scexe", s.scExe, 0);
+                ImGui::TextDisabled("sclang.exe. Needed only for SuperCollider clips.");
+                ImGui::TextDisabled("A path from another computer is ignored if the file is not here.");
+                ImGui::EndTabItem();
             }
-        }
-        row("Tail after last clip (s)");
-        if (ImGui::IsItemHovered()) helpTip("Seconds of silence rendered after the last note so reverbs and releases can ring out");
-        if (ImGui::InputDouble("##tail", &s.tail, 0.5, 2.0, "%.1f")) s.tail = std::min(60.0, std::max(0.0, s.tail));
 
+            // ---------------------------------------------------------- Render
+            if (ImGui::BeginTabItem("Render")) {
+                ImGui::TextColored(head, "RENDER AUDIO");
+                row("File");
+                ImGui::SetNextItemWidth(S(330));
+                inputStr("##rf", s.renderFile, 0);
+                row("Format");
+                {
+                    static const char* fmts[] = {"WAV 16-bit", "WAV 24-bit", "WAV 32-bit float"};
+                    s.renderFormat = std::min(2, std::max(0, s.renderFormat));
+                    if (ImGui::BeginCombo("##fmt", fmts[s.renderFormat])) {
+                        for (int i = 0; i < 3; ++i)
+                            if (ImGui::Selectable(fmts[i], s.renderFormat == i)) s.renderFormat = i;
+                        ImGui::EndCombo();
+                    }
+                }
+                row("Tail after last clip (s)");
+                if (ImGui::InputDouble("##tail", &s.tail, 0.5, 2.0, "%.1f")) s.tail = std::min(60.0, std::max(0.0, s.tail));
+                if (ImGui::IsItemHovered()) helpTip("Seconds of silence rendered after the last note so reverbs and releases can ring out");
+                ImGui::EndTabItem();
+            }
+
+            // ---------------------------------------------------------- Editor
+            if (ImGui::BeginTabItem("Editor")) {
+                ImGui::TextColored(head, "CODE EDITOR");
+                row("Font size");
+                ImGui::SliderFloat("##editor_font_size", &g_proj.cs.editorFontSize, 10.f, 30.f, "%.0f px");
+                row("Font style");
+                const char* editorStyles[] = {"Regular", "Bold", "Italic"};
+                g_proj.cs.editorFontStyle = std::min(2, std::max(0, g_proj.cs.editorFontStyle));
+                if (ImGui::BeginCombo("##editor_font_style", editorStyles[g_proj.cs.editorFontStyle])) {
+                    for (int i = 0; i < 3; ++i)
+                        if (ImGui::Selectable(editorStyles[i], g_proj.cs.editorFontStyle == i)) g_proj.cs.editorFontStyle = i;
+                    ImGui::EndCombo();
+                }
+                ImGui::TextDisabled("Source is syntax-highlighted live while you edit.");
+                ImGui::EndTabItem();
+            }
+
+            // ---------------------------------------------------------- Advanced: the raw Csound options + header
+            if (ImGui::BeginTabItem("Advanced")) {
+                ImGui::TextColored(head, "CSOUND OPTIONS + HEADER (type here)");
+                ImGui::TextDisabled("Everything on the Audio tab is also written here. Type any Csound flag (a line starting with -) or a header value.");
+                static std::string text;
+                static bool editing = false;
+                if (!editing) text = engineSettingsToText(s);
+                const ImVec2 boxSize(-FLT_MIN, S(230));
+                if (inputMulti("##engine_text", text, boxSize, 0)) applyEngineText(s, text);
+                editing = ImGui::IsItemActive();
+                const std::string problems = engineTextProblems(text);
+                if (!problems.empty()) ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.3f, 1.f), "%s", problems.c_str());
+                const std::string effective = s.options.empty() ? defaultOptions(s) : s.options;
+                if (effective.find("-odac") == std::string::npos && effective.find("-o") == std::string::npos)
+                    ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1.f), "No -odac in the options: Csound will not play to the sound card.");
+                ImGui::TextDisabled(
+                    "Options: any Csound flag, e.g.  -odac -+rtaudio=portaudio -b1024 -B4096 -d\n"
+                    "sr / ksmps / kr   sample rate, samples per control period (kr = sr / ksmps)\n"
+                    "nchnls / nchnls_i number of output / input channels\n"
+                    "0dbfs             value of digital full scale (1 = floating point -1..1)\n"
+                    "A4                tuning of A4 in Hz (440 default)\n"
+                    "-b N / -B N       software / hardware buffer in sample frames; -odacN picks the output device");
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
     }
     ImGui::End();
 }

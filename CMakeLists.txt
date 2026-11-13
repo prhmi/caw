@@ -54,6 +54,7 @@ add_executable(caw WIN32
     src/audio_devices.cpp
     src/process.cpp
     src/osc_sender.cpp
+    src/wavbridge.cpp
     src/project_io.cpp
     src/pd_text.cpp
     src/score_svg.cpp

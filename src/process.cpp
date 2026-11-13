@@ -19,9 +19,11 @@ struct ProcessRunner::Impl {
     std::atomic<bool> readerDone{true};
     int exitCode = 0;
     std::string err;
+    bool highPriority = false;
 };
 
 ProcessRunner::ProcessRunner() : d(new Impl) {}
+void ProcessRunner::setHighPriority(bool on) { d->highPriority = on; }
 ProcessRunner::~ProcessRunner() { stop(); }
 
 bool ProcessRunner::start(const std::string& commandLine, bool withInput) {
@@ -61,6 +63,7 @@ bool ProcessRunner::start(const std::string& commandLine, bool withInput) {
     PROCESS_INFORMATION pi = {};
     std::string cmd = commandLine;  // CreateProcess needs a writable buffer
     BOOL ok = CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (ok && d->highPriority) SetPriorityClass(pi.hProcess, HIGH_PRIORITY_CLASS);
     CloseHandle(wr);
     if (inRd) CloseHandle(inRd);
     if (!ok) {

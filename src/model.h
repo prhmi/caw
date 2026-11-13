@@ -142,7 +142,7 @@ struct Track {
 
 // General Csound engine settings (written into the generated CSD header / options)
 struct CsoundSettings {
-    int sr = 44100;
+    int sr = 48000;
     int ksmps = 32;              // kr = sr / ksmps
     int nchnls = 2;
     int nchnlsIn = 0;            // 0 = not written (Csound then uses nchnls)
@@ -151,6 +151,7 @@ struct CsoundSettings {
     int bufSW = 1024;            // -b  software buffer (sample frames)
     int bufHW = 4096;            // -B  hardware buffer (sample frames)
     bool monitorFeed = true;     // engine run: Csound prints meter / scope / spectrum data for the monitor panels
+    int syncMs = 0;              // extra delay (ms, can be negative) added to the sound sync of the timeline and the meters; tune it until the sound meets the playhead
     std::string rtaudio = "portaudio";
     std::string options;                     // typed Csound options for live runs, e.g. "-odac -+rtaudio=portaudio -b1024 -B4096 -d" (empty = generated)
     int outDev = -1;             // -1 = system default

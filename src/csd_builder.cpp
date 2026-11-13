@@ -360,6 +360,13 @@ double autoValueAt(const std::vector<AutoPoint>& points, double time, double fal
     return points.back().v;
 }
 
+bool clipHasMidiNotes(const Project& p, int clipId) {
+    for (const Track& t : p.tracks)
+        for (const MidiClip& mc : t.midiClips)
+            if (mc.clipId == clipId) for (const MidiNote& n : mc.notes) if (n.start < mc.dur) return true;
+    return false;
+}
+
 std::vector<MidiNote> clipMidiNotes(const Project& p, int clipId) {
     std::vector<MidiNote> all;
     for (const Track& t : p.tracks)
@@ -381,10 +388,27 @@ std::vector<MidiNote> clipMidiNotes(const Project& p, int clipId) {
     return all;
 }
 
+namespace {
+const Clip* clipById(const Project& p, int id) {
+    for (const Track& t : p.tracks) for (const Clip& c : t.clips) if (c.id == id) return &c;
+    return nullptr;
+}
+}  // namespace
+
+// The wav of a Pd / SuperCollider clip with  midi: "on"  starts where the clip starts on the timeline (the patch itself sounds from
+// there) or at the first MIDI note if that is earlier. Everything inside the wav is relative to this origin, so the timeline decides the timing.
+double midiWavOrigin(const Project& p, int clipId) {
+    const Clip* c = clipById(p, clipId);
+    double origin = c ? c->start : 0.0;
+    for (const MidiNote& n : clipMidiNotes(p, clipId)) origin = std::min(origin, n.start);
+    return std::max(0.0, origin);
+}
+
 double midiWavLength(const Project& p, int clipId) {
-    double end = 0.0;
+    const Clip* c = clipById(p, clipId);
+    double end = c ? c->start + c->dur : 0.0;
     for (const MidiNote& n : clipMidiNotes(p, clipId)) end = std::max(end, n.start + n.dur);
-    return end + kMidiTail;
+    return std::max(0.1, end - midiWavOrigin(p, clipId)) + kMidiTail;
 }
 
 
@@ -808,9 +832,18 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                 continue;
             }
 
-            if (pc.midiEnabled) {
-                // A MIDI instrument is played only by its MIDI clips (below), never by the Csound clip itself.
-            } else {
+            if (pc.midiEnabled && clip.lang >= 1) {
+                // Pd / SuperCollider with midi: "on": ONE wav (the patch itself + its MIDI notes) from its origin on the timeline
+                if (pdMidiPlayed.insert(clip.id).second) {
+                    const double org = midiWavOrigin(p, clip.id), endAbs = org + midiWavLength(p, clip.id);
+                    const double st = std::max(0.0, org - fromTime), du = endAbs - std::max(org, fromTime);
+                    if (du > 0.0) {
+                        score << "i \"" << clip.name << "\" " << st << " " << du << " " << std::max(0.0, fromTime - org) << "\n";
+                        endT = std::max(endT, st + du);
+                        any = true;
+                    }
+                }
+            } else {   // a Csound clip always plays from its box; with midi: "on" its MIDI clips add their notes on top (below)
                 // "runs" = how many times the instr is triggered; the clip is split into equal slots
                 const int runs = (pc.launcher || clip.lang >= 1) ? 1 : std::min(256, std::max(1, clip.runs));   // a Pd clip is one wav: never split
                 for (int r = 0; r < runs; ++r) {
@@ -823,6 +856,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                     if (du <= 0.0) continue;
                     score << "i \"" << clip.name << "\" " << st << " " << du;
                     if (clip.lang >= 1) score << " " << std::max(0.0, fromTime - clip.start);   // wav offset when playing from the middle of the clip
+                    else if (pc.midiEnabled) score << " 60 100";
                     score << "\n";
                     endT = std::max(endT, st + du);
                     any = true;
@@ -837,18 +871,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
             for (const Track& other : p.tracks)
                 for (const Clip& c : other.clips) if (c.id == mc.clipId) target = &c;
             if (!target || target->muted) continue;
-            if (target->lang >= 1) {
-                // Pure Data / SuperCollider: the notes are already inside the rendered wav (timeline time 0 = wav time 0)
-                if (pdMidiPlayed.insert(target->id).second) {
-                    const double en = midiWavLength(p, target->id) - fromTime;
-                    if (en > 0.0) {
-                        score << "i \"" << target->name << "\" 0 " << en << " " << std::max(0.0, fromTime) << "\n";
-                        endT = std::max(endT, en);
-                        any = true;
-                    }
-                }
-                continue;
-            }
+            if (target->lang >= 1) continue;   // Pure Data / SuperCollider: the notes are inside the wav that the clip loop above starts
             std::vector<MidiNote> notes = mc.notes;
             std::stable_sort(notes.begin(), notes.end(), [](const MidiNote& a, const MidiNote& b) { return a.start < b.start; });
             const double mcEnd = mc.start + mc.dur;
@@ -1029,12 +1052,14 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
             std::vector<std::string> bands, scopeL, scopeR;
             for (int b = 0; b < kMeterBands; ++b) bands.push_back("kBd" + std::to_string(b));
             sendList("/caw/s", 0, bands);
+            mon << "if kTrig == 1 then\n";   // the scope points are collected only when a frame is sent (20 times a second), not in every control period
             for (int j = 0; j < kScopePoints; ++j) {
                 mon << "kQ" << j << " = kW + " << j << "\nif kQ" << j << " >= " << kScopePoints << " then\nkQ" << j << " = kQ" << j << " - " << kScopePoints << "\nendif\n"
                     << "kPL" << j << " = kScL[kQ" << j << "]\nkPR" << j << " = kScR[kQ" << j << "]\n";
                 scopeL.push_back("kPL" + std::to_string(j));
                 scopeR.push_back("kPR" + std::to_string(j));
             }
+            mon << "endif\n";
             sendList("/caw/l", 0, scopeL);
             sendList("/caw/r", 0, scopeR);
             {   // live Rec: the value each clip sends to its channel "rec", 50 times per second ("/caw/c": start index + values)
@@ -1151,6 +1176,7 @@ std::string buildClipTestCsd(const Project& p, const Clip& clip, OrcSpan& span) 
     std::ostringstream tail;
     tail << pc.body << "\nendin\n</CsInstruments>\n<CsScore>\ni \"" << clip.name << "\" 0 " << dur;
     if (pc.midiEnabled && clip.lang == 0) tail << " 60 100";
+    else if (clip.lang >= 1) tail << " 0";   // a Pd / SC clip reads p4 (seconds to skip in the wav): without it Csound warns "uses 4 p-fields but is given 3"
     tail << "\ne\n</CsScore>\n</CsoundSynthesizer>\n";
     return prefix + tail.str();
 }

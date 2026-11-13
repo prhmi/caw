@@ -28,7 +28,7 @@ bool readString(std::istream& in, std::string& value) {
 namespace {
 void writeProject(std::ostream& out, const Project& p) {
     const CsoundSettings& s = p.cs;
-    out << "CAW_PROJECT 29\n"
+    out << "CAW_PROJECT 30\n"
         << s.sr << ' ' << s.ksmps << ' ' << s.nchnls << ' ' << s.nchnlsIn << ' '
         << std::setprecision(17) << s.zdbfs << ' ' << s.a4 << ' ' << s.bufSW << ' ' << s.bufHW << ' '
         << s.outDev << ' ' << s.inDev << ' ' << s.renderFormat << ' ' << s.tail << ' '
@@ -39,6 +39,7 @@ void writeProject(std::ostream& out, const Project& p) {
     writeString(out, s.options);
     writeString(out, s.pdExe);
     writeString(out, s.scExe);
+    out << s.syncMs << '\n';
     out << p.tracks.size() << '\n';
     for (const Track& t : p.tracks) {
         out << "TRACK " << t.id << ' ' << (t.muted ? 1 : 0) << ' ' << (t.solo ? 1 : 0) << ' '
@@ -272,7 +273,7 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
     Project candidate;
     std::string magic;
     int version = 0;
-    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 29)) {
+    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 30)) {
         error = "This is not a supported CAW project file.";
         return false;
     }
@@ -294,6 +295,11 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
     }
     if (version >= 11 && !readString(in, s.pdExe)) { error = "The CAW project settings are invalid."; return false; }
     if (version >= 12 && !readString(in, s.scExe)) { error = "The CAW project settings are invalid."; return false; }
+    if (version >= 30) {
+        if (!(in >> s.syncMs)) { error = "The CAW project settings are invalid."; return false; }
+        in.get();
+        s.syncMs = std::min(1000, std::max(-500, s.syncMs));
+    }
     size_t trackCount = 0;
     if (!(in >> trackCount) || trackCount > 10000) { error = "The track count is invalid."; return false; }
     in.get();
