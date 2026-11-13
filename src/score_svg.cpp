@@ -1,5 +1,6 @@
 #include "score_svg.h"
 #include "csd_builder.h"
+#include "marks_gfx.h"
 #include <algorithm>
 #include <cmath>
 #include <complex>
@@ -8,6 +9,7 @@
 #include <deque>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 
 namespace {
@@ -27,6 +29,18 @@ uint32_t paletteRgb(int index) {
 }
 
 std::string hex(uint32_t rgb) { char b[16]; std::snprintf(b, sizeof b, "#%06X", rgb & 0xFFFFFF); return b; }
+// weighted mix of "#RRGGBB" colours (used when graph lines are combined into one shape: the shape gets the mix of their colours)
+std::string mixHexWeighted(const std::vector<std::pair<std::string, double>>& cols) {
+    double r = 0, g = 0, b = 0, ws = 0;
+    for (const auto& pc : cols) {
+        unsigned v = 0;
+        if (pc.first.size() != 7 || pc.first[0] != '#' || std::sscanf(pc.first.c_str() + 1, "%x", &v) != 1) continue;
+        r += pc.second * ((v >> 16) & 255); g += pc.second * ((v >> 8) & 255); b += pc.second * (v & 255); ws += pc.second;
+    }
+    if (ws <= 0) return std::string();
+    const auto q = [&](double x) { return (uint32_t)std::lround(std::min(255.0, std::max(0.0, x / ws))); };
+    return hex((q(r) << 16) | (q(g) << 8) | q(b));
+}
 std::string num(double v) { char b[32]; std::snprintf(b, sizeof b, "%.1f", v); return b; }
 
 std::string esc(const std::string& s) {
@@ -64,12 +78,12 @@ double hash01(uint32_t x) {   // deterministic pseudo random 0..1
 }
 
 std::string pitchName(int p) {
-    static const char* n[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+    static const char* n[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "Bb", "B" };
     return std::string(n[((p % 12) + 12) % 12]) + std::to_string(p / 12 - 1);
 }
 
 int diatonic(int midi) {
-    static const int sc[] = { 0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6 };
+    static const int sc[] = { 0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 6, 6 };   // A# is written as Bb (on the B line)
     return (midi / 12) * 7 + sc[((midi % 12) + 12) % 12];
 }
 bool isBlackKey(int midi) { const int k = ((midi % 12) + 12) % 12; return k == 1 || k == 3 || k == 6 || k == 8 || k == 10; }
@@ -115,7 +129,8 @@ std::string abbreviate(const std::string& name) {
 }
 
 // one pitch: C4, f#3, Bb2, e (octave 4), or a MIDI number
-bool parsePitch(const std::string& tok, int& midi) {
+bool parsePitch(const std::string& tok, int& midi, int* quarter = nullptr) {
+    if (quarter) *quarter = 0;
     if (tok.empty()) return false;
     if (std::isdigit((unsigned char)tok[0])) {
         char* end = nullptr;
@@ -129,7 +144,12 @@ bool parsePitch(const std::string& tok, int& midi) {
     if (l < 'a' || l > 'g') return false;
     int acc = 0;
     size_t i = 1;
-    for (; i < tok.size() && (tok[i] == '#' || tok[i] == 'b' || tok[i] == 'B'); ++i) acc += tok[i] == '#' ? 1 : -1;
+    // quarter-tone signs of the python score library: "q" quarter sharp (Qsharp), "qb" quarter flat (Qflat), "d" koron. Written right after the letter: Cq4, Eqb4, Bd3
+    if (i < tok.size() && (tok[i] == 'q' || tok[i] == 'Q')) {
+        if (i + 1 < tok.size() && (tok[i + 1] == 'b' || tok[i + 1] == 'B')) { if (quarter) *quarter = 2; i += 2; }
+        else { if (quarter) *quarter = 1; i += 1; }
+    } else if (i < tok.size() && tok[i] == 'd') { if (quarter) *quarter = 3; i += 1; }
+    for (; i < tok.size() && !(quarter && *quarter) && (tok[i] == '#' || tok[i] == 'b' || tok[i] == 'B'); ++i) acc += tok[i] == '#' ? 1 : -1;
     int oct = 4;
     if (i < tok.size()) {
         char* end = nullptr;
@@ -164,6 +184,8 @@ double projectEnd(const Project& p) {
     for (const Track& t : p.tracks) {
         for (const Clip& c : t.clips) e = std::max(e, c.start + c.dur);
         for (const MidiClip& m : t.midiClips) e = std::max(e, m.start + m.dur);
+        for (const auto& a : t.automation)   // the automation of a graph can run longer than the clips
+            if (!t.hiddenAutomation.count(a.first)) for (const AutoPoint& pt : a.second) e = std::max(e, pt.t);
     }
     return std::max(e, 1.0);
 }
@@ -178,6 +200,7 @@ std::string hzText(double f) {
 typedef std::vector<std::pair<double, double>> Pts;
 
 struct Canvas {
+    double lw = 1.0;                  // general line weight of the score (Score editor)
     bool bw = false;
     std::vector<ScorePrim> prims;
 
@@ -191,25 +214,25 @@ struct Canvas {
         if (d) { float a = 0, b = 0; if (std::sscanf(d, "%f,%f", &a, &b) >= 1) { p.dash0 = a; p.dash1 = b > 0 ? b : a; } }
     }
 
-    void text(double x, double y, const std::string& s, double size, const std::string& fill = "#111111", bool bold = false, const char* anchor = "start", bool italic = false) {
+    void text(double x, double y, const std::string& s, double size, const std::string& fill = "#111111", bool bold = false, const char* anchor = "start", bool italic = false, bool mono = false) {
         if (s.empty()) return;
         ScorePrim p; p.kind = ScorePrim::Text; p.x = (float)x; p.y = (float)y; p.text = s; p.size = (float)size; p.fill = rgba(bw ? "#000000" : fill);
-        p.bold = bold; p.italic = italic; p.anchor = !std::strcmp(anchor, "middle") ? 1 : !std::strcmp(anchor, "end") ? 2 : 0;
+        p.bold = bold; p.italic = italic; p.mono = mono; p.anchor = !std::strcmp(anchor, "middle") ? 1 : !std::strcmp(anchor, "end") ? 2 : 0;
         prims.push_back(std::move(p));
     }
     void line(double x1, double y1, double x2, double y2, const std::string& c = "#000000", double sw = 0.6, double op = 1.0, const char* dash = nullptr) {
-        ScorePrim p; p.kind = ScorePrim::Line; p.x = (float)x1; p.y = (float)y1; p.w = (float)x2; p.h = (float)y2; p.stroke = rgba(c, op); p.sw = (float)sw;
+        ScorePrim p; p.kind = ScorePrim::Line; p.x = (float)x1; p.y = (float)y1; p.w = (float)x2; p.h = (float)y2; p.stroke = rgba(c, op); p.sw = (float)(sw * lw);
         parseDash(dash, p);
         prims.push_back(std::move(p));
     }
     void rect(double x, double y, double w, double h, const std::string& fill, double fo, const std::string& stroke, double sw = 1.0) {
-        ScorePrim p; p.kind = ScorePrim::Rect; p.x = (float)x; p.y = (float)y; p.w = (float)std::max(w, 0.0); p.h = (float)h; p.sw = (float)sw;
+        ScorePrim p; p.kind = ScorePrim::Rect; p.x = (float)x; p.y = (float)y; p.w = (float)std::max(w, 0.0); p.h = (float)h; p.sw = (float)(sw * lw);
         if (!fill.empty()) p.fill = rgba(fill, bw ? fo * 0.35 : fo);
         if (!stroke.empty()) p.stroke = rgba(stroke);
         prims.push_back(std::move(p));
     }
     void polygon(const Pts& pts, const std::string& c, double fo, double sw = 1.0, bool dashed = false) {
-        ScorePrim p; p.kind = ScorePrim::Polygon; p.fill = rgba(c, bw ? fo * 0.35 : fo); p.stroke = rgba(c); p.sw = (float)sw;
+        ScorePrim p; p.kind = ScorePrim::Polygon; p.fill = rgba(c, bw ? fo * 0.35 : fo); p.stroke = rgba(c); p.sw = (float)(sw * lw);
         if (dashed) { p.dash0 = 3; p.dash1 = 2; }
         for (const auto& q : pts) { p.pts.push_back((float)q.first); p.pts.push_back((float)q.second); }
         prims.push_back(std::move(p));
@@ -222,18 +245,72 @@ struct Canvas {
     }
     void polyline(const Pts& pts, const std::string& c, double sw = 1.0, const char* dash = nullptr, bool round = false) {
         if (pts.size() < 2) return;
-        ScorePrim p; p.kind = ScorePrim::Polyline; p.stroke = rgba(c); p.sw = (float)sw; p.round = round;
+        ScorePrim p; p.kind = ScorePrim::Polyline; p.stroke = rgba(c); p.sw = (float)(sw * lw); p.round = round;
         parseDash(dash, p);
         for (const auto& q : pts) { p.pts.push_back((float)q.first); p.pts.push_back((float)q.second); }
         prims.push_back(std::move(p));
     }
-    void note(double x, double y, const std::string& c, double r) {
-        ScorePrim p; p.kind = ScorePrim::Ellipse; p.x = (float)x; p.y = (float)y; p.w = (float)(r * 1.25); p.h = (float)r; p.angle = -20.f;
-        p.fill = rgba(c); p.stroke = rgba(c); p.sw = 1.f;
-        prims.push_back(std::move(p));
+    // ---- ported from the python score library (def.py): note(), sharp(), bflat()
+    // note head: two cubic curves (an almond shape); r = half of the staff line distance, like y_space / 2 in python
+    void note(double x, double y, const std::string& c, double r0) {
+        const double r = r0 * 1.1;
+        Pts v; v.push_back({ x - r * 1.2, y + r * .6 });
+        cubic(v, x - r * 1.2, y + r * .6, x - r * 1.7, y - r * .3, x + r * .3, y - r * 1.4, x + r * 1.2, y - r * .6);
+        cubic(v, x + r * 1.2, y - r * .6, x + r * 1.7, y + r * .3, x - r * .3, y + r * 1.4, x - r * 1.2, y + r * .6);
+        fillPoly(v, c, 1.0);
+        polyline(v, c, std::max(0.6, r * 0.2), nullptr, true);
+    }
+    // sharp sign left of a note (x, y = middle of the note, ys = staff line distance)
+    void sharp(double x, double y, double ys, const std::string& c, double sw = 0.9) {
+        const double off = ys * 2.0 / 3.0, width = ys / 2;
+        const double ybot = y + ys, ybot1 = y + ys / 2, ybot2 = y + ys / 9, ytop = y - ys, ytop2 = y - ys / 2, ytop1 = y - ys / 9;
+        const double x1 = x - off - width - ys / 2, x2 = x - off - ys / 2, xmin = x1 - ys / 5, xmax = x2 + ys / 5;
+        line(x1, ybot, x1, ytop, c, sw);
+        line(x2, ybot, x2, ytop, c, sw);
+        line(xmin, ybot1, xmax, ybot2, c, sw * 2.0);
+        line(xmin, ytop1, xmax, ytop2, c, sw * 2.0);
+    }
+    // quarter sharp (python Qsharp): one vertical line and two slanted bars
+    void qsharp(double x, double y, double ys, const std::string& c, double sw = 0.9) {
+        const double off = ys * 0.8;
+        const double ybot = y + ys, ybot1 = y + ys / 2, ybot2 = y + ys / 9, ytop = y - ys, ytop2 = y - ys / 2, ytop1 = y - ys / 9;
+        const double x1 = x - off - ys * 0.5, xmin = x1 - ys / 5, xmax = x1 + ys / 5;
+        line(x1, ybot, x1, ytop, c, sw);
+        line(xmin - 1, ybot1, xmax + 1, ybot2, c, sw * 2.0);
+        line(xmin - 1, ytop1, xmax + 1, ytop2, c, sw * 2.0);
+    }
+    // quarter flat (python Qflat): a flat with a wider curve
+    void qflat(double x, double y, double ys, const std::string& c, double sw = 0.9) {
+        const double width = ys * 0.5, off = ys;
+        const double xl = x + ys * 0.5 - off - width, ytop = y - ys * 1.5, ybot = y + ys * 0.5, yend = y - ys * 0.25;
+        Pts v; v.push_back({ xl, ytop }); v.push_back({ xl, ybot });
+        const double qx = x - off * 2.15, qy = y - ys * 0.6;
+        for (int i = 1; i <= 12; ++i) {
+            const double t = i / 12.0, u = 1 - t;
+            v.push_back({ u * u * xl + 2 * u * t * qx + t * t * xl, u * u * ybot + 2 * u * t * qy + t * t * yend });
+        }
+        polyline(v, c, sw, nullptr, true);
+    }
+    // koron (python koron): a stem with a flag
+    void koron(double x, double y, double ys, const std::string& c, double sw = 0.9) {
+        const double k = ys / 10.0, xs = x - 20 * k, yb = y + 25 * k;
+        Pts v = { { xs, yb }, { xs, yb - 30 * k }, { xs + 7 * k, yb - 25 * k }, { xs, yb - 20 * k } };
+        polyline(v, c, sw, nullptr, true);
+    }
+    // flat sign left of a note
+    void flat(double x, double y, double ys, const std::string& c, double sw = 0.9) {
+        const double width = ys / 2, off = ys;
+        const double xl = x - off - width, ytop = y - ys * 1.5, ybot = y + ys * 0.5, yend = y - ys / 4;
+        Pts v; v.push_back({ xl, ytop }); v.push_back({ xl, ybot });
+        const double qx = x - off / 4, qy = y - ys * 3 / 4;
+        for (int i = 1; i <= 12; ++i) {
+            const double t = i / 12.0, u = 1 - t;
+            v.push_back({ u * u * xl + 2 * u * t * qx + t * t * xl, u * u * ybot + 2 * u * t * qy + t * t * yend });
+        }
+        polyline(v, c, sw, nullptr, true);
     }
     void circle(double x, double y, double r, const std::string& fill, const std::string& stroke = "", double sw = 1.0) {
-        ScorePrim p; p.kind = ScorePrim::Circle; p.x = (float)x; p.y = (float)y; p.w = (float)r; p.h = (float)r; p.sw = (float)sw;
+        ScorePrim p; p.kind = ScorePrim::Circle; p.x = (float)x; p.y = (float)y; p.w = (float)r; p.h = (float)r; p.sw = (float)(sw * lw);
         if (!fill.empty()) p.fill = rgba(fill);
         if (!stroke.empty()) p.stroke = rgba(stroke);
         prims.push_back(std::move(p));
@@ -333,7 +410,7 @@ std::string primsToSvg(const ScorePage& page) {
             case ScorePrim::Circle:
                 o << "<circle cx=\"" << num(p.x) << "\" cy=\"" << num(p.y) << "\" r=\"" << num(p.w) << "\""; fillAttrs(); strokeAttrs(); o << "/>\n"; break;
             case ScorePrim::Text: {
-                o << "<text x=\"" << num(p.x) << "\" y=\"" << num(p.y) << "\" font-family=\"Georgia, 'Times New Roman', serif\" font-size=\"" << num(p.size) << "\"";
+                o << "<text x=\"" << num(p.x) << "\" y=\"" << num(p.y) << "\" font-family=\"" << (p.mono ? "Consolas, 'Courier New', monospace" : "Georgia, 'Times New Roman', serif") << "\" font-size=\"" << num(p.size) << "\"";
                 if (p.bold) o << " font-weight=\"bold\"";
                 if (p.italic) o << " font-style=\"italic\"";
                 o << " fill=\"" << (fc.empty() ? "#000000" : fc) << "\" text-anchor=\"" << (p.anchor == 1 ? "middle" : p.anchor == 2 ? "end" : "start") << "\">" << esc(p.text) << "</text>\n";
@@ -372,7 +449,7 @@ void fft(std::vector<std::complex<double>>& a) {
 
 // "C4 E4:2 - G3+D4" -> notes spread over `dur` seconds. name[:length] (length is relative, default 1), "-" or "r" = rest, "+" joins a chord.
 std::vector<MidiNote> scoreWrittenNotes(const std::string& text, double dur) {
-    struct Tok { std::vector<int> pitches; double w = 1.0; };
+    struct Tok { std::vector<int> pitches, quarters; double w = 1.0; };
     std::vector<Tok> toks;
     std::istringstream in(text);
     std::string word;
@@ -392,9 +469,10 @@ std::vector<MidiNote> scoreWrittenNotes(const std::string& text, double dur) {
         while (ok && pos <= word.size()) {
             const size_t plus = word.find('+', pos);
             const std::string one = word.substr(pos, plus == std::string::npos ? std::string::npos : plus - pos);
-            int midi = 0;
-            if (!parsePitch(one, midi)) { ok = false; break; }
+            int midi = 0, q = 0;
+            if (!parsePitch(one, midi, &q)) { ok = false; break; }
             t.pitches.push_back(midi);
+            t.quarters.push_back(q);
             if (plus == std::string::npos) break;
             pos = plus + 1;
         }
@@ -407,8 +485,10 @@ std::vector<MidiNote> scoreWrittenNotes(const std::string& text, double dur) {
     double at = 0.0;
     for (const Tok& t : toks) {
         const double len = t.w / total * dur;
-        for (int pitch : t.pitches) {
+        for (size_t pi = 0; pi < t.pitches.size(); ++pi) {
+            const int pitch = t.pitches[pi];
             MidiNote n;
+            n.quarter = t.quarters[pi];
             n.start = at;
             n.dur = std::max(0.05, len * 0.94);
             n.pitch = pitch;
@@ -507,12 +587,23 @@ struct Auto {
     int mode = 1;                    // 1 own lane with the full curve, 2 compact contour lane
     double lo = 0, hi = 0;           // range declared in the <caw> block (hi > lo), else the range of the data
     bool ranged = false;
+    int shape = 0;                   // 0 curve, 1 steps, 2 lines, 3 dots, 4 dashed, 5 mirror smooth, 6 mirror boxes, 7 hairpin, 8 bars
+    double ratio = 1.0;              // shape ratio of the mirror shapes (1 = linear)
+    double stroke = 0.0;             // stroke width of the line (0 = default); the dots, bars, dashes and break points scale with it
+    std::string color;               // colour of the automation lane in the editor (#RRGGBB), used for the line in the score
+    bool graph = false;              // line of a graph track
+    double ysize = 1.0;              // graph lines: height of the strip (1 = normal)
+    bool overlay = false;            // extra layer of a combined shape: only the curve is drawn (no frame, labels or grid)
+    int merge = 2;                   // graph lines: 0 combine (one strip with the other combined lines), 1 half combine (same strip, 50% on top), 2 separated (own strip)
 };
 
 struct SrcClip { const Track* t; const Clip* c; int row; };
 struct SrcMidi { const Track* t; const MidiClip* m; const Clip* c; };
 
+struct ScoreItem { double t, dur; std::string text, color; int kind, type, shape, lang, pos, size, font, ratio; };   // kind = track kind (1 marker, 2 graph)   // marker / graph track item shown above (1) or below (2) its lane
+
 struct RLane {
+    std::vector<ScoreItem> items;
     std::string name, sub, color;
     int kind = 0, clef = 0;
     bool staff = false, bass = false, axis = false;
@@ -520,6 +611,8 @@ struct RLane {
     std::vector<std::string> rowKeys, rowNames;   // graphic lane: one row per track NAME (tracks with the same name share a row)
     bool dyn = false;                // a clip has a dynamic marking: the row gets room for it
     bool merged = false;             // several tracks with the same name were put together
+    bool byName = false;             // lane made from score names: all its tracks share ONE row (their shapes overlap)
+    bool separated = false;          // a track of the lane asks for 'separated': shapes drawn on top of each other at 50% instead of combined
     bool noClef = false;
     std::vector<SrcClip> clips;
     std::vector<SrcMidi> midi;
@@ -545,7 +638,7 @@ struct Renderer {
     std::deque<MidiClip> synth;      // written notes of clips (shown like MIDI)
     double W = 1500, L = 200, R = 50;   // W = page width
     double LW = 1500;                   // width a system is laid out with (the full score scales it down to fit the page)
-    double end = 1, sysSec = 1, pps = 1, barSec = 0;
+    double end = 1, sysSec = 1, pps = 1;
     int systems = 1;
     bool detailed = false;
     int labelRows = 1;
@@ -555,9 +648,7 @@ struct Renderer {
     Renderer(const Project& proj, const ScoreRenderOptions& o, const std::string& fallbackTitle) : p(proj), opt(o), detailed(o.detailed) {
         title = p.score.title.empty() ? (fallbackTitle.empty() ? std::string("Untitled") : fallbackTitle) : p.score.title;
         end = projectEnd(p);
-        if (detailed && p.score.tempo > 0.0) barSec = 60.0 / p.score.tempo * p.score.meterNum * 4.0 / std::max(1, p.score.meterDen);
         sysSec = detailed ? std::min(600.0, std::max(10.0, p.score.sysSec)) : end;
-        if (detailed && barSec > 0.0) sysSec = std::max(1.0, std::round(sysSec / barSec)) * barSec;   // a system ends on a barline
         systems = std::max(1, (int)std::ceil(end / sysSec - 1e-9));
         labelRows = detailed ? 2 : 1;
         spec = (p.score.spectrum && o.spectrum && o.spectrum->valid()) ? o.spectrum : nullptr;
@@ -577,8 +668,88 @@ struct Renderer {
         tickStep = pps >= 7 ? 5.0 : 10.0;
     }
 
+    std::map<const Clip*, const Track*> clipTrack;
+    int midiShow(const Clip* c) const { const auto it = clipTrack.find(c); return it == clipTrack.end() ? 0 : it->second->scoreMidiShow; }
+    // name of a clip in the score, with its role and language when asked for
+    std::string clipTitle(const Clip& c) const {
+        std::string s = c.scoreLabel.empty() ? c.name : c.scoreLabel;
+        if (c.scoreShowLang) s += std::string("  [") + (c.lang == 1 ? "Pd" : c.lang == 2 ? "SC" : "Csound") + "]";
+        if (c.scoreRole == 1) s += "  (fx)";
+        else if (c.scoreRole == 2) s += "  (gen+fx)";
+        return s;
+    }
+
+
+    // ---- measured clip data (Render audio -> probe file): amplitude / frequency of the clip and the data of the channel "score"
+    struct ClipAna { bool ok = false; std::vector<double> t, amp, cent; double centLo = 0, centHi = 0; };
+    std::map<const Clip*, ClipAna> anaCache;
+    const ScoreClipProbe* probeOf(const Clip& c) const {
+        if (!opt.probe) return nullptr;
+        const auto it = opt.probe->find(c.name);
+        return it == opt.probe->end() ? nullptr : &it->second;
+    }
+    const ClipAna& anaOf(const Clip& c) {
+        const auto found = anaCache.find(&c);
+        if (found != anaCache.end()) return found->second;
+        ClipAna a;
+        if (const ScoreClipProbe* pr = probeOf(c)) {
+            double mx = 0;
+            for (size_t i = 0; i < pr->t.size(); ++i)
+                if (pr->t[i] >= c.start - 1e-9 && pr->t[i] <= c.start + c.dur + 1e-9) { a.t.push_back(pr->t[i]); a.amp.push_back(pr->rms[i]); a.cent.push_back(pr->cent[i]); mx = std::max(mx, pr->rms[i]); }
+            if (a.t.size() >= 2 && mx > 1e-7) {
+                a.ok = true;
+                a.centLo = 1e9; a.centHi = 0;
+                for (size_t i = 0; i < a.amp.size(); ++i) {
+                    if (a.amp[i] > 0.05 * mx && a.cent[i] > 20) { a.centLo = std::min(a.centLo, a.cent[i]); a.centHi = std::max(a.centHi, a.cent[i]); }
+                    a.amp[i] /= mx;
+                }
+                if (a.centHi <= a.centLo) { a.centLo = std::max(20.0, a.centLo * 0.7); a.centHi = std::max(a.centLo * 1.5, a.centHi * 1.3); }
+            }
+        }
+        return anaCache.emplace(&c, std::move(a)).first->second;
+    }
+    static double lerpAt(const std::vector<double>& xs, const std::vector<double>& ys, double x) {
+        if (xs.empty()) return 0;
+        if (x <= xs.front()) return ys.front();
+        if (x >= xs.back()) return ys.back();
+        const size_t i = (size_t)(std::upper_bound(xs.begin(), xs.end(), x) - xs.begin());
+        const double u = (x - xs[i - 1]) / std::max(1e-9, xs[i] - xs[i - 1]);
+        return ys[i - 1] + (ys[i] - ys[i - 1]) * u;
+    }
+    // half height of the shape of a clip at time tt: measured when the clip was rendered, else a drawn envelope
+    double shapeHalf(const Clip& cl, double tt, double hh) {
+        const ClipAna& an = anaOf(cl);
+        if (an.ok) return hh * (0.05 + 0.95 * std::pow(std::max(0.0, std::min(1.0, lerpAt(an.t, an.amp, tt))), 0.6));
+        const double u = (tt - cl.start) / cl.dur, ph = cl.id * 1.7;
+        return hh * smoothAmp(u) * (0.78 + 0.22 * std::sin(tt * 3.1 + ph)) * (0.9 + 0.1 * std::sin(tt * 0.9 + ph));
+    }
+    // colour of a clip: its own colour, else the colour of its track (lane colour as the last fallback)
+    std::string clipHex(const Clip& cl, const std::string& laneColor) const {
+        if (cl.color & 0xFFFFFF) return hex(cl.color);
+        const auto it = clipTrack.find(&cl);
+        if (it != clipTrack.end()) {
+            if (it->second->color & 0xFFFFFF) return hex(it->second->color);
+            return hex(paletteRgb((int)(it->second - &p.tracks[0])));
+        }
+        return laneColor;
+    }
+    static std::string mixHex(const std::vector<std::string>& cols) {
+        if (cols.empty()) return "#000000";
+        double r = 0, g = 0, b = 0;
+        for (const std::string& c : cols) { unsigned v = 0; if (c.size() == 7) std::sscanf(c.c_str() + 1, "%x", &v); r += (v >> 16) & 255; g += (v >> 8) & 255; b += v & 255; }
+        const double n = (double)cols.size();
+        return hex(((uint32_t)std::lround(r / n) << 16) | ((uint32_t)std::lround(g / n) << 8) | (uint32_t)std::lround(b / n));
+    }
+
+    bool audible(const Track& t) const {
+        if (t.muted) return false;
+        for (const Track& o : p.tracks) if (o.solo && !o.muted) return t.solo;
+        return true;
+    }
+
     void buildLanes() {
         const ScoreInfo& sc = p.score;
+        for (const Track& t : p.tracks) for (const Clip& c : t.clips) clipTrack[&c] = &t;
         std::vector<RLane> defs(sc.lanes.size());
         std::map<int, size_t> defIndex;
         for (size_t i = 0; i < sc.lanes.size(); ++i) {
@@ -592,15 +763,16 @@ struct Renderer {
         std::deque<RLane> autoLanes;                  // deque: references stay valid while lanes are added
         std::map<std::string, size_t> autoIndex;
         // A track without a lane of its own choice gets a lane named like the track. Tracks with the same name share it.
-        auto laneOf = [&](int laneId, size_t ti) -> RLane& {
+        auto laneOf = [&](int laneId, size_t ti, const std::string* name = nullptr) -> RLane& {
             const auto it = defIndex.find(laneId);
             if (laneId > 0 && it != defIndex.end()) return defs[it->second];
             const Track& t = p.tracks[ti];
-            const std::string label = t.scoreLabel.empty() ? t.name : t.scoreLabel;
+            const std::string label = name && !name->empty() ? *name : (t.scoreLabel.empty() ? t.name : t.scoreLabel);
             const std::string key = sc.mergeSameName ? "n:" + normName(label) : "t:" + std::to_string(ti);
             auto ai = autoIndex.find(key);
             if (ai == autoIndex.end()) {
                 RLane l;
+                l.byName = true;
                 l.name = label;
                 l.sub = t.scoreSub;
                 l.kind = t.scoreKind;
@@ -618,24 +790,43 @@ struct Renderer {
         std::vector<RLane*> primary(p.tracks.size(), nullptr);
         for (size_t ti = 0; ti < p.tracks.size(); ++ti) {
             const Track& t = p.tracks[ti];
-            if (t.scoreKind == 3) continue;
+            if (t.scoreKind == 3 || !audible(t)) continue;   // hidden or muted tracks are not in the score (like a render)
             const uint32_t rgb = (t.color & 0xFFFFFF) ? (t.color & 0xFFFFFF) : paletteRgb((int)ti);
             auto place = [&](RLane& l) -> int {
                 if (l.color.empty()) l.color = hex(rgb);
                 if (std::find(l.tracks.begin(), l.tracks.end(), &t) == l.tracks.end()) {
-                    for (const Track* o : l.tracks) if (normName(o->name) == normName(t.name)) l.merged = true;
+                    if (!l.tracks.empty()) l.merged = true;
                     l.tracks.push_back(&t);
                 }
                 l.used = true;
                 if (!primary[ti]) primary[ti] = &l;
-                const std::string key = normName(t.name);
+                if (t.scoreOverlap == 1) l.separated = true;
+                const std::string key = l.byName ? std::string() : normName(t.name);   // tracks of one named lane share ONE row
                 for (size_t r = 0; r < l.rowKeys.size(); ++r) if (l.rowKeys[r] == key) return (int)r;
                 l.rowKeys.push_back(key);
-                l.rowNames.push_back(t.name);
+                l.rowNames.push_back(l.byName ? std::string() : t.name);
                 return (int)l.rowKeys.size() - 1;
             };
+            auto addItems = [&](RLane& l) {
+                for (const TrackMark& mk : t.marks) {
+                    if (mk.scorePos <= 0) continue;
+                    ScoreItem it;
+                    it.t = mk.t; it.dur = std::max(0.2, mk.dur);
+                    it.text = mk.text; for (char& ch : it.text) if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+                    it.color = hex((mk.color & 0xFFFFFF) ? (mk.color & 0xFFFFFF) : rgb);
+                    it.kind = t.kind; it.type = mk.type; it.shape = mk.shape; it.lang = mk.lang; it.pos = mk.scorePos; it.size = mk.size; it.font = mk.font; it.ratio = mk.ratio;
+                    l.items.push_back(it);
+                }
+            };
+            if (t.kind == 1) {                                                  // marker track: only notes with 'In score' set reach the score (the lane with the same name)
+                bool any = false;
+                for (const TrackMark& mk : t.marks) if (mk.scorePos > 0) any = true;
+                if (any) { RLane& l = laneOf(t.scoreLane, ti); place(l); addItems(l); }
+                continue;
+            }
+            if (t.kind == 2) { RLane& fl = laneOf(t.scoreLane, ti); place(fl); addItems(fl); }   // graph track: its items sit above / below the lane   // free automation: a lane that only holds its automation
             for (const Clip& c : t.clips) {
-                if (c.scoreLane < 0) continue;
+                if (c.scoreLane < 0 || c.muted) continue;
                 RLane& l = laneOf(c.scoreLane > 0 ? c.scoreLane : t.scoreLane, ti);
                 const int row = place(l);
                 l.clips.push_back({ &t, &c, row });
@@ -644,14 +835,14 @@ struct Renderer {
             }
             for (const MidiClip& mc : t.midiClips) {
                 const Clip* owner = findClip(t, mc.clipId);
-                if (owner && owner->scoreLane < 0) continue;
-                RLane& l = laneOf(owner && owner->scoreLane > 0 ? owner->scoreLane : t.scoreLane, ti);
+                if (owner && (owner->scoreLane < 0 || owner->muted)) continue;
+                RLane& l = laneOf(owner && owner->scoreLane > 0 ? owner->scoreLane : t.scoreLane, ti, &t.scoreMidiLabel);
                 place(l);
                 l.midi.push_back({ &t, &mc, owner });
                 for (const MidiNote& n : mc.notes) { l.lo = std::min(l.lo, n.pitch); l.hi = std::max(l.hi, n.pitch); ++l.notes; }
             }
             for (const Clip& c : t.clips) {       // notes written by hand for clips whose notes are made inside the code
-                if (c.scoreLane < 0 || c.scoreWritten.empty()) continue;
+                if (c.scoreLane < 0 || c.muted || c.scoreWritten.empty()) continue;
                 std::vector<MidiNote> nn = scoreWrittenNotes(c.scoreWritten, c.dur);
                 if (nn.empty()) continue;
                 synth.emplace_back();
@@ -661,7 +852,7 @@ struct Renderer {
                 mc.start = c.start;
                 mc.dur = c.dur;
                 mc.notes = std::move(nn);
-                RLane& l = laneOf(c.scoreLane > 0 ? c.scoreLane : t.scoreLane, ti);
+                RLane& l = laneOf(c.scoreLane > 0 ? c.scoreLane : t.scoreLane, ti, &t.scoreMidiLabel);
                 place(l);
                 l.midi.push_back({ &t, &mc, &c });
                 for (const MidiNote& n : mc.notes) { l.lo = std::min(l.lo, n.pitch); l.hi = std::max(l.hi, n.pitch); ++l.notes; }
@@ -671,21 +862,47 @@ struct Renderer {
             const Track& t = p.tracks[ti];
             if (!primary[ti]) continue;
             const ParsedTrack parsed = parseTrack(t);
+            int laneIdx = 0;   // same colour order as the lanes in the editor (the editor counts the lanes that are shown)
             for (const auto& a : t.automation) {
-                if (a.second.empty() || t.hiddenAutomation.count(a.first)) continue;
+                const int myIdx = t.hiddenAutomation.count(a.first) ? -1 : laneIdx++;
+                if (a.second.empty() || myIdx < 0) continue;
+                if (t.scoreAutoMuted.count(a.first)) continue;                                   // M: hidden in the score
+                if (!t.scoreAutoSolo.empty() && !t.scoreAutoSolo.count(a.first)) continue;       // S: only the soloed lines
                 const auto m = t.scoreAuto.find(a.first);
                 const int mode = m == t.scoreAuto.end() ? 1 : m->second;      // every automation with points is in the score unless it is switched off
                 if (mode <= 0) continue;
                 Auto au;
                 au.label = a.first; au.track = t.name; au.pts = &a.second; au.mode = mode;
+                { const auto sh = t.scoreAutoShape.find(a.first); if (sh != t.scoreAutoShape.end()) au.shape = sh->second; }
+                { const auto cv = t.scoreAutoCurve.find(a.first); if (cv != t.scoreAutoCurve.end()) au.ratio = cv->second; }
+                { const auto sk = t.scoreAutoStroke.find(a.first); if (sk != t.scoreAutoStroke.end()) au.stroke = std::min(8.0, std::max(0.3, sk->second)); }
+                {   // the colour of the automation lane (the one you pick in the editor), not the colour of the track
+                    static const uint32_t defaults[] = { 0xF2A65Au, 0x5BC0DEu, 0xB18BF0u, 0x77C77Du, 0xE66B87u, 0xD6C855u };
+                    const auto ac = t.automationColors.find(a.first);
+                    au.color = hex(ac != t.automationColors.end() && ac->second != 0 ? ac->second : defaults[(size_t)myIdx % 6]);
+                }
+                if (t.kind == 2) {
+                    const auto yz = t.scoreAutoYSize.find(a.first);
+                    au.graph = true;
+                    au.ysize = yz == t.scoreAutoYSize.end() ? 1.0 : std::min(400, std::max(50, yz->second)) / 100.0;
+                    if (au.ranged) for (const AutoPoint& pt : a.second) if (pt.v < au.lo - 1e-9 || pt.v > au.hi + 1e-9) { au.ranged = false; break; }   // data outside 0..1 (older projects): fit the line to its own values
+                }
+                if (t.kind == 2) { const auto mg = t.scoreAutoMerge.find(a.first); au.merge = mg == t.scoreAutoMerge.end() ? 0 : mg->second; }
                 for (const CawParam& cp : parsed.params) if (cp.chn == a.first && cp.max > cp.min) { au.lo = cp.min; au.hi = cp.max; au.ranged = true; }
-                primary[ti]->autos.push_back(au);
+                RLane* home = primary[ti];
+                const auto nm = t.scoreAutoNames.find(a.first);
+                if (nm != t.scoreAutoNames.end() && !nm->second.empty() && t.scoreLane <= 0) {   // own name: the same name as another lane puts it in that lane
+                    home = &laneOf(0, ti, &nm->second);
+                    if (home->color.empty()) home->color = hex((t.color & 0xFFFFFF) ? (t.color & 0xFFFFFF) : paletteRgb((int)ti));
+                    home->used = true;
+                }
+                home->autos.push_back(au);
             }
         }
         for (RLane& l : defs) if (l.used) lanes.push_back(l);
         for (RLane& l : autoLanes) if (l.used) lanes.push_back(l);
         for (RLane& l : lanes) {
-            l.staff = p.score.mode != 0 && (l.kind == 1 || (l.kind == 0 && l.notes > 0));
+            l.staff = l.kind == 1 || (l.kind == 0 && l.notes > 0);
             if (l.kind == 2) l.staff = false;
             if (l.staff) {
                 l.noClef = l.clef == 3;
@@ -704,7 +921,7 @@ struct Renderer {
         for (size_t li = 0; li < lanes.size(); ++li) {
             const RLane& l = lanes[li];
             if (l.staff) {
-                for (const SrcMidi& m : l.midi) if (m.c && m.c->scoreMidi != 2 && !m.m->notes.empty()) list.push_back({ { m.c->start, li }, m.c });
+                for (const SrcMidi& m : l.midi) if (m.c && midiShow(m.c) != 2 && !m.m->notes.empty()) list.push_back({ { m.c->start, li }, m.c });
             } else {
                 for (const SrcClip& c : l.clips) list.push_back({ { c.c->start, li }, c.c });
             }
@@ -741,19 +958,51 @@ struct Renderer {
     }
 
     // ---- geometry
-    double autoH(const Auto& a) const { return a.mode == 2 ? 22.0 : (detailed ? 38.0 : 30.0); }
-    double stripsH(const RLane& l) const { double h = 0; for (const Auto& a : l.autos) h += autoH(a) + 4.0; return h; }
+    double autoH(const Auto& a) const { return a.mode == 2 ? 22.0 : (a.graph ? (detailed ? 52.0 : 44.0) : (detailed ? 38.0 : 30.0)) * a.ysize; }
+    // a lane that holds only graph lines: the strips ARE the lane (no empty instrument row above them)
+    static bool graphOnly(const RLane& l) {
+        if (l.autos.empty() || !l.clips.empty() || !l.midi.empty()) return false;
+        for (const Track* t : l.tracks) if (t->kind != 2) return false;
+        return true;
+    }
+    double groupH(const std::vector<const Auto*>& g) const { double h = 0; for (const Auto* a : g) h = std::max(h, autoH(*a)); return h; }
+    // Graph lines that are 'combine' or 'half combine' share ONE strip (drawn on top of each other); 'separated' lines and the other automations have a strip of their own.
+    std::vector<std::vector<const Auto*>> autoStrips(const RLane& l) const {
+        std::vector<std::vector<const Auto*>> out;
+        for (const Auto& a : l.autos) {
+            if (a.merge < 2 && a.mode == 1 && !out.empty() && out.back().front()->merge < 2 && out.back().front()->mode == 1) out.back().push_back(&a);
+            else out.push_back({ &a });
+        }
+        return out;
+    }
+    double stripsH(const RLane& l) const { double h = 0; for (const auto& g : autoStrips(l)) h += groupH(g) + 4.0; return h; }
     double labelArea() const { return detailed ? 24.0 : 12.0; }
     double contentH(const RLane& l) const { return l.axis ? 62.0 : 44.0; }
     double rowExtra(const RLane& l) const { return (detailed ? 12.0 : 0.0) + (l.dyn ? 11.0 : 0.0); }
     double graphicRowH(const RLane& l) const { return labelArea() + contentH(l) + rowExtra(l); }
-    size_t rowCount(const RLane& l) const { return std::max<size_t>(1, l.rowKeys.size()); }
+    size_t rowCount(const RLane& l) const { return graphOnly(l) ? 0 : std::max<size_t>(1, l.rowKeys.size()); }
     double spectrumH() const { return detailed ? 100.0 : 66.0; }
+    static bool hasItems(const RLane& l, int pos) { for (const ScoreItem& it : l.items) if (it.pos == pos) return true; return false; }
+    // size of an item: 13 px at 100 %, the font size makes it at least as tall as its text
+    static double itemScale(const ScoreItem& it) { return std::max(0.4, std::min(4.0, it.size / 100.0)); }
+    static double itemFont(const ScoreItem& it, double def) { return it.font > 0 ? (double)it.font : def; }
+    static double itemHeight(const ScoreItem& it) {
+        double h = 13.0 * itemScale(it);
+        if (it.kind == 1 || !it.text.empty()) h = std::max(h, itemFont(it, 9.0) * 1.45);
+        if (it.kind == 1 && it.type == 4) h = std::max(h, itemFont(it, 9.0) * 1.2 + 4.0 + 6.0 * itemScale(it));   // line + ends + the comment
+        return h;
+    }
+    static double bandH(const RLane& l, int pos) {
+        double m = 0.0;
+        for (const ScoreItem& it : l.items) if (it.pos == pos) m = std::max(m, itemHeight(it));
+        return m > 0.0 ? m + 4.0 : 0.0;
+    }
+    double itemBand(const RLane& l) const { return bandH(l, 1) + bandH(l, 2); }
     double laneHeight(const RLane& l) const {
         double h;
         if (l.staff) h = labelRows * 12.0 + 8 + 4 + 40 + 36 + 8 + (detailed ? 12.0 : 0.0);
         else h = rowCount(l) * graphicRowH(l) + 8;
-        return h + stripsH(l);
+        return h + stripsH(l) + itemBand(l);
     }
     double systemHeight() const {
         double h = 62;
@@ -768,22 +1017,7 @@ struct Renderer {
         const double t0 = k * sysSec, t1 = std::min(end, t0 + sysSec);
         const double xe = L + (t1 - t0) * pps;
         s.line(L, yR, xe, yR, "#000000", 0.9);
-        if (barSec > 0.0) {
-            // bars: tick + bar number above the line, clock time (small, grey) under it
-            const long b0 = (long)std::ceil(t0 / barSec - 1e-9), b1 = (long)std::floor(t1 / barSec + 1e-9);
-            const double barPx = barSec * pps;
-            const long every = barPx >= 26 ? 1 : (barPx >= 13 ? 2 : (barPx >= 7 ? 4 : 8));
-            for (long b = b0; b <= b1; ++b) {
-                const double x = L + (b * barSec - t0) * pps;
-                s.line(x, yR, x, yR - (b % every == 0 ? 9 : 5), "#000000", 0.8);
-                if (b % every == 0 && x < xe - 4) s.text(x + 2, yR - 3, std::to_string(b + 1), 9, "#111111", false, "start", true);
-            }
-            for (double t = std::ceil(t0 / labelStep - 1e-9) * labelStep; t <= t1 + 1e-6; t += labelStep) {
-                const double x = L + (t - t0) * pps;
-                s.line(x, yR, x, yR + 4, "#666666", 0.6);
-                s.text(x, yR + 13, clockText(t), 8, "#777777", false, "middle");
-            }
-        } else {
+        {
             for (double t = std::ceil(t0 / tickStep - 1e-9) * tickStep; t <= t1 + 1e-6; t += tickStep) {
                 const bool big = std::fmod(t, labelStep) < 1e-6;
                 const double x = L + (t - t0) * pps;
@@ -818,11 +1052,16 @@ struct Renderer {
     static std::string valueText(double v) { char b[32]; std::snprintf(b, sizeof b, "%.4g", v); return b; }
 
     // An automation lane, drawn like an instrument lane: label + range on the left, grid, filled curve, break points, peak values.
-    void drawAutoLane(Canvas& s, const RLane& ln, const Auto& au, double ys, int k, const std::string& c) {
+    void drawAutoLane(Canvas& s, const RLane& ln, const Auto& au, double ys, int k, const std::string& laneColor, size_t gi = 0, const std::vector<const Auto*>& grp = {}, double stripH = 0.0) {
+        const std::string& c = au.color.empty() ? laneColor : au.color;
+        const double fm = au.merge == 1 ? 3.1 : 1.0;   // half combine: the fill is stronger, the lines lie on top of each other at 50%
+        const double lwDef = detailed ? 1.6 : 1.3;
+        const double lw1 = au.stroke > 0 ? au.stroke : lwDef;   // stroke width of the line
+        const double kr = lw1 / lwDef;                            // ratio to the default width: the dots, bars, dashes and break points of the other shapes scale with it
         const double t0 = k * sysSec, t1 = std::min(end, t0 + sysSec);
         auto X = [&](double t) { return L + (t - t0) * pps; };
         const double xe = X(t1);
-        const double h = autoH(au), top = ys + 1;
+        const double h = stripH > 0 ? stripH : autoH(au), top = ys + 1;
         const double pTop = top + 4, pBot = top + h - 4;
         std::vector<AutoPoint> v = *au.pts;
         std::stable_sort(v.begin(), v.end(), [](const AutoPoint& a, const AutoPoint& b) { return a.t < b.t; });
@@ -836,38 +1075,111 @@ struct Renderer {
             return v.back().v;
         };
         // frame
-        s.rect(L, top, xe - L, h, c, 0.05, "#9A9A9A", 0.5);
-        s.rect(L - 28, top, 3, h, c, 1.0, "");
+        if (gi == 0 && !au.overlay) s.rect(L, top, xe - L, h, c, 0.05, "#9A9A9A", 0.5);
+        const bool graphLane = graphOnly(ln);
+        if (!au.overlay) s.rect(L - 28, top + (double)gi * (h / (double)std::max<size_t>(1, grp.size())), 3, h / (double)std::max<size_t>(1, grp.size()), c, 1.0, "");   // one colour bar per line of a shared strip
         // left: name, where it belongs, range
         const bool second = ln.tracks.size() > 1 || au.track != ln.name;
-        s.text(14, top + 13, fit(au.label, L - 86, 10.5), 10.5, "#111111", true);
-        s.text(14, top + 25, fit(second ? au.track : std::string("automation"), L - 86, 8.5), 8.5, "#777777", false, "start", true);
-        s.text(L - 33, top + 10, valueText(mx), 7.5, "#555555", false, "end", true);
-        s.text(L - 33, top + h - 3, valueText(mn), 7.5, "#555555", false, "end", true);
-        if (au.mode == 1) for (double u : { 0.0, 0.5, 1.0 }) s.line(L, pBot - u * (pBot - pTop), xe, pBot - u * (pBot - pTop), "#000000", 0.3, u == 0.5 ? 0.2 : 0.3, "1,3");
+        if (au.overlay) {}
+        else if (grp.size() > 1 || graphLane) {   // graph lane / shared strip: the name of the lane, then every line in its own colour
+            if (gi == 0 && graphLane) s.text(14, top + 11, fit(ln.name, L - 86, 10.5), 10.5, "#111111", true);
+            const double ly = top + (graphLane ? 22.0 : 10.0) + 9.0 * (double)gi;
+            if (ly < top + h - 1) s.text(14, ly, fit(au.label, L - 86, 8.5), 8.5, c, true);
+        } else {
+            s.text(14, top + 13, fit(au.label, L - 86, 10.5), 10.5, "#111111", true);
+            s.text(14, top + 25, fit(second ? au.track : std::string("automation"), L - 86, 8.5), 8.5, "#777777", false, "start", true);
+        }
+        if (gi == 0 && !au.overlay) {
+            s.text(L - 33, top + 10, valueText(mx), 7.5, "#555555", false, "end", true);
+            s.text(L - 33, top + h - 3, valueText(mn), 7.5, "#555555", false, "end", true);
+        }
+        if (au.mode == 1 && gi == 0 && !au.overlay) for (double u : { 0.0, 0.5, 1.0 }) s.line(L, pBot - u * (pBot - pTop), xe, pBot - u * (pBot - pTop), "#000000", 0.3, u == 0.5 ? 0.2 : 0.3, "1,3");
         // curve
         Pts curve;
         if (au.mode == 2) {
             const size_t n = v.size(), stepN = std::max<size_t>(1, n / 24);
             for (size_t i = 0; i < n; i += stepN) if (v[i].t >= t0 - 1e-9 && v[i].t <= t1 + 1e-9) curve.push_back({ X(v[i].t), Y(v[i].v) });
             if (curve.size() < 2) { curve.clear(); curve.push_back({ L, Y(valueAt(t0)) }); curve.push_back({ xe, Y(valueAt(t1)) }); }
-            s.smoothPath(curve, c, 1.7);
+            s.smoothPath(curve, c, 1.7 * kr);
             return;
         }
+        if (au.shape != 0) {
+            // the other looks of the line. Mirror shapes: the value is the HEIGHT of a shape mirrored around a centre line
+            const double ex = std::max(0.3, std::min(3.0, au.ratio));
+            const double midY = (pTop + pBot) / 2, halfMax = (pBot - pTop) / 2;
+            auto halfAt = [&](double val) { return std::pow(std::max(0.0, std::min(1.0, (val - mn) / (mx - mn))), ex) * halfMax; };
+            Pts pv;   // (x, value) of the points in this system, with the values at both borders
+            std::vector<double> pt_t, pt_v;
+            pt_t.push_back(t0); pt_v.push_back(valueAt(t0));
+            for (const AutoPoint& pt : v) if (pt.t > t0 + 1e-9 && pt.t < t1 - 1e-9) { pt_t.push_back(pt.t); pt_v.push_back(pt.v); }
+            pt_t.push_back(t1); pt_v.push_back(valueAt(t1));
+            const size_t n = pt_t.size();
+            if (au.shape == 1) {                                       // steps
+                Pts st;
+                for (size_t i = 0; i < n; ++i) { if (i > 0) st.push_back({ X(pt_t[i]), Y(pt_v[i - 1]) }); st.push_back({ X(pt_t[i]), Y(pt_v[i]) }); }
+                s.polyline(st, c, lw1);
+            } else if (au.shape == 2 || au.shape == 4) {               // straight lines / dashed
+                Pts ln2;
+                for (size_t i = 0; i < n; ++i) ln2.push_back({ X(pt_t[i]), Y(pt_v[i]) });
+                char dashBuf[32];
+                std::snprintf(dashBuf, sizeof dashBuf, "%.2f,%.2f", 5.0 * std::max(1.0, kr), 3.0 * std::max(1.0, kr));
+                s.polyline(ln2, c, lw1, au.shape == 4 ? dashBuf : nullptr);
+            } else if (au.shape == 3) {                                // dots
+                Pts ln3;   // "dots" no longer draws dots: a plain line
+                for (size_t i = 0; i < n; ++i) ln3.push_back({ X(pt_t[i]), Y(pt_v[i]) });
+                s.polyline(ln3, c, lw1);
+            } else if (au.shape == 5) {                                // mirror, smooth
+                const int N = std::max(8, (int)((xe - L) / 2.0));
+                Pts up, dn;
+                for (int i = 0; i <= N; ++i) {
+                    const double tt = t0 + (t1 - t0) * i / N, hv = halfAt(valueAt(tt)), x = X(tt);
+                    up.push_back({ x, midY - hv }); dn.push_back({ x, midY + hv });
+                }
+                Pts shape = up;
+                for (auto it = dn.rbegin(); it != dn.rend(); ++it) shape.push_back(*it);
+                s.fillPoly(shape, c, 0.22 * fm);
+                s.polyline(up, c, lw1); s.polyline(dn, c, lw1);
+                s.line(L, midY, xe, midY, c, 0.4, 0.6, "2,2");
+            } else if (au.shape == 6) {                                // mirror, boxes
+                const bool many = n > 66;
+                const size_t boxes = many ? 64 : n - 1;
+                for (size_t b = 0; b < boxes; ++b) {
+                    const double ta = many ? t0 + (t1 - t0) * (double)b / boxes : pt_t[b];
+                    const double tb = many ? t0 + (t1 - t0) * (double)(b + 1) / boxes : pt_t[b + 1];
+                    const double hv = std::max(0.6, halfAt(many ? valueAt((ta + tb) / 2) : pt_v[b]));
+                    s.rect(X(ta), midY - hv, std::max(1.0, X(tb) - X(ta)), 2 * hv, c, std::min(0.9, 0.25 * fm), c, 0.8 * kr);
+                }
+                s.line(L, midY, xe, midY, c, 0.4, 0.6, "2,2");
+            } else if (au.shape == 7) {                                // hairpin: straight wedge between the points
+                Pts up, dn;
+                for (size_t i = 0; i < n; ++i) { up.push_back({ X(pt_t[i]), midY - halfAt(pt_v[i]) }); dn.push_back({ X(pt_t[i]), midY + halfAt(pt_v[i]) }); }
+                Pts shape = up;
+                for (auto it = dn.rbegin(); it != dn.rend(); ++it) shape.push_back(*it);
+                s.fillPoly(shape, c, 0.22 * fm);
+                s.polyline(up, c, lw1); s.polyline(dn, c, lw1);
+                s.line(L, midY, xe, midY, c, 0.4, 0.6, "2,2");
+            } else {                                                   // bars
+                const int N = std::max(8, (int)((xe - L) / 4.0));
+                for (int i = 0; i <= N; ++i) {
+                    const double tt = t0 + (t1 - t0) * i / N;
+                    s.line(X(tt), pBot, X(tt), Y(valueAt(tt)), c, 1.0 * kr, 0.85);
+                }
+            }
+        } else {
         curve.push_back({ L, Y(valueAt(t0)) });
         for (const AutoPoint& pt : v) if (pt.t > t0 + 1e-9 && pt.t < t1 - 1e-9) curve.push_back({ X(pt.t), Y(pt.v) });
         curve.push_back({ xe, Y(valueAt(t1)) });
         Pts area = curve;
         area.push_back({ xe, pBot });
         area.push_back({ L, pBot });
-        s.fillPoly(area, c, 0.16);
-        s.polyline(curve, c, detailed ? 1.6 : 1.3, nullptr, true);
+        s.fillPoly(area, c, std::min(0.9, 0.16 * fm));
+        s.polyline(curve, c, lw1, nullptr, true);
         size_t inside = 0;
         for (const AutoPoint& pt : v) if (pt.t >= t0 && pt.t <= t1) ++inside;
-        if (inside <= 80)
-            for (const AutoPoint& pt : v) if (pt.t >= t0 - 1e-9 && pt.t <= t1 + 1e-9) s.circle(X(pt.t), Y(pt.v), detailed ? 2.3 : 1.9, "#ffffff", c, 1.0);
+        (void)inside;   // no dots on the break points: the automation is a plain drawn line
+        }
         // peak values
-        if (detailed && h >= 34) {
+        if (detailed && h >= 34 && !au.overlay) {
             const AutoPoint* hi = nullptr; const AutoPoint* lo = nullptr;
             for (const AutoPoint& pt : v) {
                 if (pt.t < t0 - 1e-9 || pt.t > t1 + 1e-9) continue;
@@ -878,6 +1190,147 @@ struct Renderer {
                 const double xh = std::min(xe - 14, std::max(L + 14, X(hi->t))), xl = std::min(xe - 14, std::max(L + 14, X(lo->t)));
                 s.text(xh, std::max(top + 8.0, Y(hi->v) - 4), valueText(hi->v), 7.5, "#444444", false, "middle", true);
                 if (std::fabs(xh - xl) > 26 || std::fabs(Y(hi->v) - Y(lo->v)) > 10) s.text(xl, std::min(top + h - 1.0, Y(lo->v) + 10), valueText(lo->v), 7.5, "#444444", false, "middle", true);
+            }
+        }
+    }
+
+    // The other (non-mirror) shapes of a combined strip are drawn INSIDE the mirror body: mirrored around the centre line and never taller than the body.
+    void drawInsideMirror(Canvas& s, const Auto& env, const std::vector<const Auto*>& oth, double ys, int k, double stripH, const std::string& laneColor) {
+        if (!env.pts || env.pts->size() < 2) return;
+        const double t0 = k * sysSec, t1 = std::min(end, t0 + sysSec);
+        auto X = [&](double t) { return L + (t - t0) * pps; };
+        const double xe = X(t1), top = ys + 1;
+        const double pTop = top + 4, pBot = top + stripH - 4;
+        const double midY = (pTop + pBot) / 2, halfMax = (pBot - pTop) / 2;
+        const std::vector<AutoPoint>& ev = *env.pts;   // the body: 0..1, sorted by time
+        auto bodyAt = [&](double tt) {
+            if (tt <= ev.front().t) return ev.front().v;
+            if (tt >= ev.back().t) return ev.back().v;
+            size_t lo = 0, hi = ev.size() - 1;
+            while (hi - lo > 1) { size_t mid = (lo + hi) / 2; if (ev[mid].t <= tt) lo = mid; else hi = mid; }
+            const double f = (tt - ev[lo].t) / std::max(1e-9, ev[hi].t - ev[lo].t);
+            return ev[lo].v + f * (ev[hi].v - ev[lo].v);
+        };
+        const double lwDef = detailed ? 1.6 : 1.3;
+        for (const Auto* a : oth) {
+            std::vector<AutoPoint> v = *a->pts;
+            if (v.empty()) continue;
+            std::stable_sort(v.begin(), v.end(), [](const AutoPoint& x, const AutoPoint& y2) { return x.t < y2.t; });
+            double mn = a->ranged ? a->lo : 1e300, mx = a->ranged ? a->hi : -1e300;
+            for (const AutoPoint& pt : v) { mn = std::min(mn, pt.v); mx = std::max(mx, pt.v); }
+            if (!(mx > mn)) { mn -= 0.5; mx += 0.5; }
+            auto normAt = [&](double tt) {
+                double val;
+                if (tt <= v.front().t) val = v.front().v;
+                else if (tt >= v.back().t) val = v.back().v;
+                else { size_t i = 1; while (i < v.size() && v[i].t < tt) ++i; const double f = (tt - v[i - 1].t) / std::max(1e-9, v[i].t - v[i - 1].t); val = v[i - 1].v + f * (v[i].v - v[i - 1].v); }
+                return std::min(1.0, std::max(0.0, (val - mn) / (mx - mn)));
+            };
+            const std::string& col = a->color.empty() ? laneColor : a->color;
+            const double lw1 = a->stroke > 0 ? a->stroke : lwDef, kr = lw1 / lwDef;
+            auto halfOf = [&](double tt) { (void)normAt; return bodyAt(tt) * halfMax; };   // fills the shared body: both shapes use ONE height
+            if (a->shape == 8) {                                       // bars, mirrored, inside the body
+                const int N = std::max(8, (int)((xe - L) / 4.0));
+                for (int i = 0; i <= N; ++i) {
+                    const double tt = t0 + (t1 - t0) * i / N, hh = halfOf(tt);
+                    if (hh > 0.3) s.line(X(tt), midY - hh, X(tt), midY + hh, col, 1.0 * kr, 0.9);
+                }
+            } else {                                                   // curve, steps, lines, dashes, dots: an upper and a lower line inside the body
+                const int N = std::max(8, (int)((xe - L) / 2.0));
+                Pts up, dn;
+                for (int i = 0; i <= N; ++i) {
+                    const double tt = t0 + (t1 - t0) * i / N, hh = halfOf(tt), x = X(tt);
+                    up.push_back({ x, midY - hh }); dn.push_back({ x, midY + hh });
+                }
+                if (a->shape == 3) {
+                    s.polyline(up, col, lw1); s.polyline(dn, col, lw1);
+                } else {
+                    char dashBuf[32];
+                    std::snprintf(dashBuf, sizeof dashBuf, "%.2f,%.2f", 5.0 * std::max(1.0, kr), 3.0 * std::max(1.0, kr));
+                    const char* dash = a->shape == 4 ? dashBuf : nullptr;
+                    s.polyline(up, col, lw1, dash); s.polyline(dn, col, lw1, dash);
+                }
+            }
+        }
+    }
+
+    // marker / graph track items in a band above (pos 1) or below (pos 2) a lane; the band is as tall as the biggest item (Size, Font size).
+    // Marker: comment, letter box, cue (Q), code (coding font, colors of the language). Graph: graphic-score shapes (grain cloud, glissando, swell...).
+    void drawItems(Canvas& s, const RLane& ln, int k, double yb, int pos) {
+        const double t0 = k * sysSec, t1 = std::min(end, t0 + sysSec);
+        auto X = [&](double t) { return L + (t - t0) * pps; };
+        const double band = bandH(ln, pos);
+        auto drawPrims = [&](int shape, double ax, double ay, double bx, double by, const std::string& c, double ratio) {
+            for (const markgfx::Prim& pr : markgfx::shapePrims(shape, ax, ay, bx, by, ratio)) {
+                Pts pts;
+                for (const auto& q : pr.pts) pts.push_back({ q.first, q.second });
+                if (pr.fill) s.fillPoly(pts, c, pr.solid ? 1.0 : 0.25);
+                if (pr.closed && !pts.empty()) pts.push_back(pts.front());
+                s.polyline(pts, c, pr.sw * 0.9);
+            }
+        };
+        for (const ScoreItem& it : ln.items) {
+            if (it.pos != pos || it.t + it.dur < t0 - 1e-9 || it.t > t1) continue;
+            const double xa = X(std::max(it.t, t0)), hh = itemHeight(it);
+            const double xb = std::max(xa + hh, X(std::min(it.t + it.dur, t1)));
+            const double y0 = yb + (band - hh) / 2, y1 = y0 + hh, ym = (y0 + y1) / 2;
+            const std::string& c = it.color;
+            if (it.kind == 2) {   // graph shape, with its text beside it
+                drawPrims(it.shape, xa, y0, xb, y1, c, it.ratio / 100.0);
+                if (!it.text.empty()) { const double gfs = itemFont(it, 9.0); s.text(markgfx::shapeRight(it.shape, xa, y0, xb, y1, it.ratio / 100.0) + 4, y1 - (hh - gfs * 0.7) / 2, it.text, gfs, "#111111", false, "start", true); }
+                continue;
+            }
+            const double fs = itemFont(it, 9.0), base = y1 - (hh - fs * 0.7) / 2;   // text baseline
+            if (it.type == 1) {                                   // letter box
+                const double w = std::max(hh, textWidth(it.text, fs * 1.05) + 7);
+                s.rect(xa, y0, w, hh, c, 0.12, c, 1.2);
+                s.text(xa + w / 2, base, it.text, fs * 1.05, "#111111", true, "middle");
+            } else if (it.type == 2) {                            // cue Q
+                const double cx = xa + hh / 2;
+                if (it.shape == 0) s.circle(cx, ym, hh / 2, "", c, 1.2);
+                else if (it.shape == 1) s.rect(xa, y0, hh, hh, c, 0.12, c, 1.2);
+                else if (it.shape == 2) { Pts d = { { xa, ym }, { cx, y0 }, { xa + hh, ym }, { cx, y1 }, { xa, ym } }; s.polyline(d, c, 1.2); }
+                else if (it.shape == 4) {                         // [ Q ]
+                    const double tk = std::min(4.0, hh * 0.3), xr = xa + hh;
+                    Pts lb = { { xa + 1 + tk, y0 }, { xa + 1, y0 }, { xa + 1, y1 }, { xa + 1 + tk, y1 } };
+                    Pts rb = { { xr - 1 - tk, y0 }, { xr - 1, y0 }, { xr - 1, y1 }, { xr - 1 - tk, y1 } };
+                    s.polyline(lb, c, 1.2); s.polyline(rb, c, 1.2);
+                }
+                else s.line(xa + 1, y1, xa + hh - 1, y1, c, 1.1);
+                s.text(cx, base, "Q", fs, "#111111", true, "middle");
+                if (!it.text.empty()) s.text(xa + hh + 4, base, fit(it.text, xb - xa - hh - 4, fs), fs, "#111111", false, "start", true);
+            } else if (it.type == 4) {                            // span bracket: a horizontal line with 90 degree ends, the comment centred above (ends down) or below (ends up)
+                const double tk = std::min(hh * 0.45, 4.0 + 2.0 * itemScale(it)), ww = std::max(10.0, xb - xa), bfs = itemFont(it, 9.0);
+                const bool up = it.shape == 1;
+                const double yl = up ? y0 + tk : y1 - tk, ye = up ? y0 : y1;
+                Pts br = { { xa, ye }, { xa, yl }, { xa + ww, yl }, { xa + ww, ye } };
+                s.polyline(br, c, 1.3);
+                if (!it.text.empty()) s.text(xa + ww / 2, up ? yl + 2.0 + bfs * 0.8 : yl - 2.5, fit(it.text, ww - 4, bfs), bfs, "#111111", false, "middle", true);
+            } else if (it.type == 3) {                            // code: coding font, colors of the language
+                static const char* const cols[] = { "#222222", "#8A3FA0", "#2E7D32", "#B5541C", "#6A8F55", "#1F5FA8" };
+                const double cfs = itemFont(it, 7.8) * (it.font > 0 ? 1.0 : 1.0), cw = cfs * 0.6;
+                std::vector<markgfx::Tok> toks;
+                std::istringstream lines(it.text);
+                std::string ln2;
+                while (std::getline(lines, ln2)) {
+                    for (const markgfx::Tok& tk : markgfx::highlightLine(ln2, it.lang)) toks.push_back(tk);
+                    toks.push_back({ "   ", 0 });
+                }
+                double len = 0.0;
+                for (const markgfx::Tok& tk : toks) len += tk.text.size() * cw;
+                const double w = std::max(xb - xa, std::min(len + 8, 400.0));
+                s.rect(xa, y0, w, hh, "#F4F4F4", 1.0, "#999999", 0.6);
+                double x = xa + 4;
+                const double cbase = y1 - (hh - cfs * 0.7) / 2;
+                for (const markgfx::Tok& tk : toks) {
+                    if (x + tk.text.size() * cw > xa + w - 2) break;
+                    s.text(x, cbase, tk.text, cfs, cols[std::min(5, std::max(0, tk.kind))], tk.kind == 1, "start", tk.kind == 4, true);
+                    x += tk.text.size() * cw;
+                }
+            } else {                                              // comment
+                s.line(xa, y1, xb, y1, c, 0.9);
+                s.line(xa, y0 + 4, xa, y1, c, 0.9);
+                if (!it.text.empty()) s.text(xa + 3, y1 - 3.5, fit(it.text, xb - xa - 4, fs * 0.95), fs * 0.95, "#111111", false, "start", true);
             }
         }
     }
@@ -928,18 +1381,7 @@ struct Renderer {
         const double xe = X(t1);
         const double yR = y0 + 46;
         if (detailed) {
-            if (barSec > 0.0) {
-                if (k == 0) {   // tempo mark: quarter note = bpm, and the time signature
-                    s.note(46, yR - 15, "#111111", 3.2);
-                    s.line(49.6, yR - 15, 49.6, yR - 26, "#111111", 1.0);
-                    char tb[64]; std::snprintf(tb, sizeof tb, "= %g    %d/%d", p.score.tempo, p.score.meterNum, p.score.meterDen);
-                    s.text(58, yR - 12, tb, 12, "#111111", true);
-                } else {
-                    s.text(40, yR - 12, "bar " + std::to_string((long)std::llround(t0 / barSec) + 1), 12, "#111111", true);
-                }
-            } else {
-                s.text(40, yR - 12, k == 0 ? std::string("start") : clockText(t0), 12, "#111111", true);
-            }
+            s.text(40, yR - 12, k == 0 ? std::string("start") : clockText(t0), 12, "#111111", true);
             s.text(40, yR + 4, clockText(t0) + " - " + clockText(t1), 10.5, "#555555", false, "start", true);
         }
         ruler(s, k, yR);
@@ -948,18 +1390,13 @@ struct Renderer {
         double bodyTotal = 0;
         for (const RLane& l : lanes) bodyTotal += laneHeight(l) + extra;
         if (p.score.spectrum) bodyTotal += spectrumH() + 14;
-        if (barSec > 0.0) {   // barlines through the whole system, under the music
-            for (long b = (long)std::ceil(t0 / barSec - 1e-9); b * barSec <= t1 + 1e-9; ++b) {
-                const double x = X(b * barSec);
-                if (x < L + 1.0) continue;
-                s.line(x, yR, x, y + bodyTotal + 4, "#000000", 0.45, 0.22);
-            }
-        }
         struct Span { double top, bot; bool staff; };
         std::vector<Span> spans;
 
         for (const RLane& ln : lanes) {
             const double lh = laneHeight(ln) + extra;
+            const double laneY0 = y;
+            if (hasItems(ln, 1)) { drawItems(s, ln, k, y, 1); y += bandH(ln, 1); }
             const std::string c = ln.color;
             double lastEnd[2] = { -1e9, -1e9 };
             auto placeLabel = [&](double x, double xr, const std::string& main, const std::string& info, double yBase, int dir, int cueNo) {
@@ -997,7 +1434,7 @@ struct Renderer {
                 std::stable_sort(items.begin(), items.end(), [](const SrcMidi& a, const SrcMidi& b) { return a.m->start < b.m->start; });
                 for (const SrcMidi& it : items) {
                     const MidiClip& mc = *it.m;
-                    const int disp = it.c ? it.c->scoreMidi : 0;
+                    const int disp = midiShow(it.c);
                     const double a = std::max(mc.start, t0), b = std::min(mc.start + mc.dur, t1);
                     if (b <= a || mc.notes.empty() || disp == 2) continue;
                     const bool first = mc.start >= t0 - 1e-9;
@@ -1008,8 +1445,8 @@ struct Renderer {
                     s.line(xa, by, xa, by + 4, c, 1.2);
                     if (b >= mc.start + mc.dur - 1e-9) s.line(xb, by, xb, by + 4, c, 1.2);
                     if (first) {
-                        const std::string nm = it.c ? (it.c->scoreLabel.empty() ? it.c->name : it.c->scoreLabel) : std::string("MIDI");
-                        placeLabel(xa, xb, nm, it.c ? clipText(*it.c) : "", by - 3, -1, it.c ? cueOf(it.c) : 0);
+                        const std::string nm = it.c ? clipTitle(*it.c) : std::string("MIDI");
+                        placeLabel(xa, xb, nm, it.c && it.c->scoreDetail ? clipText(*it.c) : "", by - 3, -1, it.c ? cueOf(it.c) : 0);
                         const bool ownDyn = it.c && !it.c->scoreDynamic.empty();
                         if (ownDyn) dynamicMark(s, xa, xb, base + 58, it.c->scoreDynamic, detailed ? 11 : 9.5);
                         else s.text(xa, base + 58, dynamicFor(vsum / mc.notes.size()), detailed ? 11 : 9.5, "#111111", true, "start", true);
@@ -1057,7 +1494,10 @@ struct Renderer {
                             const double dl = std::min(n.dur * pps, xe - x);
                             if (dl > 8) s.line(x + r, yy, x + dl, yy, c, 0.8, 0.8);
                             s.note(x, yy, c, r);
-                            if (isBlackKey(n.pitch)) s.text(x - r * 1.25 - 6, yy + 3, "#", detailed ? 9 : 7, "#111111", true, "middle");
+                            if (n.quarter == 1) s.qsharp(x, yy, r * 2.2, "#111111");
+                            else if (n.quarter == 2) s.qflat(x, yy, r * 2.2, "#111111");
+                            else if (n.quarter == 3) s.koron(x, yy, r * 2.2, "#111111");
+                            else if (isBlackKey(n.pitch)) { if (((n.pitch % 12) + 12) % 12 == 10) s.flat(x, yy, r * 2.2, "#111111"); else s.sharp(x, yy, r * 2.2, "#111111"); }
                             if (disp == 4) {
                                 if (x - lastName > 20) { s.text(x, yy - 8, pitchName(n.pitch), 7.5, "#555555", false, "middle", true); lastName = x; }
                             } else if (detailed && !labelled) { labelled = true; s.text(x, yy - 9, pitchName(n.pitch), 8.5, "#666666", false, "middle"); }
@@ -1071,7 +1511,7 @@ struct Renderer {
                     }
                     if (detailed && (disp == 0 || disp == 4)) s.slur(xa, xb, base + 48, c);
                 }
-                yAfterBody = y + laneHeight(ln) - stripsH(ln);
+                yAfterBody = y + laneHeight(ln) - stripsH(ln) - itemBand(ln);
             } else {
                 const size_t rows = rowCount(ln);
                 const double rh = graphicRowH(ln), ch = contentH(ln);
@@ -1111,16 +1551,93 @@ struct Renderer {
                     std::vector<const Clip*> cs;
                     for (const SrcClip& sc : ln.clips) if (sc.row == (int)r) cs.push_back(sc.c);
                     std::stable_sort(cs.begin(), cs.end(), [](const Clip* a, const Clip* b) { return a->start < b->start; });
+                    auto isPitched = [&](const Clip* cl) {
+                        if (!hasPitch) return false;
+                        for (const SrcMidi& sm : ln.midi) if (sm.c == cl && !sm.m->notes.empty()) return true;
+                        return false;
+                    };
+                    auto geomOf = [&](const Clip* cl, double& gcy, double& ghh) {
+                        gcy = mid; ghh = 5 + 4.0 * std::min(cl->runs, 4);
+                        if (ln.axis) {
+                            if (cl->scoreFreqHi > 0) {
+                                const double flo = std::max(20.0, cl->scoreFreqLo), fhi = std::max(flo * 1.05, cl->scoreFreqHi);
+                                gcy = (yF(flo) + yF(fhi)) / 2;
+                                ghh = std::max(3.0, (yF(flo) - yF(fhi)) / 2);
+                            } else ghh = std::min(ghh, ch / 2 - 2);
+                        }
+                    };
+                    // frequency position of a measured clip (centroid of its spectrum) on the frequency axis
+                    auto cyAt = [&](const Clip* cl, double cy0, double ghh, double tt) {
+                        if (ln.axis && cl->scoreFreqHi <= 0) {
+                            const ClipAna& an = anaOf(*cl);
+                            if (an.ok) { const double cen = lerpAt(an.t, an.cent, tt); if (cen > 20) return std::min(cBot - ghh, std::max(cTop + ghh, yF(cen))); }
+                        }
+                        return cy0;
+                    };
+                    // OVERLAP: the shapes of all 'shape' clips of this row are combined into ONE shape (union of their outlines).
+                    // Where only one colour is active the shape has that colour, where clips of different colours overlap it gets both (mixed).
+                    std::set<const Clip*> inUnion;
+                    if (!ln.separated) {
+                        std::vector<const Clip*> sh;
+                        for (const Clip* cl : cs) if (cl->scoreStyle == 0 && !isPitched(cl) && cl->start + cl->dur > t0 && cl->start < t1) sh.push_back(cl);
+                        if (!sh.empty()) {
+                            double tA = 1e18, tB = -1e18;
+                            for (const Clip* cl : sh) { tA = std::min(tA, cl->start); tB = std::max(tB, cl->start + cl->dur); }
+                            tA = std::max(tA, t0); tB = std::min(tB, t1);
+                            struct Col { bool on = false; double x = 0, top = 0, bot = 0; std::string col; };
+                            std::vector<Col> cols;
+                            const int N = std::max(8, (int)((tB - tA) * pps / 2.5));
+                            std::vector<double> gcy(sh.size()), ghh(sh.size());
+                            std::vector<std::string> gcol(sh.size());
+                            for (size_t q = 0; q < sh.size(); ++q) { geomOf(sh[q], gcy[q], ghh[q]); gcol[q] = clipHex(*sh[q], c); }
+                            for (int i = 0; i <= N; ++i) {
+                                const double tt = tA + (tB - tA) * i / N;
+                                Col cc; cc.x = X(tt); cc.top = 1e18; cc.bot = -1e18;
+                                std::vector<std::string> act;
+                                for (size_t q = 0; q < sh.size(); ++q) {
+                                    if (tt < sh[q]->start || tt > sh[q]->start + sh[q]->dur) continue;
+                                    const double am = shapeHalf(*sh[q], tt, ghh[q]), cyT = cyAt(sh[q], gcy[q], ghh[q], tt);
+                                    cc.top = std::min(cc.top, cyT - am); cc.bot = std::max(cc.bot, cyT + am);
+                                    act.push_back(gcol[q]);
+                                    inUnion.insert(sh[q]);
+                                }
+                                if (!act.empty()) { cc.on = true; cc.col = mixHex(act); }
+                                cols.push_back(cc);
+                            }
+                            size_t i = 0;
+                            while (i < cols.size()) {
+                                if (!cols[i].on) { ++i; continue; }
+                                size_t j = i;                                   // run of the same colour
+                                while (j + 1 < cols.size() && cols[j + 1].on && cols[j + 1].col == cols[i].col) ++j;
+                                const size_t jEnd = (j + 1 < cols.size() && cols[j + 1].on) ? j + 1 : j;   // share the border column with the next colour
+                                Pts top, bot, shape;
+                                for (size_t q = i; q <= jEnd; ++q) { top.push_back({ cols[q].x, cols[q].top }); bot.push_back({ cols[q].x, cols[q].bot }); }
+                                shape = top;
+                                for (auto it = bot.rbegin(); it != bot.rend(); ++it) shape.push_back(*it);
+                                s.fillPoly(shape, cols[i].col, 0.30);
+                                s.polyline(top, cols[i].col, 1.0);
+                                s.polyline(bot, cols[i].col, 1.0);
+                                if (i == 0 || !cols[i - 1].on) s.line(cols[i].x, cols[i].top, cols[i].x, cols[i].bot, cols[i].col, 1.0);
+                                if (j + 1 >= cols.size() || !cols[j + 1].on) s.line(cols[j].x, cols[j].top, cols[j].x, cols[j].bot, cols[j].col, 1.0);
+                                for (size_t q = i; q <= j; q += 3) {            // fine hairlines inside, like the single shape
+                                    const double h1 = hash01((uint32_t)(q * 977 + k * 31 + 5)), h2 = hash01((uint32_t)(q * 313 + 11));
+                                    const double md = (cols[q].top + cols[q].bot) / 2;
+                                    s.line(cols[q].x, md - (md - cols[q].top) * h1, cols[q].x, md + (cols[q].bot - md) * h2, cols[i].col, 0.5, 0.75);
+                                }
+                                i = j + 1;
+                            }
+                        }
+                    }
                     for (const Clip* cl : cs) {
                         const double a = std::max(cl->start, t0), b = std::min(cl->start + cl->dur, t1);
                         if (b <= a) continue;
-                        const std::string nm = cl->scoreLabel.empty() ? cl->name : cl->scoreLabel;
+                        const std::string nm = clipTitle(*cl);
                         const double xa = X(a), xb = X(b);
                         const bool firstSeg = cl->start >= t0 - 1e-9;
                         bool pitched = false;
                         if (hasPitch) for (const SrcMidi& sm : ln.midi) if (sm.c == cl && !sm.m->notes.empty()) { pitched = true; break; }
                         if (pitched) {
-                            if (cl->scoreMidi == 2) continue;
+                            if (midiShow(cl) == 2) continue;
                             for (const SrcMidi& sm : ln.midi) {
                                 if (sm.c != cl || sm.m->notes.empty()) continue;
                                 const MidiClip& mc = *sm.m;
@@ -1128,14 +1645,14 @@ struct Renderer {
                                 if (mb <= ma) continue;
                                 s.line(X(ma), cTop - 2, X(mb), cTop - 2, c, 1.2);
                                 s.line(X(ma), cTop - 2, X(ma), cTop + 2, c, 1.2);
-                                if (mc.start >= t0 - 1e-9) placeLabel(X(ma), X(mb), nm, clipText(*cl), ry + labelArea() - 4, -1, cueOf(cl));
-                                if (cl->scoreMidi == 3) {
+                                if (mc.start >= t0 - 1e-9) placeLabel(X(ma), X(mb), nm, cl->scoreDetail ? clipText(*cl) : std::string(), ry + labelArea() - 4, -1, cueOf(cl));
+                                if (midiShow(cl) == 3) {
                                     int plo = 127, phi = 0;
                                     for (const MidiNote& n : mc.notes) { plo = std::min(plo, n.pitch); phi = std::max(phi, n.pitch); }
                                     const double yh = yPitch(phi) - 3, yl = yPitch(plo) + 3;
                                     s.rect(X(ma), yh, X(mb) - X(ma), std::max(6.0, yl - yh), c, 0.22, c, 1.0);
                                     if (detailed && mc.start >= t0 - 1e-9) s.text(X(ma) + 3, yh - 2, pitchName(phi) + " - " + pitchName(plo), 7.5, "#555555", false, "start", true);
-                                } else if (cl->scoreMidi == 1) {
+                                } else if (midiShow(cl) == 1) {
                                     Pts pts;
                                     const size_t n = mc.notes.size(), win = std::max<size_t>(2, n / 10);
                                     for (size_t i = 0; i < n; i += win) {
@@ -1152,61 +1669,141 @@ struct Renderer {
                                         if (tn < t0 - 1e-9 || tn >= t1) continue;
                                         const double x = X(tn), yy = yPitch(n.pitch);
                                         s.line(x, yy, x + std::max(3.0, std::min(n.dur * pps, xe - x)), yy, c, detailed ? 2.2 : 1.6, 0.9);
-                                        if (cl->scoreMidi == 4 && x - lastName > 22) { s.text(x, yy - 4, pitchName(n.pitch), 7, "#555555", false, "start", true); lastName = x; }
+                                        if (midiShow(cl) == 4 && x - lastName > 22) { s.text(x, yy - 4, pitchName(n.pitch), 7, "#555555", false, "start", true); lastName = x; }
                                     }
                                 }
                             }
                             if (!cl->scoreDynamic.empty() && firstSeg) dynamicMark(s, xa, xb, cBot + 8, cl->scoreDynamic, 9);
-                            if (detailed && firstSeg) s.text(xa + 2, ry + rh - 3, fit(dataLine(*cl), xb - xa, 7.5), 7.5, "#777777", false, "start", true);
+                            if (detailed && cl->scoreDetail && firstSeg) s.text(xa + 2, ry + rh - 3, fit(dataLine(*cl), xb - xa, 7.5), 7.5, "#777777", false, "start", true);
                             continue;
                         }
                         // sound material
-                        double cy = mid, hh = 5 + 4.0 * std::min(cl->runs, 4);
-                        if (ln.axis) {
-                            if (cl->scoreFreqHi > 0) {
-                                const double flo = std::max(20.0, cl->scoreFreqLo), fhi = std::max(flo * 1.05, cl->scoreFreqHi);
-                                cy = (yF(flo) + yF(fhi)) / 2;
-                                hh = std::max(3.0, (yF(flo) - yF(fhi)) / 2);
-                            } else hh = std::min(hh, ch / 2 - 2);
-                        }
+                        const std::string cc = clipHex(*cl, c);
+                        double cy = mid, hh = 5;
+                        geomOf(cl, cy, hh);
+                        const double fillOp = ln.separated ? 0.50 : 0.30;   // separated: on top of each other at 50%
                         const int N = std::max(8, (int)((b - a) * pps / 3));
                         if (cl->scoreStyle == 1) {
-                            s.line(xa, cy, xb, cy, c, 2.4);
-                            s.line(xa, cy - 6, xa, cy + 6, c, 1.4);
-                            s.line(xb, cy - 6, xb, cy + 6, c, 1.4);
+                            s.line(xa, cy, xb, cy, cc, 2.4);
+                            s.line(xa, cy - 6, xa, cy + 6, cc, 1.4);
+                            s.line(xb, cy - 6, xb, cy + 6, cc, 1.4);
                         } else if (cl->scoreStyle == 2) {
                             const int count = std::max(6, (int)((b - a) * pps / 4.5) * std::min(cl->runs, 4));
                             for (int i = 0; i < count; ++i) {
                                 const double gx = xa + hash01((uint32_t)(cl->id * 131 + i * 17 + k)) * (xb - xa);
                                 const double gy = cy + (hash01((uint32_t)(cl->id * 71 + i * 29)) - 0.5) * 2 * hh;
-                                s.circle(gx, gy, 1.0 + hash01((uint32_t)(i * 7 + cl->id)) * 1.6, c);
+                                s.circle(gx, gy, 1.0 + hash01((uint32_t)(i * 7 + cl->id)) * 1.6, cc);
                             }
                         } else if (cl->scoreStyle == 3) {
-                            s.rect(xa, cy - hh, xb - xa, 2 * hh, c, cl->muted ? 0.08 : 0.30, c, 1.2);
-                            for (double hx = xa + 4; hx < xb - 2; hx += 6) s.line(hx, cy + hh, hx + 5, cy - hh, c, 0.5, 0.6);
-                        } else {
+                            s.rect(xa, cy - hh, xb - xa, 2 * hh, cc, cl->muted ? 0.08 : fillOp, cc, 1.2);
+                            for (double hx = xa + 4; hx < xb - 2; hx += 6) s.line(hx, cy + hh, hx + 5, cy - hh, cc, 0.5, 0.6);
+                        } else if (cl->scoreStyle == 4) {
+                            // SLICED WAVE (granular): the wave of the sound cut into slices, every slice its own little piece of wave
+                            const double sliceW = 5.0, gap = 2.5;
+                            for (double sx = xa; sx < xb - 1; sx += sliceW + gap) {
+                                const double tt = a + (sx + sliceW / 2 - xa) / pps;
+                                const double am = shapeHalf(*cl, tt, hh), cyT = cyAt(cl, cy, hh, tt);
+                                s.rect(sx, cyT - am, std::min(sliceW, xb - sx), 2 * am, cc, ln.separated ? 0.30 : 0.16, "");
+                                Pts w;
+                                for (int j = 0; j <= 6; ++j) w.push_back({ sx + sliceW * j / 6.0, cyT + am * 0.9 * std::sin(j * 1.9 + sx * 0.7 + cl->id) });
+                                s.polyline(w, cc, 0.8);
+                            }
+                        } else if (cl->scoreStyle == 5) {
+                            // FM GRAPH: a carrier wave bent by a modulator; the depth of the bend follows the loudness
+                            Pts w;
+                            const int M = std::max(24, (int)((xb - xa) / 1.2));
+                            for (int i = 0; i <= M; ++i) {
+                                const double xx = xa + (xb - xa) * i / M, tt = a + (xx - xa) / pps;
+                                const double am = shapeHalf(*cl, tt, hh), cyT = cyAt(cl, cy, hh, tt);
+                                const double idx = 1.0 + 3.5 * am / std::max(1.0, hh);
+                                w.push_back({ xx, cyT + am * std::sin(xx * 0.85 + idx * std::sin(xx * 0.21 + cl->id)) });
+                            }
+                            s.polyline(w, cc, 1.0);
+                            Pts hi, lo;
+                            for (int i = 0; i <= N; ++i) {
+                                const double tt = a + (b - a) * i / N, am = shapeHalf(*cl, tt, hh), cyT = cyAt(cl, cy, hh, tt);
+                                hi.push_back({ X(tt), cyT - am }); lo.push_back({ X(tt), cyT + am });
+                            }
+                            s.polyline(hi, cc, 0.5, "2,2");
+                            s.polyline(lo, cc, 0.5, "2,2");
+                            if (firstSeg && detailed) s.text(xa + 2, cy - hh - 2, "FM", 7.5, "#777777", false, "start", true);
+                        } else if (cl->scoreStyle == 6) {
+                            // DOTS AND LINES (keys, leads): one dot per sounded note at its pitch height, a line for how long it rings
+                            const ClipAna& an = anaOf(*cl);
+                            std::vector<double> ons;
+                            if (an.ok) {
+                                for (size_t i = 1; i < an.t.size(); ++i)
+                                    if (an.t[i] >= a && an.t[i] <= b && ((an.amp[i] > 0.12 && an.amp[i - 1] <= 0.12) || (an.amp[i] > 0.15 && an.amp[i] > 1.6 * an.amp[i - 1] + 0.05))) ons.push_back(an.t[i]);
+                            }
+                            if (ons.empty()) { const int n = std::max(1, std::min(cl->runs, 64)); for (int r2 = 0; r2 < n; ++r2) ons.push_back(a + (b - a) * (r2 + 0.5) / n); }
+                            if (ons.size() > 600) ons.resize(600);
+                            for (size_t i = 0; i < ons.size(); ++i) {
+                                const double tEnd0 = i + 1 < ons.size() ? ons[i + 1] : b;
+                                double tEnd = tEnd0;
+                                if (an.ok) for (size_t q = 0; q < an.t.size(); ++q) if (an.t[q] > ons[i] && an.t[q] < tEnd0 && an.amp[q] < 0.05) { tEnd = an.t[q]; break; }
+                                double yy = cy;
+                                if (an.ok) {
+                                    const double cen = std::max(an.centLo, std::min(an.centHi, lerpAt(an.t, an.cent, ons[i])));
+                                    if (ln.axis) yy = std::min(cBot - 2, std::max(cTop + 2, yF(cen)));
+                                    else yy = cy + hh * 0.8 - (std::log(cen / an.centLo) / std::log(an.centHi / an.centLo)) * 2 * hh * 0.8;
+                                } else yy = cy + (hash01((uint32_t)(cl->id * 17 + i * 5)) - 0.5) * hh;
+                                s.line(X(ons[i]), yy, std::max(X(ons[i]) + 3.0, X(tEnd)), yy, cc, 1.4);
+                                s.circle(X(ons[i]), yy, 2.4, cc);
+                            }
+                        } else if (!inUnion.count(cl)) {
+                            // SHAPE, separated: the shape of this clip alone (amplitude shape, frequency position when measured)
                             Pts up, dn;
                             for (int i = 0; i <= N; ++i) {
                                 const double tt = a + (b - a) * i / N;
-                                const double u = (tt - cl->start) / cl->dur;
-                                const double ph = cl->id * 1.7;
-                                const double amp = hh * smoothAmp(u) * (0.78 + 0.22 * std::sin(tt * 3.1 + ph)) * (0.9 + 0.1 * std::sin(tt * 0.9 + ph));
-                                up.push_back({ X(tt), cy - amp });
-                                dn.push_back({ X(tt), cy + amp });
+                                const double am = shapeHalf(*cl, tt, hh), cyT = cyAt(cl, cy, hh, tt);
+                                up.push_back({ X(tt), cyT - am });
+                                dn.push_back({ X(tt), cyT + am });
                             }
                             Pts shape = up;
                             for (auto it = dn.rbegin(); it != dn.rend(); ++it) shape.push_back(*it);
-                            s.polygon(shape, c, cl->muted ? 0.08 : 0.30, 1.0, cl->muted);
+                            s.polygon(shape, cc, cl->muted ? 0.08 : fillOp, 1.0, cl->muted);
                             const int step = std::max(2, 8 - 2 * std::min(cl->runs, 3));
                             for (int i = 1; i < N; i += step) {
                                 const double h1 = hash01((uint32_t)(cl->id * 977 + i + k * 31)), h2 = hash01((uint32_t)(cl->id * 313 + i * 7));
-                                const double amp = cy - up[(size_t)i].second;
-                                s.line(up[(size_t)i].first, cy - amp * h1, up[(size_t)i].first, cy + amp * h2, c, 0.5, 0.75);
+                                const double md = (up[(size_t)i].second + dn[(size_t)i].second) / 2, amp = md - up[(size_t)i].second;
+                                s.line(up[(size_t)i].first, md - amp * h1, up[(size_t)i].first, md + amp * h2, cc, 0.5, 0.75);
+                            }
+                        }
+                        // DETAILED: everything the code sent to the channel "score" (numbers, signals as a curve, strings as text)
+                        if (cl->scoreDetail) {
+                            if (const ScoreClipProbe* pr = probeOf(*cl)) {
+                                double lo = 1e18, hi = -1e18;
+                                for (const ScoreDataSample& sd : pr->data) if (!sd.isText && sd.t >= cl->start && sd.t <= cl->start + cl->dur) { lo = std::min(lo, sd.v); hi = std::max(hi, sd.v); }
+                                if (hi >= lo) {
+                                    Pts curve;
+                                    for (const ScoreDataSample& sd : pr->data) {
+                                        if (sd.isText || sd.t < a || sd.t > b) continue;
+                                        curve.push_back({ X(sd.t), hi > lo ? cy + hh - (sd.v - lo) / (hi - lo) * 2 * hh : cy });
+                                    }
+                                    s.polyline(curve, "#222222", detailed ? 1.3 : 1.0);
+                                    if (firstSeg && detailed) {
+                                        char bufHi[32], bufLo[32];
+                                        std::snprintf(bufHi, sizeof bufHi, "%.4g", hi); std::snprintf(bufLo, sizeof bufLo, "%.4g", lo);
+                                        s.text(xa + 2, cy - hh + 6, bufHi, 6.5, "#444444", false, "start", true);
+                                        s.text(xa + 2, cy + hh - 1, bufLo, 6.5, "#444444", false, "start", true);
+                                    }
+                                }
+                                std::string prev;
+                                double lastEndX = -1e9;
+                                int tr = 0;
+                                for (const ScoreDataSample& sd : pr->data) {
+                                    if (!sd.isText || sd.t < a || sd.t > b || sd.text == prev) continue;
+                                    prev = sd.text;
+                                    const double tx = X(sd.t);
+                                    if (tx < lastEndX) continue;
+                                    s.text(tx, cy - hh - 3 - (tr++ % 2) * 8, fit(sd.text, 120, 7.5), 7.5, "#222222", false, "start", true);
+                                    lastEndX = tx + std::min(120.0, textWidth(sd.text, 7.5)) + 3;
+                                }
                             }
                         }
                         if (firstSeg) {
-                            std::string extra = clipText(*cl);
-                            if (cl->runs > 1) extra = "x" + std::to_string(cl->runs) + (extra.empty() ? "" : "  " + extra);
+                            std::string extra = cl->scoreDetail ? clipText(*cl) : std::string();
+                            if (cl->scoreDetail && cl->runs > 1) extra = "x" + std::to_string(cl->runs) + (extra.empty() ? "" : "  " + extra);
                             placeLabel(xa, xb, nm, extra, ry + labelArea() - 4, -1, cueOf(cl));
                         }
                         if (!cl->scoreDynamic.empty() && firstSeg) dynamicMark(s, xa, xb, cBot + 8, cl->scoreDynamic, 9);
@@ -1222,11 +1819,98 @@ struct Renderer {
 
             // automation lanes of this score lane: drawn like instruments, right under the lane
             double ys = yAfterBody;
-            for (const Auto& au : ln.autos) {
-                drawAutoLane(s, ln, au, ys, k, c);
-                ys += autoH(au) + 4.0;
+            for (const auto& grp : autoStrips(ln)) {
+                // 'combine' lines become ONE shape: the mix of all of them (weighted by their Y size), 'half combine' lines lie on top of it at 50%
+                std::vector<const Auto*> draw;
+                std::vector<AutoPoint> envPts;
+                Auto env;
+                std::vector<const Auto*> comb;
+                std::vector<Auto> extras;   // extra shape layers of the combined shape
+                extras.reserve(8);
+                for (const Auto* a : grp) if (a->merge == 0 && a->mode == 1 && grp.size() > 1) comb.push_back(a);
+                // With a mirror shape in the group, ALL combined lines reshape ONE common height (weighted mix of their values);
+                // the mirror shape is drawn on it and the other shapes (bars, lines, dashes...) fill it to the same height.
+                std::vector<const Auto*> mirM, insideM;
+                for (const Auto* a : comb) (a->shape >= 5 && a->shape <= 7 ? mirM : insideM).push_back(a);
+                const bool mirrorMode = comb.size() >= 2 && !mirM.empty();
+                if (!mirrorMode) { mirM = comb; insideM.clear(); }
+                if (comb.size() >= 2) {
+                    std::vector<double> ts;
+                    for (int i = 0; i <= 400; ++i) ts.push_back(end * i / 400.0);
+                    for (const Auto* a : comb) for (const AutoPoint& pt : *a->pts) ts.push_back(pt.t);
+                    std::sort(ts.begin(), ts.end());
+                    struct Nr { std::vector<AutoPoint> v; double mn, mx, w; };
+                    std::vector<Nr> nr;
+                    for (const Auto* a : comb) {
+                        Nr n; n.v = *a->pts; n.w = std::max(0.05, a->ysize);   // the Y size of a line = how much it counts in the mix
+                        std::stable_sort(n.v.begin(), n.v.end(), [](const AutoPoint& x, const AutoPoint& y2) { return x.t < y2.t; });
+                        n.mn = a->ranged ? a->lo : 1e300; n.mx = a->ranged ? a->hi : -1e300;
+                        for (const AutoPoint& pt : n.v) { n.mn = std::min(n.mn, pt.v); n.mx = std::max(n.mx, pt.v); }
+                        if (!(n.mx > n.mn)) { n.mn -= 0.5; n.mx += 0.5; }
+                        nr.push_back(n);
+                    }
+                    for (double tt : ts) {
+                        double sum = 0.0, wsum = 0.0, best = 0.0;
+                        size_t ni = 0;
+                        for (const Nr& n : nr) {
+                            double val;
+                            if (tt <= n.v.front().t) val = n.v.front().v;
+                            else if (tt >= n.v.back().t) val = n.v.back().v;
+                            else { size_t i = 1; while (i < n.v.size() && n.v[i].t < tt) ++i; const double f = (tt - n.v[i - 1].t) / std::max(1e-9, n.v[i].t - n.v[i - 1].t); val = n.v[i - 1].v + f * (n.v[i].v - n.v[i - 1].v); }
+                            const double nv = (val - n.mn) / (n.mx - n.mn);
+                            sum += n.w * nv; wsum += n.w;
+                            best += n.w * std::pow(std::min(1.0, std::max(0.0, nv)), (comb[ni]->shape >= 5 && comb[ni]->shape <= 7) ? std::max(0.3, std::min(3.0, comb[ni]->ratio)) : 1.0);
+                            ++ni;
+                        }
+                        envPts.push_back({ tt, mirrorMode ? (wsum > 0 ? best / wsum : 0.0) : (wsum > 0 ? sum / wsum : 0.0) });
+                    }
+                    env = *comb.front();
+                    env.pts = &envPts; env.lo = 0.0; env.hi = 1.0; env.ranged = true;
+                    {   // the combined shape gets the mix of the colours of its lines (weighted like the mix of the values)
+                        std::vector<std::pair<std::string, double>> cols;
+                        double sw = 0.0, rt = 0.0;
+                        for (const Auto* a : comb) {
+                            if (!a->color.empty()) cols.push_back({ a->color, std::max(0.05, a->ysize) });
+                            sw += std::max(0.05, a->ysize); rt += std::max(0.05, a->ysize) * a->ratio;
+                        }
+                        const std::string mixed = mixHexWeighted(cols);
+                        if (!mixed.empty()) env.color = mixed;
+                        if (sw > 0) env.ratio = rt / sw;
+                        double st = 0.0; int stn = 0;
+                        for (const Auto* a : comb) if (a->stroke > 0) { st += a->stroke; ++stn; }
+                        env.stroke = stn ? st / stn : 0.0;
+                    }
+                    if (mirrorMode) {
+                        env.ratio = 1.0;   // the ratios are already inside the united outline
+                        env.shape = mirM.front()->shape;
+                        for (const Auto* a : mirM) if (a->shape == 5) { env.shape = 5; break; }
+                    }
+                    env.label = comb.front()->label;
+                    for (size_t i = 1; i < comb.size(); ++i) env.label += "+" + comb[i]->label.substr(comb[i]->label.size() > 4 ? 4 : 0);
+                    draw.push_back(&env);
+                    // COMBINE also merges the SHAPES: every different shape of the combined lines is drawn on the same mixed curve
+                    // (e.g. a mirror shape + dashed lines = one filled mirror body with the dashes inside it)
+                    std::vector<int> seen{ env.shape };
+                    for (size_t i = 1; i < comb.size() && !mirrorMode; ++i) {
+                        if (std::find(seen.begin(), seen.end(), comb[i]->shape) != seen.end()) continue;
+                        seen.push_back(comb[i]->shape);
+                        Auto ex = env; ex.shape = comb[i]->shape; ex.overlay = true;
+                        extras.push_back(ex);
+                    }
+                }
+                for (const Auto* a : grp) {
+                    const bool inEnv = comb.size() >= 2 && a->merge == 0 && a->mode == 1;
+                    if (!inEnv) draw.push_back(a);
+                }
+                if (draw.empty()) draw = grp;
+                const double gh = groupH(grp);
+                for (size_t gi = 0; gi < draw.size(); ++gi) drawAutoLane(s, ln, *draw[gi], ys, k, c, gi, draw, gh);
+                for (const Auto& ex : extras) drawAutoLane(s, ln, ex, ys, k, c, 0, draw, gh);
+                if (mirrorMode) drawInsideMirror(s, env, insideM, ys, k, gh, c);
+                ys += gh + 4.0;
             }
-            y += lh;
+            if (hasItems(ln, 2)) drawItems(s, ln, k, laneY0 + laneHeight(ln) - bandH(ln, 2), 2);
+            y = laneY0 + lh;
         }
 
         // system barline and brackets on the left, like a printed score
@@ -1291,6 +1975,7 @@ struct Renderer {
         s.text(40, H - 18, title, 10, "#555555", false, "start", true);
         s.text(W / 2, H - 18, pages > 1 ? "- " + std::to_string(page) + " -" : std::string("- 1 -"), 10, "#555555", false, "middle");
         s.text(W - R, H - 18, p.score.composer, 10, "#555555", false, "end", true);
+        if (!p.score.copyright.empty()) s.text(W / 2, H - 6, p.score.copyright, 8.5, "#777777", false, "middle", true);
     }
 
     void bigHeader(Canvas& s) {
@@ -1298,7 +1983,7 @@ struct Renderer {
         const std::string kind = detailed ? "full score" : "overview";
         s.text(40, 80, p.score.subtitle.empty() ? kind : p.score.subtitle, 14, "#555555", false, "start", true);
         s.text(W - R, 54, p.score.composer, 15, "#111111", true, "end");
-        s.text(W - R, 76, kind + "  |  duration " + durText(end) + (barSec > 0.0 ? "  |  " + std::to_string((int)std::ceil(end / barSec - 1e-9)) + " bars" : std::string()), 11.5, "#555555", false, "end", true);
+        s.text(W - R, 76, kind + "  |  duration " + durText(end), 11.5, "#555555", false, "end", true);
     }
 
     std::vector<std::string> wrap(const std::string& text, size_t cols) const {
@@ -1326,7 +2011,7 @@ struct Renderer {
                 const Clip& c = *sc.c;
                 const int q = cueOf(&c);
                 if (!q) continue;
-                ev.push_back({ q, c.start, c.dur, l.name, c.scoreLabel.empty() ? c.name : c.scoreLabel, clipText(c), params(c), false });
+                ev.push_back({ q, c.start, c.dur, l.name, clipTitle(c), clipText(c), params(c), false });
             }
         for (const RLane& l : lanes)       // clips of staff lanes (only their MIDI is drawn)
             if (l.staff) for (const SrcClip& sc : l.clips) {
@@ -1334,7 +2019,7 @@ struct Renderer {
                 const int q = cueOf(&c);
                 bool dup = false;
                 for (const Event& e : ev) if (e.cue == q) dup = true;
-                if (q && !dup) ev.push_back({ q, c.start, c.dur, l.name, c.scoreLabel.empty() ? c.name : c.scoreLabel, clipText(c), params(c), false });
+                if (q && !dup) ev.push_back({ q, c.start, c.dur, l.name, clipTitle(c), clipText(c), params(c), false });
             }
         for (const ScoreMark& m : sections) ev.push_back({ 0, m.t, 0, "section " + m.label, "", m.text, "", true });
         for (const ScoreMark& m : markers) ev.push_back({ 0, m.t, 0, "marker", "", m.label, "", true });
@@ -1346,11 +2031,12 @@ struct Renderer {
 
     ScorePage coverPage(int pages) {
         const double H = 1060;
-        Canvas s; s.bw = opt.blackWhite;
+        Canvas s; s.bw = opt.blackWhite; s.lw = p.score.lineWeight;
         bigHeader(s);
         double y = 140;
-        s.text(40, y, p.score.mode == 0 ? "for electronics" : "for instruments and electronics", 16, "#111111", false, "start", true);
-        if (barSec > 0.0) { char tb[64]; std::snprintf(tb, sizeof tb, "tempo: quarter = %g    meter: %d/%d", p.score.tempo, p.score.meterNum, p.score.meterDen); s.text(W - R, y, tb, 13, "#333333", false, "end", true); }
+        bool anyStaff = false;
+        for (const RLane& l : lanes) anyStaff = anyStaff || l.staff;
+        s.text(40, y, anyStaff ? "for instruments and electronics" : "for electronics", 16, "#111111", false, "start", true);
         y += 34;
         s.text(40, y, "Lanes", 14, "#111111", true);
         y += 8;
@@ -1365,6 +2051,11 @@ struct Renderer {
             s.text(380, y, l.staff ? (l.noClef ? "staff, no clef" : (l.bass ? "staff, bass clef" : "staff")) : (l.axis ? "graphic, frequency axis" : "graphic"), 11, "#333333");
             std::string src;
             for (size_t i = 0; i < l.rowNames.size(); ++i) {
+                if (l.rowKeys[i].empty()) {   // named lane: one row, every track of it
+                    for (size_t j = 0; j < l.tracks.size(); ++j) src += (j ? ", " : "") + l.tracks[j]->name;
+                    if (l.tracks.size() > 1) src += l.separated ? "  (separated)" : "  (overlap)";
+                    continue;
+                }
                 int n = 0;
                 for (const Track* t : l.tracks) if (normName(t->name) == l.rowKeys[i]) ++n;
                 src += (i ? ", " : "") + l.rowNames[i] + (n > 1 ? " (x" + std::to_string(n) + ")" : std::string());
@@ -1414,7 +2105,7 @@ struct Renderer {
         const double H = 1060;
         const size_t perPage = 46;
         for (size_t start = 0; start < ev.size(); start += perPage) {
-            Canvas s; s.bw = opt.blackWhite;
+            Canvas s; s.bw = opt.blackWhite; s.lw = p.score.lineWeight;
             s.text(40, 54, title, 20, "#111111", true);
             s.text(40, 76, "Cue list", 13, "#555555", false, "start", true);
             double y = 110;
@@ -1488,7 +2179,7 @@ bool buildScorePages(const Project& p, const std::string& fallbackTitle, const S
         double H = 1060;
         if (top + nat + bottom > H) H = top + nat + bottom;
         const double extra = std::max(0.0, std::min(110.0, (H - top - bottom - nat) / (double)r.lanes.size()));
-        Canvas s; s.bw = opt.blackWhite;
+        Canvas s; s.bw = opt.blackWhite; s.lw = p.score.lineWeight;
         r.bigHeader(s);
         r.drawSystem(s, 0, top, extra);
         r.key(s, H - 60);
@@ -1521,13 +2212,13 @@ bool buildScorePages(const Project& p, const std::string& fallbackTitle, const S
         ++pageNo;
     }
     for (int pg = 0; pg < sysPages; ++pg) {
-        Canvas s; s.bw = opt.blackWhite;
+        Canvas s; s.bw = opt.blackWhite; s.lw = p.score.lineWeight;
         s.text(40, 30, r.title, 14, "#111111", true);
         s.text(r.W - r.R, 30, pg == 0 && !cover ? p.score.composer : std::string("full score"), 11, "#555555", false, "end", true);
         for (int i = 0; i < perPage; ++i) {
             const int k = pg * perPage + i;
             if (k >= r.systems) break;
-            Canvas sys; sys.bw = opt.blackWhite;
+            Canvas sys; sys.bw = opt.blackWhite; sys.lw = p.score.lineWeight;
             r.drawSystem(sys, k, 0.0, extra);
             transformPrims(sys.prims, 0, f, 0.0, top + i * slot);
             for (ScorePrim& q : sys.prims) s.prims.push_back(std::move(q));
@@ -1579,6 +2270,40 @@ bool writeScoreDocument(const Project& p, const std::string& fallbackTitle, cons
     files.push_back(htmlPath);
     for (const std::string& pa : paths) files.push_back(pa);
     return true;
+}
+
+bool loadScoreProbe(const std::string& path, ScoreProbeData& out) {
+    out.clear();
+    std::ifstream in(path);
+    if (!in) return false;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.size() < 6 || line[1] != ' ') continue;
+        const char type = line[0];
+        const size_t n1 = line.find(' ', 2);
+        if (n1 == std::string::npos) continue;
+        const std::string name = line.substr(2, n1 - 2);
+        const size_t n2 = line.find(' ', n1 + 1);
+        const std::string tt = line.substr(n1 + 1, n2 == std::string::npos ? std::string::npos : n2 - n1 - 1);
+        const std::string rest = n2 == std::string::npos ? std::string() : line.substr(n2 + 1);
+        double t = 0;
+        try { t = std::stod(tt); } catch (...) { continue; }
+        ScoreClipProbe& pr = out[name];
+        if (type == 'A') {
+            double r = 0, c = 0;
+            if (std::sscanf(rest.c_str(), "%lf %lf", &r, &c) != 2) continue;
+            pr.t.push_back(t); pr.rms.push_back(r); pr.cent.push_back(c);
+        } else if (type == 'D') {
+            ScoreDataSample sd; sd.t = t;
+            if (std::sscanf(rest.c_str(), "%lf", &sd.v) != 1) continue;
+            pr.data.push_back(sd);
+        } else if (type == 'S') {
+            ScoreDataSample sd; sd.t = t; sd.isText = true; sd.text = rest;
+            pr.data.push_back(sd);
+        }
+    }
+    return !out.empty();
 }
 
 std::vector<ScoreLaneInfo> scoreLaneSummary(const Project& p) {

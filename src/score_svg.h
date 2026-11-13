@@ -1,6 +1,7 @@
 #pragma once
 #include "model.h"
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -8,7 +9,7 @@
 // the same list is written as SVG or drawn by the Caw preview window.
 //  overview : the whole piece on ONE page.
 //  detailed : the FULL SCORE, a multi-page document (A4 landscape): cover page, then systems that read from left to right and
-//             top to bottom, page after page (barlines and bar numbers when a tempo is set), then cue-list pages.
+//             top to bottom, page after page, then cue-list pages.
 //             Clips get cue numbers, times, parameters; automation lanes, spectrum and notes are shown.
 struct ScorePrim {
     enum Kind { Line, Rect, Polygon, Polyline, Ellipse, Circle, Text } kind = Line;
@@ -19,7 +20,7 @@ struct ScorePrim {
     float x = 0, y = 0, w = 0, h = 0;      // line: x,y -> w,h as x2,y2; rect: x,y,w,h; circle/ellipse: center x,y radius w (h = ry)
     float size = 10.f;                      // text size
     float angle = 0.f;                      // ellipse rotation (degrees)
-    bool bold = false, italic = false, round = false;
+    bool bold = false, italic = false, round = false, mono = false;   // mono: coding font
     int anchor = 0;                         // text: 0 start, 1 middle, 2 end
     std::vector<float> pts;                 // polygon / polyline x,y pairs
     std::string text;
@@ -39,8 +40,18 @@ struct ScoreSpectrum {
 };
 bool analyzeScoreWav(const std::string& path, ScoreSpectrum& out, std::string& error);
 
+// What Render audio measured / recorded per clip (file written by the score probe, see scoreProbePath()).
+struct ScoreDataSample { double t = 0.0; double v = 0.0; bool isText = false; std::string text; };
+struct ScoreClipProbe {
+    std::vector<double> t, rms, cent;        // every 50 ms: loudness (rms) and centroid of the spectrum (Hz) of the clip's own output
+    std::vector<ScoreDataSample> data;       // everything the code sent to the channel "score": numbers / signals (v) and strings (text)
+};
+typedef std::map<std::string, ScoreClipProbe> ScoreProbeData;   // key = clip (instrument) name
+bool loadScoreProbe(const std::string& path, ScoreProbeData& out);
+
 struct ScoreRenderOptions {
     bool detailed = false;
+    const ScoreProbeData* probe = nullptr;     // measured clips; without it the shapes are drawn envelopes
     bool blackWhite = false;
     const ScoreSpectrum* spectrum = nullptr;   // used when Project::score.spectrum is on
 };
@@ -66,4 +77,5 @@ struct ScoreLaneInfo {
 std::vector<ScoreLaneInfo> scoreLaneSummary(const Project& project);
 
 // "C4 E4:2 - G3+D4": notes written by hand (name[:relative length], "-" = rest, "+" = chord), spread over `dur` seconds.
+// Quarter-tone signs (score only): "Cq4" quarter sharp, "Eqb4" quarter flat, "Bd3" koron.
 std::vector<MidiNote> scoreWrittenNotes(const std::string& text, double dur);

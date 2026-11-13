@@ -16,6 +16,12 @@ std::string channelName(const std::string& instr, const std::string& chn) {
     return instr + "_" + chn;
 }
 
+std::string scoreProbePath() {
+    std::string s = (workDir() / "caw_score_data.txt").string();
+    for (char& ch : s) if (ch == '\\') ch = '/';
+    return s;
+}
+
 namespace {
 std::vector<std::string> splitArgs(const std::string& text) {
     std::vector<std::string> out;
@@ -259,6 +265,28 @@ ParsedTrack parseCodeUncached(const std::string& instrName, const std::string& s
         last = it->position() + it->length();
     }
     result.append(code, last, std::string::npos);
+    // 2b) score data:  chnset kVal, "score"  /  chnset aSig, "score"  /  chnset Stext, "score"
+    //     goes to the clip's own channel (<instr>_score); the score reads it during Render audio. Line count stays the same.
+    {
+        static const std::regex scoreSend(R"re(^(\s*chnset\s+)([^,;]+?)(\s*,\s*)"score"(.*)$)re");
+        std::istringstream in(result);
+        std::string line, rebuilt;
+        bool changed = false;
+        while (std::getline(in, line)) {
+            std::smatch m;
+            if (std::regex_match(line, m, scoreSend)) {
+                const std::string expr = m[2].str();
+                const size_t f = expr.find_first_not_of(" \t");
+                const char ch = f == std::string::npos ? 'k' : expr[f];
+                const int sig = (ch == '"' || ch == 'S') ? 3 : (ch == 'a' ? 2 : 1);
+                if (out.scoreSig == 0) out.scoreSig = sig;
+                line = m[1].str() + expr + m[3].str() + "\"" + channelName(instrName, "score") + "\"" + m[4].str();
+                changed = true;
+            }
+            rebuilt += line + "\n";
+        }
+        if (changed) result = rebuilt;
+    }
     if (!pMath.empty()) {   // the <caw> copies lines become one cawRun line on top of the code
         std::string line = "cawRun ";
         for (int pn = 4; pn <= pMath.rbegin()->first; ++pn) {
@@ -291,8 +319,15 @@ ParsedTrack parseCode(const std::string& instrName, const std::string& sourceCod
     return out;
 }
 
+std::filesystem::path workDir() {
+    std::error_code ec;
+    const std::filesystem::path dir = std::filesystem::temp_directory_path(ec) / "CAW";
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 std::string pdWavPath(const std::string& name) {
-    std::string path = (std::filesystem::absolute("caw_pd") / (name + ".wav")).string();
+    std::string path = (workDir() / "caw_pd" / (name + ".wav")).string();
     std::replace(path.begin(), path.end(), '\\', '/');   // Csound strings: forward slashes
     return path;
 }
@@ -471,6 +506,16 @@ ParsedTrack parseClip(const Clip& c, bool taps) {
         out.midiEnabled = std::regex_search(block, midiOnRe);
         for (std::sregex_iterator it(block.begin(), block.end(), sendRe), end; it != end; ++it)
             out.pdSends.push_back({(*it)[1].str(), (*it)[2].str(), (*it)[3].str()});
+        // score data:  Pd  [s score]  is found by itself;  SuperCollider (and Pd if you like)  <caw> { send: "score" }  sends the control values
+        // after the second output to the channel "score" of this clip.
+        {
+            static const std::regex scoreOnly(R"re(\{\s*send:\s*"score"\s*\})re");
+            static const std::regex pdScore(R"re(\bs\s+score\b)re");
+            bool want = std::regex_search(block, scoreOnly) || (c.lang == 1 && std::regex_search(c.code, pdScore));
+            for (const PdSend& sd : out.pdSends) if (sd.name == "score") want = false;
+            if (want) out.pdSends.push_back({"score", c.name, "score"});
+            for (const PdSend& sd : out.pdSends) if (sd.name == "score" && sd.to == c.name && sd.chn == "score") out.scoreSig = 1;
+        }
         // the wav holds L, R and one extra channel per send (control values as a signal, 32-bit float)
         std::string outs = "aPdL, aPdR";
         for (size_t k = 0; k < out.pdSends.size(); ++k) outs += ", aPdS" + std::to_string(k + 1);
@@ -502,6 +547,17 @@ std::vector<LaneMeterInfo> meterLayout(const Project& p) {
 
 ParsedTrack parseTrack(const Track& t) {
     ParsedTrack out;
+    if (t.kind == 1) return out;   // marker track: nothing to automate
+    if (t.kind == 2) {             // graph track: up to 8 lines (line1 .. line8), only drawn in the score, never sent to the sound
+        auto add = [&out](const std::string& name) {
+            for (const CawParam& q : out.params) if (q.chn == name) return;
+            CawParam p; p.chn = name; p.min = 0.0; p.max = 1.0; p.step = 0.001; p.value = 0.0;
+            out.params.push_back(p);
+        };
+        for (int k = 1; k <= 8; ++k) add("line" + std::to_string(k));
+        for (const auto& kv : t.automation) add(kv.first);   // lines of older projects
+        return out;
+    }
     auto merge = [&out](const ParsedTrack& p) {
         out.midiEnabled = out.midiEnabled || p.midiEnabled;
         for (const CawParam& param : p.params) {
@@ -667,8 +723,12 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
     };
 
     const bool engine = mode == "engine";
+    const bool probe = mode == "render" && p.score.analyze;           // Render audio also measures the clips for the score
+    const bool tap = (engine && p.cs.monitorFeed) || probe;           // meter buses (gaCawT_*) are needed by the monitor and by the probe
+    std::vector<std::string> probeAmp;                                // clips measured (amplitude + frequency)
+    std::vector<std::pair<std::string, int>> probeData;              // clips that send to the channel "score" (name, 1 number / 2 signal / 3 string)
     std::set<std::string> busDeclared;
-    if (engine && p.cs.monitorFeed) {   // meter buses must exist before the instruments that write to them
+    if (tap) {   // meter buses must exist before the instruments that write to them
         for (const Track& t : p.tracks)
             for (const Clip& c : t.clips) {
                 const int ch = parseClip(c, true).outChannels;
@@ -683,8 +743,15 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
 
         // Every clip is its own instrument: own instr name, own code, own channels, own MIDI.
         for (const Clip& clip : t.clips) {
-            const ParsedTrack pc = parseClip(clip, engine && p.cs.monitorFeed);
+            const ParsedTrack pc = parseClip(clip, tap);
             if (emitted.insert(clip.name).second) {
+                if (probe) {
+                    if (pc.outChannels >= 1) probeAmp.push_back(clip.name);
+                    if (pc.scoreSig) {
+                        o << (pc.scoreSig == 2 ? "chn_a" : pc.scoreSig == 3 ? "chn_S" : "chn_k") << " \"" << channelName(clip.name, "score") << "\", 3\n";
+                        probeData.push_back({clip.name, pc.scoreSig});
+                    }
+                }
                 for (const CawParam& c : pc.params) {
                     const std::string fullName = channelName(clip.name, c.chn);
                     o << "chn_k \"" << fullName << "\", 3\n";
@@ -697,7 +764,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                     const std::string so = o.str();
                     OrcSpan sp;
                     sp.name = clip.name;
-                    sp.first = (int)std::count(so.begin() + (long)(so.find("<CsInstruments>\n") + 16), so.end(), '\n') + 1;
+                    sp.first = (int)std::count(so.begin(), so.end(), '\n') + 1;   // Csound counts the lines of the whole .csd file (options and header lines included)
                     sp.lineMap = pc.lineMap;
                     spans->push_back(sp);
                 }
@@ -866,7 +933,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                 for (int c = 1; c <= p.cs.nchnls; ++c) list += std::string(c > 1 ? ", " : "") + "aM" + std::to_string(c);
                 mon << "instr CawMon\n" << list << " monitor\naL = aM1\naR = aM2\n";
             }
-            mon << "kTrig metro 20\n";
+            mon << "kTrig metro 20\nchn_k \"cawScopeDiv\", 3\n";   // the app sets cawScopeDiv: control periods per scope point (= the time window)
             std::vector<std::string> peaks;
             for (int c = 1; c <= mch; ++c) {
                 const std::string id = std::to_string(c);
@@ -900,16 +967,21 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                 for (int c = 1; c <= ch; ++c) mon << "gaCawT_" << name << "_" << c << " = 0\n";
             }
             // scope ring buffers (one point per control period)
-            mon << "kScL[] init " << kScopePoints << "\nkScR[] init " << kScopePoints << "\nkW init 0\n"
-                << "kSmpL downsamp aL\nkSmpR downsamp aR\nkScL[kW] = kSmpL\nkScR[kW] = kSmpR\n"
-                << "kW = kW + 1\nif kW >= " << kScopePoints << " then\nkW = 0\nendif\n";
+            // scope ring buffers: one point per kDiv control periods, the largest value of those periods (so a long window still shows peaks)
+            mon << "kDiv chnget \"cawScopeDiv\"\nif kDiv < 1 then\nkDiv = 1\nendif\n"
+                << "kScL[] init " << kScopePoints << "\nkScR[] init " << kScopePoints << "\nkW init 0\nkScN init 0\nkAccL init 0\nkAccR init 0\n"
+                << "kSmpL downsamp aL\nkSmpR downsamp aR\n"
+                << "if abs(kSmpL) > abs(kAccL) then\nkAccL = kSmpL\nendif\n"
+                << "if abs(kSmpR) > abs(kAccR) then\nkAccR = kSmpR\nendif\n"
+                << "kScN = kScN + 1\nif kScN >= kDiv then\nkScL[kW] = kAccL\nkScR[kW] = kAccR\nkAccL = 0\nkAccR = 0\nkScN = 0\n"
+                << "kW = kW + 1\nif kW >= " << kScopePoints << " then\nkW = 0\nendif\nendif\n";
             // spectrum bands
             mon << "aMono = (aL + aR) * 0.5\n";
             const double ratio = std::pow(18000.0 / 25.0, 1.0 / (kMeterBands - 1));
             for (int b = 0; b < kMeterBands; ++b) {
                 const double fc = 25.0 * std::pow(ratio, b);
                 if (fc * 1.2 > p.cs.sr * 0.45) { mon << "kBd" << b << " = 0\n"; continue; }   // above what this sample rate can hold
-                mon << "aBd" << b << " butterbp aMono, " << fc << ", " << fc * 0.3 << "\n"
+                mon << "aBd" << b << " butterbp aMono, " << fc << ", " << fc * (ratio - 1.0) * 1.5 << "\n"
                     << "kBd" << b << " rms aBd" << b << "\n";
             }
             // ---- send one frame to the app over UDP (OSC); a counter changes on every pulse, so each pulse sends exactly once
@@ -940,6 +1012,40 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
             score << "i \"CawMon\" 0 86400\n";   // the monitor runs for the whole engine session (it is the last instrument defined)
         }
     }
+    if (probe && any && (!probeAmp.empty() || !probeData.empty())) {
+        // ---- score probe: runs after every clip instrument (it is defined last) and writes 20 lines per second to a text file:
+        //   A <clip> <time> <rms> <centroid Hz>     measured amplitude and frequency position of the clip
+        //   D <clip> <time> <value>                 number / signal sent to the channel "score"
+        //   S <clip> <time> <text>                  string sent to the channel "score"
+        const std::string file = scoreProbePath();
+        o << "instr CawScoreProbe\nkPbT times\nkPbM metro 20\n";
+        int n = 0;
+        for (const std::string& name : probeAmp) {
+            const std::string id = std::to_string(++n);
+            o << "aPb" << id << " = gaCawT_" << name << "_1\n"
+              << "kPbR" << id << " rms aPb" << id << "\n"
+              << "fPb" << id << " pvsanal aPb" << id << ", 1024, 256, 1024, 1\n"
+              << "kPbC" << id << " pvscent fPb" << id << "\n"
+              << "if kPbM == 1 then\nfprintks \"" << file << "\", \"A " << name << " %f %f %f\\n\", kPbT, kPbR" << id << ", kPbC" << id << "\nendif\n";
+        }
+        for (const auto& [name, sig] : probeData) {
+            const std::string id = std::to_string(++n);
+            const std::string chan = channelName(name, "score");
+            if (sig == 3) o << "SPb" << id << " chnget \"" << chan << "\"\nif kPbM == 1 then\nfprintks \"" << file << "\", \"S " << name << " %f %s\\n\", kPbT, SPb" << id << "\nendif\n";
+            else {
+                if (sig == 2) o << "aPd" << id << " chnget \"" << chan << "\"\nkPd" << id << " downsamp aPd" << id << "\n";
+                else o << "kPd" << id << " chnget \"" << chan << "\"\n";
+                o << "if kPbM == 1 then\nfprintks \"" << file << "\", \"D " << name << " %f %f\\n\", kPbT, kPd" << id << "\nendif\n";
+            }
+        }
+        for (const std::string& name : busDeclared) {   // the buses are summed anew in every control period
+            int ch = 0;
+            for (const Track& t : p.tracks) for (const Clip& c : t.clips) if (c.name == name) ch = std::max(ch, parseClip(c, true).outChannels);
+            for (int c = 1; c <= ch; ++c) o << "gaCawT_" << name << "_" << c << " = 0\n";
+        }
+        o << "endin\n\n";
+        score << "i \"CawScoreProbe\" 0 " << (endT + std::max(0.0, p.cs.tail)) << "\n";
+    }
     if (any && mode != "live" && p.cs.tail > 0.0) {
         o << "instr CawTail\nendin\n\n";
         score << "i \"CawTail\" " << endT << " " << p.cs.tail << "\n";
@@ -964,7 +1070,7 @@ std::string buildClipTestCsd(const Project& p, const Clip& clip, OrcSpan& span) 
     o << "\ninstr " << clip.name << "\n";
     const std::string prefix = o.str();
     span.name = clip.name;
-    span.first = (int)std::count(prefix.begin() + (long)(prefix.find("<CsInstruments>\n") + 16), prefix.end(), '\n') + 1;
+    span.first = (int)std::count(prefix.begin(), prefix.end(), '\n') + 1;   // line of the first body line in the .csd file
     span.lineMap = pc.lineMap;
     const double dur = std::min(5.0, std::max(0.1, clip.dur));
     std::ostringstream tail;

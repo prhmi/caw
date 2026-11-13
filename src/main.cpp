@@ -78,6 +78,9 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DragFinish(drop);
         return 0;
     }
+    case WM_CLOSE:
+        appRequestClose();   // asks "save changes?" in the program when needed, then the main loop ends
+        return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -100,7 +103,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int) {
     wc.lpszClassName = "CawWindow";
     RegisterClassExA(&wc);
 
-    HWND hwnd = CreateWindowA(wc.lpszClassName, "CAW - Csound Audio Workstation", WS_OVERLAPPEDWINDOW, 100, 100,
+    HWND hwnd = CreateWindowA(wc.lpszClassName, "CAW - Code Audio Workstation", WS_OVERLAPPEDWINDOW, 100, 100,
                               (int)(1400 * dpi), (int)(800 * dpi), nullptr, nullptr, hInst, nullptr);
 
     if (!createDevice(hwnd)) {

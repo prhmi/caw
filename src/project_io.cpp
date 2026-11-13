@@ -28,7 +28,7 @@ bool readString(std::istream& in, std::string& value) {
 namespace {
 void writeProject(std::ostream& out, const Project& p) {
     const CsoundSettings& s = p.cs;
-    out << "CAW_PROJECT 16\n"
+    out << "CAW_PROJECT 28\n"
         << s.sr << ' ' << s.ksmps << ' ' << s.nchnls << ' ' << s.nchnlsIn << ' '
         << std::setprecision(17) << s.zdbfs << ' ' << s.a4 << ' ' << s.bufSW << ' ' << s.bufHW << ' '
         << s.outDev << ' ' << s.inDev << ' ' << s.renderFormat << ' ' << s.tail << ' '
@@ -108,7 +108,7 @@ void writeProject(std::ostream& out, const Project& p) {
         out << t.scoreLane << ' ' << t.scoreAuto.size() << '\n';
         for (const auto& [channel, mode] : t.scoreAuto) { writeString(out, channel); out << mode << '\n'; }
         for (const Clip& c : t.clips) {
-            out << c.scoreLane << ' ' << c.scoreMidi << ' ' << c.scoreStyle << '\n';
+            out << c.scoreLane << " 0 " << c.scoreStyle << '\n';   // the 0 was a per-clip MIDI display, now a setting of the MIDI lane
             writeString(out, c.scoreLabel);
         }
     }
@@ -116,12 +116,89 @@ void writeProject(std::ostream& out, const Project& p) {
     out << "SCORE3 " << (sc.spectrum ? 1 : 0) << '\n';
     for (const Track& t : p.tracks)
         for (const Clip& c : t.clips) out << std::setprecision(9) << c.scoreFreqLo << ' ' << c.scoreFreqHi << '\n';
-    // version 16: bars (tempo, meter), merge by name, written notes and dynamics per clip
-    out << "SCORE4 " << std::setprecision(9) << sc.tempo << ' ' << sc.meterNum << ' ' << sc.meterDen << ' ' << (sc.mergeSameName ? 1 : 0) << '\n';
+    // version 16: merge by name, written notes and dynamics per clip (the 0 4 4 were tempo and meter, no longer used)
+    out << "SCORE4 0 4 4 " << (sc.mergeSameName ? 1 : 0) << '\n';
     for (const Track& t : p.tracks)
         for (const Clip& c : t.clips) {
             writeString(out, c.scoreWritten);
             writeString(out, c.scoreDynamic);
+        }
+    // version 18: line weight, copyright, names and display of the MIDI / automation lanes, role and detail of the clips
+    out << "SCORE6 " << std::setprecision(4) << sc.lineWeight << '\n';
+    writeString(out, sc.copyright);
+    for (const Track& t : p.tracks) {
+        writeString(out, t.scoreMidiLabel);
+        out << t.scoreMidiShow << ' ' << t.scoreAutoNames.size() << '\n';
+        for (const auto& [channel, name] : t.scoreAutoNames) { writeString(out, channel); writeString(out, name); }
+        for (const Clip& c : t.clips) out << c.scoreRole << ' ' << c.scoreDetail << ' ' << (c.scoreShowLang ? 1 : 0) << '\n';
+    }
+    // version 19: lane overlap / separated per track, analysis while rendering
+    out << "SCORE7 " << (sc.analyze ? 1 : 0) << '\n';
+    for (const Track& t : p.tracks) out << t.scoreOverlap << '\n';
+    // version 20: track kinds (marker track, free automation), template language, automation line shapes in the score
+    out << "TRACKS8\n";
+    for (const Track& t : p.tracks) {
+        out << t.kind << ' ' << t.lang << ' ' << std::setprecision(12) << t.autoMin << ' ' << t.autoMax << ' ' << t.marks.size() << ' ' << t.scoreAutoShape.size() << '\n';
+        for (const TrackMark& m : t.marks) { out << std::setprecision(12) << m.t << ' ' << m.dur << ' ' << m.color << '\n'; writeString(out, m.text); }
+        for (const auto& [channel, shape] : t.scoreAutoShape) {
+            const auto cv = t.scoreAutoCurve.find(channel);
+            writeString(out, channel);
+            out << shape << ' ' << std::setprecision(6) << (cv == t.scoreAutoCurve.end() ? 1.0 : cv->second) << '\n';
+        }
+    }
+    // version 21: graph lines: combine / half combine / separated, M and S
+    out << "GRAPH1\n";
+    for (const Track& t : p.tracks) {
+        out << t.scoreAutoMerge.size() << ' ' << t.scoreAutoMuted.size() << ' ' << t.scoreAutoSolo.size() << '\n';
+        for (const auto& [channel, m] : t.scoreAutoMerge) { writeString(out, channel); out << m << '\n'; }
+        for (const std::string& c : t.scoreAutoMuted) writeString(out, c);
+        for (const std::string& c : t.scoreAutoSolo) writeString(out, c);
+    }
+    // version 22: height of the graph lines in the score
+    out << "GRAPH2\n";
+    for (const Track& t : p.tracks) {
+        out << t.scoreAutoYSize.size() << '\n';
+        for (const auto& [channel, y] : t.scoreAutoYSize) { writeString(out, channel); out << y << '\n'; }
+    }
+    // version 23: stroke width of the automation / graph lines in the score
+    out << "GRAPH3\n";
+    for (const Track& t : p.tracks) {
+        out << t.scoreAutoStroke.size() << '\n';
+        for (const auto& [channel, w] : t.scoreAutoStroke) { writeString(out, channel); out << std::setprecision(6) << w << '\n'; }
+    }
+    // version 24: marker / graph track items: type, shape and where they show in the score
+    out << "MARKS2\n";
+    for (const Track& t : p.tracks) {
+        out << t.marks.size() << '\n';
+        for (const TrackMark& m : t.marks) out << m.type << ' ' << m.shape << ' ' << m.scorePos << '\n';
+    }
+    // version 25: code language of the marker items
+    out << "MARKS3\n";
+    for (const Track& t : p.tracks) {
+        out << t.marks.size() << '\n';
+        for (const TrackMark& m : t.marks) out << m.lang << '\n';
+    }
+    // version 26: size of the shape / box and font size of the marker and graph items
+    out << "MARKS4\n";
+    for (const Track& t : p.tracks) {
+        out << t.marks.size() << '\n';
+        for (const TrackMark& m : t.marks) out << m.size << ' ' << m.font << '\n';
+    }
+    // version 28: curve (ratio) of the swell / fade shapes
+    out << "MARKS5\n";
+    for (const Track& t : p.tracks) {
+        out << t.marks.size() << '\n';
+        for (const TrackMark& m : t.marks) out << m.ratio << '\n';
+    }
+    // version 27: automation points inside a Pen 2 stroke (no dot)
+    out << "AUTOLINE\n";
+    for (const Track& t : p.tracks)
+        for (const auto& lane : t.automation) {
+            std::vector<size_t> idx;
+            for (size_t i = 0; i < lane.second.size(); ++i) if (lane.second[i].line) idx.push_back(i);
+            out << idx.size();
+            for (size_t i : idx) out << ' ' << i;
+            out << '\n';
         }
 }
 
@@ -189,7 +266,7 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
     Project candidate;
     std::string magic;
     int version = 0;
-    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 16)) {
+    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 28)) {
         error = "This is not a supported CAW project file.";
         return false;
     }
@@ -411,9 +488,9 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
                 t.scoreAuto[channel] = std::min(2, std::max(0, mode));
             }
             for (Clip& c : t.clips) {
-                if (!(in >> c.scoreLane >> c.scoreMidi >> c.scoreStyle) || !readString(in, c.scoreLabel)) { error = "A clip score entry is invalid."; return false; }
-                c.scoreMidi = std::min(4, std::max(0, c.scoreMidi));
-                c.scoreStyle = std::min(3, std::max(0, c.scoreStyle));
+                int legacyMidi = 0;
+                if (!(in >> c.scoreLane >> legacyMidi >> c.scoreStyle) || !readString(in, c.scoreLabel)) { error = "A clip score entry is invalid."; return false; }
+                c.scoreStyle = std::min(6, std::max(0, c.scoreStyle));
             }
         }
     }
@@ -433,14 +510,191 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
         std::string marker;
         int merge = 1;
         ScoreInfo& sc = candidate.score;
-        if (!(in >> marker >> sc.tempo >> sc.meterNum >> sc.meterDen >> merge) || marker != "SCORE4") { error = "The score block (4) is invalid."; return false; }
+        double oldTempo; int oldNum, oldDen;   // tempo and meter were dropped from the format
+        if (!(in >> marker >> oldTempo >> oldNum >> oldDen >> merge) || marker != "SCORE4") { error = "The score block (4) is invalid."; return false; }
         sc.mergeSameName = merge != 0;
-        sc.tempo = (sc.tempo > 0.0) ? std::min(400.0, std::max(20.0, sc.tempo)) : 0.0;
-        sc.meterNum = std::min(32, std::max(1, sc.meterNum));
-        sc.meterDen = (sc.meterDen == 2 || sc.meterDen == 4 || sc.meterDen == 8 || sc.meterDen == 16) ? sc.meterDen : 4;
         for (Track& t : candidate.tracks)
             for (Clip& c : t.clips)
                 if (!readString(in, c.scoreWritten) || !readString(in, c.scoreDynamic)) { error = "A clip's written notes are invalid."; return false; }
+    }
+    if (version == 17) {   // line weight, then two names per track (only the MIDI name is still used)
+        std::string marker, ignored;
+        ScoreInfo& sc = candidate.score;
+        if (!(in >> marker >> sc.lineWeight) || marker != "SCORE5") { error = "The score block (5) is invalid."; return false; }
+        sc.lineWeight = std::min(3.0, std::max(0.4, sc.lineWeight));
+        for (Track& t : candidate.tracks)
+            if (!readString(in, t.scoreMidiLabel) || !readString(in, ignored)) { error = "A track's score names are invalid."; return false; }
+    }
+    if (version >= 18) {
+        std::string marker;
+        ScoreInfo& sc = candidate.score;
+        if (!(in >> marker >> sc.lineWeight) || marker != "SCORE6" || !readString(in, sc.copyright)) { error = "The score block (6) is invalid."; return false; }
+        sc.lineWeight = std::min(3.0, std::max(0.4, sc.lineWeight));
+        for (Track& t : candidate.tracks) {
+            size_t nameCount = 0;
+            if (!readString(in, t.scoreMidiLabel) || !(in >> t.scoreMidiShow >> nameCount) || nameCount > 10000) { error = "A track's score names are invalid."; return false; }
+            t.scoreMidiShow = std::min(4, std::max(0, t.scoreMidiShow));
+            for (size_t i = 0; i < nameCount; ++i) {
+                std::string channel, name;
+                if (!readString(in, channel) || !readString(in, name)) { error = "A score automation name is invalid."; return false; }
+                t.scoreAutoNames[channel] = name;
+            }
+            for (Clip& c : t.clips) {
+                int showLang = 0;
+                if (!(in >> c.scoreRole >> c.scoreDetail >> showLang)) { error = "A clip score entry is invalid."; return false; }
+                c.scoreRole = std::min(2, std::max(0, c.scoreRole));
+                c.scoreDetail = std::min(1, std::max(0, c.scoreDetail));
+                c.scoreShowLang = showLang != 0;
+            }
+        }
+    }
+    if (version >= 19) {
+        std::string marker;
+        int an = 1;
+        if (!(in >> marker >> an) || marker != "SCORE7") { error = "The score block (7) is invalid."; return false; }
+        candidate.score.analyze = an != 0;
+        for (Track& t : candidate.tracks) {
+            if (!(in >> t.scoreOverlap)) { error = "A track's score overlap setting is invalid."; return false; }
+            t.scoreOverlap = std::min(1, std::max(0, t.scoreOverlap));
+        }
+    }
+    if (version >= 20) {
+        std::string marker;
+        if (!(in >> marker) || marker != "TRACKS8") { error = "The track block (8) is invalid."; return false; }
+        for (Track& t : candidate.tracks) {
+            size_t markCount = 0, shapeCount = 0;
+            if (!(in >> t.kind >> t.lang >> t.autoMin >> t.autoMax >> markCount >> shapeCount) || markCount > 100000 || shapeCount > 10000) { error = "A track's kind is invalid."; return false; }
+            t.kind = std::min(2, std::max(0, t.kind));
+            t.lang = std::min(2, std::max(0, t.lang));
+            if (!(t.autoMax > t.autoMin)) t.autoMax = t.autoMin + 1.0;
+            for (size_t i = 0; i < markCount; ++i) {
+                TrackMark m;
+                if (!(in >> m.t >> m.dur >> m.color) || !readString(in, m.text)) { error = "A marker is invalid."; return false; }
+                m.dur = std::max(0.0, m.dur);
+                t.marks.push_back(m);
+            }
+            for (size_t i = 0; i < shapeCount; ++i) {
+                std::string channel; int shape = 0; double curve = 1.0;
+                if (!readString(in, channel) || !(in >> shape >> curve)) { error = "An automation shape is invalid."; return false; }
+                t.scoreAutoShape[channel] = std::min(9, std::max(0, shape));
+                t.scoreAutoCurve[channel] = std::min(3.0, std::max(0.3, curve));
+            }
+        }
+    }
+    if (version >= 21) {
+        std::string marker;
+        if (!(in >> marker) || marker != "GRAPH1") { error = "The graph block is invalid."; return false; }
+        for (Track& t : candidate.tracks) {
+            size_t nm = 0, nmu = 0, nso = 0;
+            if (!(in >> nm >> nmu >> nso) || nm > 10000 || nmu > 10000 || nso > 10000) { error = "A graph entry is invalid."; return false; }
+            for (size_t i = 0; i < nm; ++i) {
+                std::string channel; int m = 0;
+                if (!readString(in, channel) || !(in >> m)) { error = "A graph line mode is invalid."; return false; }
+                t.scoreAutoMerge[channel] = std::min(2, std::max(0, m));
+            }
+            for (size_t i = 0; i < nmu; ++i) { std::string c; if (!readString(in, c)) { error = "A graph mute is invalid."; return false; } t.scoreAutoMuted.insert(c); }
+            for (size_t i = 0; i < nso; ++i) { std::string c; if (!readString(in, c)) { error = "A graph solo is invalid."; return false; } t.scoreAutoSolo.insert(c); }
+        }
+    }
+    if (version >= 22) {
+        std::string marker;
+        if (!(in >> marker) || marker != "GRAPH2") { error = "The graph block (2) is invalid."; return false; }
+        for (Track& t : candidate.tracks) {
+            size_t n = 0;
+            if (!(in >> n) || n > 10000) { error = "A graph height entry is invalid."; return false; }
+            for (size_t i = 0; i < n; ++i) {
+                std::string channel; int y = 100;
+                if (!readString(in, channel) || !(in >> y)) { error = "A graph height is invalid."; return false; }
+                t.scoreAutoYSize[channel] = std::min(400, std::max(50, y));
+            }
+        }
+    }
+    if (version >= 23) {
+        std::string marker;
+        if (!(in >> marker) || marker != "GRAPH3") { error = "The graph block (3) is invalid."; return false; }
+        for (Track& t : candidate.tracks) {
+            size_t n = 0;
+            if (!(in >> n) || n > 10000) { error = "A graph stroke entry is invalid."; return false; }
+            for (size_t i = 0; i < n; ++i) {
+                std::string channel; double w = 0.0;
+                if (!readString(in, channel) || !(in >> w)) { error = "A graph stroke width is invalid."; return false; }
+                t.scoreAutoStroke[channel] = std::min(8.0, std::max(0.3, w));
+            }
+        }
+    }
+    if (version >= 24) {
+        std::string marker;
+        if (!(in >> marker) || marker != "MARKS2") { error = "The marker block (2) is invalid."; return false; }
+        for (Track& t : candidate.tracks) {
+            size_t n = 0;
+            if (!(in >> n) || n != t.marks.size()) { error = "A marker entry is invalid."; return false; }
+            for (TrackMark& m : t.marks) {
+                if (!(in >> m.type >> m.shape >> m.scorePos)) { error = "A marker setting is invalid."; return false; }
+                m.type = std::min(4, std::max(0, m.type));
+                m.shape = std::min(23, std::max(0, m.shape));
+                m.scorePos = std::min(2, std::max(0, m.scorePos));
+            }
+        }
+    }
+    if (version >= 25) {
+        std::string marker;
+        if (!(in >> marker) || marker != "MARKS3") { error = "The marker block (3) is invalid."; return false; }
+        for (Track& t : candidate.tracks) {
+            size_t n = 0;
+            if (!(in >> n) || n != t.marks.size()) { error = "A marker entry is invalid."; return false; }
+            for (TrackMark& m : t.marks) {
+                if (!(in >> m.lang)) { error = "A marker language is invalid."; return false; }
+                m.lang = std::min(2, std::max(0, m.lang));
+            }
+        }
+    }
+    if (version >= 26) {
+        std::string marker;
+        if (!(in >> marker) || marker != "MARKS4") { error = "The marker block (4) is invalid."; return false; }
+        for (Track& t : candidate.tracks) {
+            size_t n = 0;
+            if (!(in >> n) || n != t.marks.size()) { error = "A marker entry is invalid."; return false; }
+            for (TrackMark& m : t.marks) {
+                if (!(in >> m.size >> m.font)) { error = "A marker size is invalid."; return false; }
+                m.size = std::min(400, std::max(40, m.size));
+                m.font = m.font <= 0 ? 0 : std::min(40, std::max(6, m.font));
+                m.type = std::min(4, std::max(0, m.type));
+            }
+        }
+    } else {
+        // older files: the Icon type is gone (it becomes a comment), Code moves from 4 to 3, the old shapes (squares, music notes...) are replaced by graphic-score shapes
+        for (Track& t : candidate.tracks)
+            for (TrackMark& m : t.marks) {
+                if (t.kind == 2) m.shape = 0;
+                else if (m.type == 3) { m.type = 0; m.shape = 0; }
+                else if (m.type == 4) m.type = 3;
+            }
+    }
+    if (version >= 28) {
+        std::string marker;
+        if (!(in >> marker) || marker != "MARKS5") { error = "The marker block (5) is invalid."; return false; }
+        for (Track& t : candidate.tracks) {
+            size_t n = 0;
+            if (!(in >> n) || n != t.marks.size()) { error = "A marker entry is invalid."; return false; }
+            for (TrackMark& m : t.marks) {
+                if (!(in >> m.ratio)) { error = "A marker ratio is invalid."; return false; }
+                m.ratio = std::min(300, std::max(30, m.ratio));
+            }
+        }
+    }
+    if (version >= 27) {
+        std::string marker;
+        if (!(in >> marker) || marker != "AUTOLINE") { error = "The automation block is invalid."; return false; }
+        for (Track& t : candidate.tracks)
+            for (auto& lane : t.automation) {
+                size_t n = 0;
+                if (!(in >> n) || n > lane.second.size()) { error = "An automation entry is invalid."; return false; }
+                for (size_t k = 0; k < n; ++k) {
+                    size_t idx = 0;
+                    if (!(in >> idx) || idx >= lane.second.size()) { error = "An automation entry is invalid."; return false; }
+                    lane.second[idx].line = true;
+                }
+            }
     }
     {
         int maxMidiId = 0;

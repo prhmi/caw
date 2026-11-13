@@ -47,10 +47,12 @@ cmake --build build --config Release
 if errorlevel 1 goto :fail
 
 echo.
+if /i "%~1"=="nostart" goto :done
 echo === Starting CAW ===
 pushd build\Release
 start "" caw.exe
 popd
+:done
 
 echo.
 echo Done.

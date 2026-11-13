@@ -2,16 +2,18 @@
 #include "audio_devices.h"
 #include "csd_builder.h"
 #include "imgui.h"
-#include "meters.h"
 #include "osc_sender.h"
+#include "pd_text.h"
 #include "process.h"
 #include "project_io.h"
 #include "score_svg.h"
 #include "TextEditor.h"
 #include "csound_opcodes.h"
+#include "marks_gfx.h"
 
 #include <algorithm>
 #include <cfloat>
+#include <cstdarg>
 #include <cmath>
 #include <cctype>
 #include <cstdio>
@@ -41,6 +43,8 @@ namespace {
 Project g_proj;
 double g_play = 0.0;          // playhead (seconds)
 bool g_playing = false;
+int g_runMask = 7;                       // languages the engine and the timeline run: bit 0 Csound, bit 1 Pure Data, bit 2 SuperCollider
+bool langOn(int lang) { return ((g_runMask >> std::min(2, std::max(0, lang))) & 1) != 0; }
 bool g_liveCsound = false;
 float g_pps = 80.f;           // pixels per second (zoom)
 float g_scrollX = 0.f;        // seconds
@@ -48,6 +52,8 @@ float g_scrollY = 0.f;        // pixels
 int g_selTrack = -1, g_selClip = -1;
 int g_nextTrackId = 1;
 std::string g_projectPath;
+std::string g_savedSnap;               // the project as it was when it was last saved / opened (to know if there are unsaved changes)
+bool g_askSaveOnClose = false;
 bool g_confirmDeleteSelected = false;
 ImFont* g_codeFonts[3] = {nullptr, nullptr, nullptr};
 std::unordered_map<int, std::unique_ptr<TextEditor>> g_codeEditors;
@@ -76,6 +82,9 @@ float g_midiPps = 120.f, g_midiScrollX = 0.f;     // MIDI editor zoom/scroll, in
 struct MidiOrig { int idx; double start; int pitch; };
 std::set<int> g_midiSel;                          // selected note indices (clip = g_midiSelectedTrackId)
 std::vector<MidiOrig> g_midiMoveOrig;
+double g_midiEmptyPressT = -10.0;   // time of the last press on an empty cell of the piano roll (double-click adds a note)
+ImVec2 g_midiEmptyPressPos(0.f, 0.f);
+bool g_midiMarqueeDbl = false;
 bool g_midiMarquee = false, g_midiMarqueeMoved = false, g_midiMarqueeAdd = false;
 int g_midiMarqueeClip = -1;
 ImVec2 g_midiMarqueeStart;
@@ -89,8 +98,17 @@ int g_midiDragMode = 0; // 1 move, 2 resize
 int g_midiDragPitchOffset = 0;
 double g_midiDragTimeOffset = 0.0;
 int g_trackCounter = 0;
+std::vector<int> g_multiMidiIds;       // MIDI clips shown together in ONE piano roll (select them, press Enter)
+bool g_multiMidiOpen = false;
+int g_ctxTrack = -1;                   // track of the right-click menu in the left panel (-1 = empty panel space)
+int g_markTrack = -1, g_markIdx = -1;  // marker being edited
+int g_markDrag = -1, g_markDragTrack = -1, g_markDragMode = 0;   // marker being dragged (1 move, 2 resize)
+double g_markGrab = 0.0;
 int g_nextClipId = 1;
 std::unordered_map<int, std::unique_ptr<TextEditor>> g_clipCodeEditors;  // one code editor per clip instrument
+std::unordered_map<int, std::unique_ptr<TextEditor>> g_pdReadEditors;    // readable view of a Pure Data clip
+std::map<int, std::string> g_pdReadText, g_pdReadFor;                    // clip id -> readable text, and the clip code it was made from
+std::set<int> g_pdRawClips;                                              // Pure Data clips shown as raw patch text
 bool g_quitRequested = false;             // Ctrl+Q / File > Exit
 bool g_codeTyping = false;               // the text cursor is inside a code editor text area (Space types a space)
 bool g_codeClickHit = false;
@@ -98,14 +116,22 @@ bool g_textEditorFocused = false;     // a code editor window had focus last fra
 int g_ctxClipId = -1;                 // clip shown in the right-click clip menu
 
 // automation editing
-enum class Tool { Select, Pen, Cut, Join };   // one tool at a time: 1 Select, 8 Pen, 3 Cut, 4 Join
+enum class Tool { Select, Pen, Cut, Join, Pen2 };   // one tool at a time: 1 Select, 8 Pen 1 (simplified), 9 Pen 2 (every dot kept), 3 Cut, 4 Join
 Tool g_tool = Tool::Select;
+bool isPenTool() { return g_tool == Tool::Pen || g_tool == Tool::Pen2; }
 enum class AutoMode { None, Move, Marquee, Pen };
 double g_trimStart = 0.0, g_trimEnd = 0.0;       // clip edges when a left-edge trim started
 std::vector<MidiNote> g_trimNotes;               // the clip's notes when the trim started
 AutoMode g_autoMode = AutoMode::None;
 int g_autoSelTrackId = -1;            // lane that owns the point selection
 std::string g_autoSelChannel;
+double g_autoLastPressT = -10.0;      // own double-click detection for the automation lanes (does not depend on the ImGui double-click)
+ImVec2 g_autoLastPressPos(0.f, 0.f);
+int g_autoLastTrackId = -1;
+std::string g_autoLastChannel;
+bool g_autoLastAddedValid = false;    // the first click of a double-click dropped a dot (kept here so the double-click can move it)
+AutoPoint g_autoLastAdded{0.0, 0.0};
+double g_autoPenMinT = 0.0, g_autoPenMaxT = 0.0;   // time span of the pen stroke being drawn (simplified to few dots on release)
 bool g_autoPressAdded = false;        // a plain click on an empty lane already dropped its dot on mouse-down (no wait for release)
 AutoPoint g_autoPressPoint{0.0, 0.0};
 std::set<int> g_autoSel;              // selected point indices in that lane
@@ -143,13 +169,28 @@ const float kMidiRowH = 16.f;
 
 bool g_showMonitor = true;
 bool g_settingsOpen = false;
-bool g_demo = false;          // demo test tones (View menu); real meters need the in-process engine step
 float g_monitorH = 210.f;
 const float kMonitorMinH = 90.f, kMonitorMaxH = 520.f, kMonitorSplitterH = 12.f;
 // monitor panels: display order and width (unscaled px, 0 = automatic) of every panel; drag a title to reorder, drag between panels to resize
-enum { kPanelMeter = 0, kPanelSpectrum = 1, kPanelScope = 2, kPanelConsole = 3, kPanelCount = 4 };
-int g_panelOrder[kPanelCount] = {kPanelMeter, kPanelSpectrum, kPanelScope, kPanelConsole};
-float g_panelW[kPanelCount] = {0.f, 0.f, 0.f, 0.f};
+enum { kPanelSpectrum = 0, kPanelScope = 1, kPanelConsole = 2, kPanelCount = 3 };
+int g_panelOrder[kPanelCount] = {kPanelSpectrum, kPanelScope, kPanelConsole};
+float g_panelW[kPanelCount] = {0.f, 0.f, 0.f};
+float g_meterW = 0.f;   // width of the meter panel (unscaled px), 0 = from the number of channels; drag its left edge
+int g_specDetail = 1;    // spectrum drawing: 0 coarse, 1 normal, 2 fine (right-click the spectrum)
+int g_specFall = 1;      // spectrum fall speed: 0 fast, 1 medium, 2 slow
+int g_scopeSmooth = 1;   // scope curve: 0 straight segments, 1 smooth, 2 extra smooth
+int g_scopeMs = 200;     // scope time window (x range) in milliseconds, right-click the scope
+bool g_scopeDivSent = false;   // the engine got the window of g_scopeMs
+// Control periods per scope point for the chosen time window, and the window that really results (whole control periods only).
+int scopeDiv() {
+    const double period = (double)std::max(1, g_proj.cs.ksmps) / (double)std::max(1, g_proj.cs.sr);
+    return std::max(1, (int)std::lround(g_scopeMs / 1000.0 / (kScopePoints * period)));
+}
+int scopeWindowMs() {
+    return (int)std::lround(scopeDiv() * kScopePoints * (double)std::max(1, g_proj.cs.ksmps) / (double)std::max(1, g_proj.cs.sr) * 1000.0);
+}
+
+
 
 bool g_viewMeter = true, g_viewSpectrum = true, g_viewScope = true, g_viewConsole = true;
 
@@ -161,10 +202,11 @@ std::string g_runName;                             // clip started with "Run cli
 double g_runLeft = 0.0;                            // seconds until that clip ends by itself
 std::string g_runPendingName;                      // clip whose Run is waiting for the Pd / SuperCollider render
 std::string clipLineMessage(const std::string& l);
-void ensurePdRendered(std::function<void()> after);   // renders the Pure Data clips that changed, then calls `after`
+void logCsoundLine(const std::string& raw);
+void ensurePdRendered(std::function<void()> after, const std::string& only = std::string());   // renders the Pd / SuperCollider clips that changed (only = just that clip), then calls `after`
 void startPlayback(bool liveMode = true);
 void startRender();
-std::vector<OrcSpan> g_orcSpans;                   // where each clip sits in the orchestra that is running (for error lines)
+std::vector<OrcSpan> g_orcSpans;                   // where each clip sits in the .csd that is running (for error lines)
 ProcessRunner g_opcodeProc;                        // 'csound -z' at startup: the opcode list for the editor colors
 bool g_opcodeScanStarted = false;
 float g_opcodeScanT = 0.f;
@@ -172,8 +214,28 @@ bool g_playWaiting = false, g_sectionSeen = false;
 float g_playWaitT = 0.f;
 bool g_renderActive = false;
 std::string g_renderPath;
-std::vector<std::string> g_log;
+// Console: every line knows its importance, its language and (when the message names one) its clip.
+enum LogLevel { kLogDetail = 0, kLogMessage = 1, kLogImportant = 2, kLogError = 3 };
+struct LogLine {
+    std::string text; int level = kLogMessage; int lang = 0; std::string clip;   // lang 0 Csound, 1 Pure Data, 2 SuperCollider
+    int clipId = -1;                 // the clip the message is about (-1 = none / not found in the project)
+    int line = 0;                    // line of the clip's code (as shown in its editor), 0 = unknown
+    std::vector<double> times;       // where that clip starts on the timeline (seconds); a shared instrument has several
+    double playhead = -1.0;          // playhead when the message came (only while the timeline played), -1 = not playing
+};
+std::vector<LogLine> g_log;
 bool g_logAuto = true, g_logDirty = false;
+int g_logDetail = kLogImportant;           // shown: kLogImportant = errors, warnings, what runs | kLogMessage = + all app messages | kLogDetail = + raw engine output
+bool g_logLang[3] = {true, true, true};    // languages shown
+std::string g_logClip;                     // empty = all clips
+char g_logSearch[64] = "";
+bool g_logProblems = false;                // the console shows only the problems (errors)
+std::map<int, std::map<int, std::string>> g_diagMarks;   // clip id -> line of the clip code -> error text (red mark in the code editor)
+std::map<int, int> g_gotoLine;             // clip id -> line the editor puts its cursor on when it is drawn next
+int g_focusClipWin = -1;                   // clip editor window that gets the focus
+struct ErrCtx { int left = 0; std::string text; int row = -1; std::string rowText; };   // row: index of the error row in g_log that waits for its line
+ErrCtx g_errCtx;                           // an error line was just printed: the "line N" lines right after it belong to it
+int g_scCodeLine = 1;                      // line of the SuperCollider script where the clip code starts
 
 std::vector<AudioDevice> g_outDevs, g_inDevs;
 
@@ -195,6 +257,19 @@ bool g_haveBands = false;
 
 float S(float v) { return v * g_ui; }
 
+// ---- help panel: what used to be pop-up tooltips is shown in a panel at the bottom of the program
+bool g_helpOn = true;                 // show / hide the help panel (View menu or the box in the panel)
+std::string g_helpNext, g_helpShown;  // text of the hovered item (this frame / last frame)
+void helpTip(const char* fmt, ...) {
+    if (!g_helpOn || !fmt) return;
+    char buf[2048];
+    va_list ap; va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    g_helpNext = buf;
+}
+
+
 const char* kLead = R"csd(; Lead: plain sine, MIDI note or input1 pitch
 <caw>
 {chn: "input1", range: (0,127,0.1), value: 60 }
@@ -212,136 +287,6 @@ endif
 aEnv  linen 1, 0.02, p3, 0.1
 aOut  oscili 0.2 * (iVel / 127) * aEnv, cpsmidinn(kNote)
 outs aOut, aOut)csd";
-
-const char* kLeadWide = R"csd(; Wide lead: two detuned sines, stereo
-<caw>
-{chn: "input1", range: (0,127,0.1), value: 67 }
-{chn: "detune", range: (0,0.15,0.001), value: 0.035 }
-midi: "on"
-</caw>
-kMidi init p4
-iVel = p5
-if (iVel <= 0) then
-  iVel = 127
-endif
-kNote caw "input1"
-kDetune caw "detune"
-if (kMidi > 0) then
-  kNote = kMidi
-endif
-aEnv linen 1, 0.04, p3, 0.16
-aLeft oscili 0.12 * (iVel / 127) * aEnv, cpsmidinn(kNote - kDetune)
-aRight oscili 0.12 * (iVel / 127) * aEnv, cpsmidinn(kNote + kDetune)
-outs aLeft, aRight)csd";
-
-const char* kLeadPluck = R"csd(; Pluck lead: saw with decay and low-pass
-<caw>
-{chn: "input1", range: (0,127,0.1), value: 72 }
-{chn: "bright", range: (500,9000,1), value: 3800 }
-midi: "on"
-</caw>
-kMidi init p4
-iVel = p5
-if (iVel <= 0) then
-  iVel = 127
-endif
-kNote caw "input1"
-kBright caw "bright"
-if (kMidi > 0) then
-  kNote = kMidi
-endif
-aEnv expseg 1, p3, 0.001
-aRaw vco2 0.18 * (iVel / 127), cpsmidinn(kNote), 2, 0.3
-aOut tone aRaw * aEnv, kBright
-outs aOut, aOut)csd";
-
-const char* kBassDeep = R"csd(; Deep bass: driven sine
-<caw>
-{chn: "volume", range: (0,1,0.01), value: 0.6 }
-{chn: "drive", range: (1,6,0.01), value: 2.2 }
-midi: "on"
-</caw>
-kVol caw "volume"
-kDrive caw "drive"
-iMidi = p4
-if (iMidi <= 0) then
-  iMidi = 31
-endif
-iVel = p5
-if (iVel <= 0) then
-  iVel = 127
-endif
-aEnv linen 1, 0.01, p3, 0.12
-aSin oscili 1, cpsmidinn(iMidi)
-aOut = tanh(aSin * kDrive) * kVol * 0.3 * (iVel / 127) * aEnv
-outs aOut, aOut)csd";
-
-const char* kBass = R"csd(; Bass: saw + sub through a low-pass
-<caw>
-{chn: "volume", range: (0,1,0.01), value: 0.55 }
-{chn: "cutoff", range: (80,1800,1), value: 520 }
-midi: "on"
-</caw>
-kVol caw "volume"
-kCut caw "cutoff"
-iMidi = p4
-if (iMidi <= 0) then
-  iMidi = 36
-endif
-iVel = p5
-if (iVel <= 0) then
-  iVel = 127
-endif
-aEnv linen 1, 0.005, p3, 0.08
-aSaw vco2 kVol * 0.25 * (iVel / 127), cpsmidinn(iMidi)
-aSub oscili kVol * 0.12 * (iVel / 127), cpsmidinn(iMidi - 12)
-aRaw = (aSaw + aSub) * aEnv
-aOut tone aRaw, kCut
-outs aOut, aOut)csd";
-
-const char* kPad = R"csd(; Pad: slow detuned stereo sines
-<caw>
-{chn: "volume", range: (0,1,0.01), value: 0.42 }
-{chn: "detune", range: (0,0.1,0.001), value: 0.025 }
-midi: "on"
-</caw>
-kVol caw "volume"
-kDetune caw "detune"
-iMidi = p4
-if (iMidi <= 0) then
-  iMidi = 60
-endif
-iVel = p5
-if (iVel <= 0) then
-  iVel = 127
-endif
-aEnv linen 1, 0.28, p3, 0.7
-aLeft oscili kVol * 0.22 * (iVel / 127) * aEnv, cpsmidinn(iMidi - kDetune)
-aRight oscili kVol * 0.22 * (iVel / 127) * aEnv, cpsmidinn(iMidi + kDetune)
-outs aLeft, aRight)csd";
-
-const char* kNoiseBed = R"csd(; Noise bed: band-passed noise, cutoff and volume are automatable
-<caw>
-{chn: "cutoff", range: (200,8000,1), value: 1200 }
-{chn: "volume", range: (0,1,0.01), value: 0.3 }
-</caw>
-kCut caw "cutoff"
-kVol caw "volume"
-aEnv linen 1, 0.5, p3, 1.5
-aNoise noise 0.5, 0
-aBand butterbp aNoise, kCut, kCut * 0.5
-outs aBand * kVol * aEnv, aBand * kVol * aEnv)csd";
-
-const char* kRunDemo = R"csd(; Unison demo: the clip's x box = number of copies, all start together.
-; The <caw> lines set p5 and p6 of every copy (p4 is set in the code), the code below uses them.
-<caw>
-{p: 5, from: 0, to: 1}
-{p: 6, from: 400, +100}
-</caw>
-iAmp = 0.1
-aEnv linen iAmp, 0.05, p3, 0.3
-aOut oscili aEnv, p6
-outs aOut * (1 - p5), aOut * p5)csd";
 
 uint32_t defaultTrackRgb(int index) {
     static const uint32_t palette[] = {
@@ -377,10 +322,12 @@ ImU32 trackColor(int i, int alpha = 255, uint32_t custom = 0) {
 
 float automationHeight(const Track& track, const std::string& channel) {
     const auto it = track.automationHeights.find(channel);
-    return it == track.automationHeights.end() ? kAutomationLaneH : it->second;
+    const float h = it == track.automationHeights.end() ? kAutomationLaneH : it->second;
+    return track.kind == 2 ? std::max(h, 68.f) : h;   // a graph line has a second row: shape and lane
 }
 
-bool autoShown(const Track& track, const std::string& channel) { return track.hiddenAutomation.count(channel) == 0; }
+std::set<int> g_collapsedAuto;   // track ids whose automation sub-tracks are folded away with the arrow (UI only, the data stays)
+bool autoShown(const Track& track, const std::string& channel) { return g_collapsedAuto.count(track.id) == 0 && track.hiddenAutomation.count(channel) == 0; }
 // The MIDI lane only exists when at least one Csound clip of the lane has  midi: "on"  in its <caw> block.
 bool trackHasMidi(const Track& track) {
     for (const Clip& c : track.clips) if (parseClip(c).midiEnabled) return true;
@@ -535,6 +482,7 @@ Clip makeClip(const Track& lane, double start, double dur, const std::string& co
     c.id = g_nextClipId++;
     c.name = nextClipName(lane.name);
     c.code = code;
+    c.lang = lane.lang;   // a Pure Data / SuperCollider track makes clips of its language
     c.color = storedRgb(defaultTrackRgb(c.id - 1));
     return c;
 }
@@ -681,8 +629,55 @@ int addTrack(const std::string& name, const std::string& templateCode) {
     return (int)g_proj.tracks.size() - 1;
 }
 
+// Templates of the right-click menu in the track panel. They are only a starting point: change everything in the code editor.
+const char* kPdTemplate = R"pd(<caw>
+{chn: "freq", range: (50,2000,1), value: 440 }
+</caw>
+#N canvas 0 50 450 300 12;
+#X obj 30 20 r freq;
+#X obj 30 60 osc~;
+#X obj 30 100 *~ 0.1;
+#X obj 30 140 dac~ 1 2;
+#X connect 0 0 1 0;
+#X connect 1 0 2 0;
+#X connect 2 0 3 0;
+#X connect 2 0 3 1;
+)pd";
+const char* kScTemplate = R"sc(<caw>
+{chn: "freq", range: (50,2000,1), value: 440 }
+</caw>
+var sig = SinOsc.ar(\freq.kr(440), 0, 0.1);
+[sig, sig]
+)sc";
+
+int addLangTrack(int lang) {
+    static const char* names[] = {"Csound", "PureData", "SC"};
+    const int idx = addTrack(std::string(names[std::min(2, std::max(0, lang))]) + std::to_string(++g_trackCounter), lang == 1 ? kPdTemplate : lang == 2 ? kScTemplate : kLead);
+    g_proj.tracks[(size_t)idx].lang = lang;
+    return idx;
+}
+
+// A graph track: one lane in the printed score that holds up to 8 automation lines. It is only drawn in the score, it never makes sound.
+int addFreeAutomationTrack() {
+    const int idx = addTrack("Graph" + std::to_string(++g_trackCounter), "");
+    Track& t = g_proj.tracks[(size_t)idx];
+    t.kind = 2;
+    t.autoMin = 0.0; t.autoMax = 1.0;
+    t.automation["line1"] = std::vector<AutoPoint>{};
+    t.automationHeights["line1"] = kAutomationLaneH;
+    return idx;
+}
+
+// A marker track: text boxes on the timeline for comments and guidance about the project.
+int addMarkerTrack() {
+    const int idx = addTrack("Notes" + std::to_string(++g_trackCounter), "");
+    g_proj.tracks[(size_t)idx].kind = 1;
+    return idx;
+}
+
 void addClip(int laneIndex, double start, double dur, const std::string& code, const std::string& name = std::string()) {
     Track& lane = g_proj.tracks[(size_t)laneIndex];
+    if (lane.kind != 0) return;   // graph and marker tracks take no clips
     Clip c = makeClip(lane, start, dur, code);
     if (!name.empty()) { c.name = name; ensureUniqueClipName(c); }
     lane.clips.push_back(c);
@@ -821,52 +816,77 @@ void fixName(std::string& n) {
     if (n[0] >= '0' && n[0] <= '9') n = "T" + n;
 }
 
-// ---------------------------------------------------------------- demo signal
-// Stands in for the Csound engine: every track with a clip under the playhead makes a tone.
-void demoFeed(float dt) {
-    const int sr = g_proj.cs.sr;
-    static double carry = 0.0;
-    static double ph[16] = {};
-    carry += (double)dt * sr;
-    int n = (int)carry;
-    carry -= n;
-    n = std::min(n, 8192);
-    if (n <= 0) return;
-
-    static std::vector<float> bl, br;
-    bl.assign((size_t)n, 0.f);
-    br.assign((size_t)n, 0.f);
-
-    if (g_demo && g_playing) {
-        const double twoPi = 6.283185307179586;
-        bool anySolo = false;
-        for (const Track& t : g_proj.tracks) if (t.solo && !t.muted) anySolo = true;
-        for (int i = 0; i < (int)g_proj.tracks.size() && i < 16; ++i) {
-            const Track& track = g_proj.tracks[(size_t)i];
-            if (track.muted || (anySolo && !track.solo)) continue;
-            bool active = false;
-            for (const Clip& c : g_proj.tracks[i].clips)
-                if (g_play >= c.start && g_play < c.start + c.dur) active = true;
-            if (!active) continue;
-            const double f = 110.0 * std::pow(2.0, i * 7.0 / 12.0);
-            const float pan = (i % 2) ? 0.7f : 0.3f;
-            for (int s = 0; s < n; ++s) {
-                ph[i] += twoPi * f / sr;
-                if (ph[i] > twoPi) ph[i] -= twoPi;
-                float v = 0.18f * (float)(std::sin(ph[i]) + 0.35 * std::sin(2 * ph[i]) + 0.15 * std::sin(3 * ph[i]));
-                bl[(size_t)s] += v * (1.f - pan) * 1.6f;
-                br[(size_t)s] += v * pan * 1.6f;
-            }
-        }
+// ---------------------------------------------------------------- console log + csound processes
+LogLine classifyLog(const std::string& text) {
+    static const std::regex pdSc(R"re(^\[(Pd|SC) ([^\]]+)\])re");
+    static const std::regex clipRe(R"re((?:instr|clip|Pure Data:|SuperCollider:)\s+(\w+))re");
+    LogLine l;
+    l.text = text;
+    std::string low = text;
+    std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    std::smatch m;
+    if (std::regex_search(text, m, pdSc)) { l.lang = m[1].str() == "Pd" ? 1 : 2; l.clip = m[2].str(); }
+    else {
+        if (low.find("pure data") != std::string::npos) l.lang = 1;
+        else if (low.find("supercollider") != std::string::npos) l.lang = 2;
+        if (std::regex_search(text, m, clipRe)) l.clip = m[1].str();
     }
-    masterTap().push(bl.data(), br.data(), n);
+    const bool app = text.rfind("[caw]", 0) == 0;
+    l.level = app ? kLogMessage : kLogDetail;
+    if (low.find("error") != std::string::npos || low.find("failed") != std::string::npos || low.find("invalid") != std::string::npos) l.level = kLogError;
+    else if (!app && (low.find("couldn't create") != std::string::npos || low.find("not understood") != std::string::npos || low.find("no method for") != std::string::npos ||
+                      low.find("used before defined") != std::string::npos || low.find("undefined variable") != std::string::npos || low.find("syntax") != std::string::npos)) l.level = kLogError;
+    else if (low.find("warning") != std::string::npos || (!app && low.find("extra arguments") != std::string::npos)) l.level = kLogImportant;
+    else if (app)
+        for (const char* key : {"run ", "rendered", "render", "playback", "stopped", "saved", "opened"})
+            if (low.find(key) != std::string::npos) { l.level = kLogImportant; break; }
+    return l;
 }
 
-// ---------------------------------------------------------------- console log + csound processes
-void logLine(const std::string& s) {
-    g_log.push_back(s);
-    if (g_log.size() > 3000) g_log.erase(g_log.begin(), g_log.begin() + 500);
+void pushLog(LogLine&& l) {
+    g_log.push_back(std::move(l));
+    if (g_log.size() > 5000) g_log.erase(g_log.begin(), g_log.begin() + 1000);
     g_logDirty = true;
+}
+
+// ---- diagnostics: which clip, which line of its code, which time on the timeline
+std::string timeText(double t) {
+    const int m = (int)(t / 60.0);
+    char b[64];
+    std::snprintf(b, sizeof b, "%.2f s (%d:%04.1f)", t, m, t - m * 60.0);
+    return b;
+}
+const Clip* clipByName(const std::string& name) {
+    for (const Track& t : g_proj.tracks) for (const Clip& c : t.clips) if (c.name == name) return &c;
+    return nullptr;
+}
+// Puts the clip, its line and its start times on a log line. An error with a line also gets a red mark in the code editor of the clip.
+void fillLoc(LogLine& l, const std::string& clipName, int line, const std::string& markText) {
+    const Clip* first = nullptr;
+    std::vector<double> times;
+    for (const Track& t : g_proj.tracks)
+        for (const Clip& c : t.clips)
+            if (c.name == clipName) { if (!first) first = &c; times.push_back(c.start); }
+    if (!first) return;
+    std::sort(times.begin(), times.end());
+    l.clip = clipName; l.clipId = first->id; l.line = line; l.times = times;
+    if (g_playing) l.playhead = g_play;
+    if (l.level == kLogError && line > 0) {
+        std::string mk = markText;
+        while (!mk.empty() && std::isspace((unsigned char)mk.front())) mk.erase(mk.begin());
+        while (!mk.empty() && std::isspace((unsigned char)mk.back())) mk.pop_back();
+        if (mk.size() > 300) mk.resize(300);
+        auto& marks = g_diagMarks[first->id];
+        if (!marks.count(line)) marks[line] = mk.empty() ? std::string("error") : mk;
+    }
+}
+void diagClearAll() { g_diagMarks.clear(); g_errCtx = ErrCtx(); }
+void diagClearClip(const std::string& name) { if (const Clip* c = clipByName(name)) g_diagMarks.erase(c->id); g_errCtx = ErrCtx(); }
+
+void logLine(const std::string& s) {
+    LogLine l = classifyLog(s);
+    if (l.level == kLogError && !l.clip.empty() && l.clipId < 0) fillLoc(l, l.clip, 0, s);
+    pushLog(std::move(l));
 }
 
 bool writeTextFile(const std::string& path, const std::string& text) {
@@ -903,30 +923,26 @@ void saveProject(bool saveAs) {
     if (saveProjectFile(g_proj, path, error)) {
         g_projectPath = std::filesystem::absolute(path).string();
         logLine("[caw] Saved project: " + g_projectPath);
+        g_savedSnap = serializeProject(g_proj);
     } else logLine("[caw] Save failed: " + error);
 }
 
 void stopPlayback();
+void splitCaw(const std::string& code, std::string& patch, std::string& caw);
 std::string csoundExePath();
 void refreshAudioDevices();
 void historyReset();
 
-void openProjectPath(const std::string& path) {
-    if (path.empty()) return;
-    Project loaded;
-    std::string error;
-    if (!loadProjectFile(loaded, path, error)) {
-        logLine("[caw] Open failed for " + path + ": " + error);
-        return;
-    }
+// Makes `project` the current one and resets every editor state that belongs to the old project.
+void adoptProject(Project&& project, const std::string& path) {
     if (g_playing) stopPlayback();
-    g_proj = std::move(loaded);
+    g_proj = std::move(project);
     g_codeEditors.clear();
     g_selMidiClips.clear();
     g_mcDragId = -1;
     g_midiDragTrackId = g_midiDragNote = -1;
     g_midiSelectedTrackId = g_midiSelectedNote = -1;
-    g_projectPath = std::filesystem::absolute(path).string();
+    g_projectPath = path;
     g_nextTrackId = 1;
     std::set<int> usedIds;
     for (Track& t : g_proj.tracks) {
@@ -939,13 +955,33 @@ void openProjectPath(const std::string& path) {
     g_nextClipId = 1;
     normalizeClips();
     g_clipCodeEditors.clear();
+    g_pdReadEditors.clear();
+    g_pdReadText.clear();
+    g_pdReadFor.clear();
     clearAutoSelection();
     g_trackCounter = (int)g_proj.tracks.size();
     g_selTrack = g_selClip = -1;
     g_play = 0.0;
     historyReset();
-    logLine("[caw] Opened project: " + g_projectPath);
     refreshAudioDevices();
+    g_savedSnap = serializeProject(g_proj);
+}
+
+void openProjectPath(const std::string& path) {
+    if (path.empty()) return;
+    Project loaded;
+    std::string error;
+    if (!loadProjectFile(loaded, path, error)) {
+        logLine("[caw] Open failed for " + path + ": " + error);
+        return;
+    }
+    adoptProject(std::move(loaded), std::filesystem::absolute(path).string());
+    logLine("[caw] Opened project: " + g_projectPath);
+}
+
+void newProject() {
+    adoptProject(Project(), std::string());
+    logLine("[caw] New empty project.");
 }
 
 void openProject() {
@@ -1046,6 +1082,9 @@ void restoreSnapshot(const std::string& data) {
     g_mcDragId = -1;
     g_codeEditors.clear();
     g_clipCodeEditors.clear();
+    g_pdReadEditors.clear();
+    g_pdReadText.clear();
+    g_pdReadFor.clear();
     g_drag = Drag::None;
     g_autoMode = AutoMode::None;
     g_autoDragTrackId = -1; g_autoDragPoint = -1; g_autoDragChannel.clear();
@@ -1087,17 +1126,20 @@ void runJoinTool();
 
 // ---------------------------------------------------------------- score (SVG) : export, editor, 3-minute example
 bool g_scoreOpen = false;
-bool g_scorePreviewOpen = false;
-void buildScoreExample();
 
 // ---- spectrogram of the rendered audio file (shown in the score when "Spectrum" is on)
 ScoreSpectrum g_scoreSpec;
 std::string g_scoreSpecPath, g_scoreSpecMsg;
 std::filesystem::file_time_type g_scoreSpecTime;
 
-std::string scoreAudioPath() {
-    return std::filesystem::absolute(g_proj.cs.renderFile.empty() ? "render.wav" : g_proj.cs.renderFile).string();
+// The render file: a relative name lives next to the saved project (or in the work folder while the project is unsaved).
+std::filesystem::path renderFilePath() {
+    const std::filesystem::path file = g_proj.cs.renderFile.empty() ? "render.wav" : g_proj.cs.renderFile;
+    if (file.is_absolute()) return file;
+    return (g_projectPath.empty() ? workDir() : std::filesystem::path(g_projectPath).parent_path()) / file;
 }
+
+std::string scoreAudioPath() { return renderFilePath().string(); }
 
 bool refreshScoreSpectrum(bool force) {
     const std::string path = scoreAudioPath();
@@ -1124,11 +1166,25 @@ bool refreshScoreSpectrum(bool force) {
 }
 
 void generateScore(bool detailed, bool blackWhite) {
-    const std::string base = std::filesystem::absolute(g_proj.cs.renderFile.empty() ? "render.wav" : g_proj.cs.renderFile).replace_extension("").string();
+    const std::string base = renderFilePath().replace_extension("").string();
     const std::string fallback = g_projectPath.empty() ? std::string("Untitled") : std::filesystem::path(g_projectPath).stem().string();
     ScoreRenderOptions opt;
     opt.detailed = detailed;
     opt.blackWhite = blackWhite;
+    ScoreProbeData probeData;
+    if (g_proj.score.analyze) {   // what the last Render audio measured: shapes of the clips and the data sent to the channel "score"
+        std::error_code pec;
+        const auto probeTime = std::filesystem::last_write_time(scoreProbePath(), pec);
+        if (!pec && loadScoreProbe(scoreProbePath(), probeData)) {
+            opt.probe = &probeData;
+            bool wantsData = false;
+            for (const Track& t : g_proj.tracks) for (const Clip& c : t.clips) if (c.scoreDetail && parseClip(c).scoreSig && !probeData.count(c.name)) wantsData = true;
+            if (wantsData) logLine("[caw] Score: a Detailed clip has no \"score\" data yet. Press Render audio first.");
+            (void)probeTime;
+        } else {
+            logLine("[caw] Score: no measured clip data yet, shapes are drawn envelopes. Press Render audio to measure the clips.");
+        }
+    }
     if (g_proj.score.spectrum) {
         if (!refreshScoreSpectrum(false)) logLine("[caw] Score spectrum: " + g_scoreSpecMsg);
         opt.spectrum = g_scoreSpec.valid() ? &g_scoreSpec : nullptr;
@@ -1145,114 +1201,108 @@ void generateScore(bool detailed, bool blackWhite) {
 }
 
 // ---- small score widgets (shared by the score editor, the track panel, the clip editor and the clip menu)
-bool scoreLaneCombo(const char* label, int& id, bool clipLevel) {
-    const ScoreInfo& sc = g_proj.score;
-    std::string cur;
-    if (id < 0) cur = "Hidden in score";
-    else if (id == 0) cur = clipLevel ? "Same as track" : "Own lane (auto)";
-    else {
-        cur = "(missing lane)";
-        for (const ScoreLaneDef& l : sc.lanes) if (l.id == id) cur = l.name.empty() ? "(unnamed lane)" : l.name;
-    }
-    bool changed = false;
-    if (ImGui::BeginCombo(label, cur.c_str())) {
-        if (ImGui::Selectable(clipLevel ? "Same as track" : "Own lane (auto)", id == 0)) { id = 0; changed = true; }
-        if (clipLevel && ImGui::Selectable("Hidden in score", id < 0)) { id = -1; changed = true; }
-        for (const ScoreLaneDef& l : sc.lanes) {
-            ImGui::PushID(l.id);
-            if (ImGui::Selectable(l.name.empty() ? "(unnamed lane)" : l.name.c_str(), id == l.id)) { id = l.id; changed = true; }
-            ImGui::PopID();
-        }
-        ImGui::EndCombo();
-    }
-    return changed;
+// ---- score settings of one lane. The same name in two lanes (track, MIDI or automation, of any track) puts them in ONE lane of the score.
+void drawLaneName(const char* id, std::string& name, const std::string& fallback) {
+    ImGui::SetNextItemWidth(S(220));
+    inputStr(id, name, 0);
+    ImGui::SameLine();
+    if (name.empty()) ImGui::TextDisabled("empty = %s", fallback.c_str());
+    else ImGui::TextDisabled("name in the score");
 }
 
 void drawTrackScoreMenu(Track& t) {
-    ImGui::TextDisabled("Score lane of this track");
-    ImGui::SetNextItemWidth(S(220));
-    scoreLaneCombo("##tr_lane", t.scoreLane, false);
-    bool hid = t.scoreKind == 3;
-    if (ImGui::Checkbox("Hide this track in the score", &hid)) t.scoreKind = hid ? 3 : 0;
-    if (t.scoreLane == 0 && !hid) {
-        if (g_proj.score.mode == 1) {   // instruments exist: staff / clef only make sense then
-            ImGui::SetNextItemWidth(S(150));
-            ImGui::Combo("##tr_kind", &t.scoreKind, "Auto\0Instrument (staff)\0Electronics (graphic)\0");
-            if (t.scoreKind == 1) {
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(S(100));
-                ImGui::Combo("##tr_clef", &t.scoreClef, "Clef auto\0Treble\0Bass\0No clef\0");
-            }
+    ImGui::TextDisabled("Track lane in the score");
+    bool shown = t.scoreKind != 3;
+    if (ImGui::Checkbox("Show in the score", &shown)) t.scoreKind = shown ? 0 : 3;
+    if (!shown) return;
+    drawLaneName("##tr_name", t.scoreLabel, t.name);
+    {   // every track decides itself: instrument (staff) or electronics (graphic), whether or not it has a Csound / Pd / SC clip
+        ImGui::SetNextItemWidth(S(150));
+        ImGui::Combo("##tr_kind", &t.scoreKind, "Auto\0Instrument (staff)\0Electronics (graphic)\0");
+        if (ImGui::IsItemHovered()) helpTip("Instrument: the sound comes from an instrument (staff, clef). Electronics: the score shows what is inside the audio (shape, grains, FM ...). Free choice per track.");
+        if (t.scoreKind == 1) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(S(100));
+            ImGui::Combo("##tr_clef", &t.scoreClef, "Clef auto\0Treble\0Bass\0No clef\0");
         }
-        ImGui::SetNextItemWidth(S(220));
-        inputStr("##tr_lbl", t.scoreLabel, 0);
-        ImGui::SameLine(); ImGui::TextDisabled("name (same name = same lane)");
-        ImGui::SetNextItemWidth(S(220));
-        inputStr("##tr_sub", t.scoreSub, 0);
-        ImGui::SameLine(); ImGui::TextDisabled("small line");
     }
-    if (!t.automation.empty()) {
-        ImGui::Separator();
-        ImGui::TextDisabled("Automation lanes in the score (like instruments)");
-        for (const auto& a : t.automation) {
-            ImGui::PushID(a.first.c_str());
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted(a.first.c_str());
-            ImGui::SameLine(S(110));
-            const auto it = t.scoreAuto.find(a.first);
-            int mode = it == t.scoreAuto.end() ? 1 : it->second;
-            ImGui::SetNextItemWidth(S(230));
-            if (ImGui::Combo("##am", &mode, "Not in the score\0Own lane, full curve\0Own lane, compact contour\0")) t.scoreAuto[a.first] = mode;
-            ImGui::PopID();
-        }
+    ImGui::SetNextItemWidth(S(220));
+    ImGui::Combo("##tr_overlap", &t.scoreOverlap, "Overlap\0Half combine\0");
+    if (ImGui::IsItemHovered()) helpTip("Tracks with the same score name share ONE lane.\nOverlap: their shapes are combined into one shape (same colour: one shape, different colours: both colours).\nSeparated: drawn on top of each other at 50% opacity, not combined.");
+    ImGui::SetNextItemWidth(S(220));
+    inputStr("##tr_sub", t.scoreSub, 0);
+    ImGui::SameLine(); ImGui::TextDisabled("small line under the name");
+}
+
+void drawMidiScoreMenu(Track& t) {
+    ImGui::TextDisabled("MIDI lane in the score");
+    drawLaneName("##midi_name", t.scoreMidiLabel, t.scoreLabel.empty() ? t.name : t.scoreLabel);
+    ImGui::SetNextItemWidth(S(220));
+    ImGui::Combo("##midi_show", &t.scoreMidiShow, "Every note\0Overall up / down\0Not in the score\0Pitch range band\0Every note with its name\0");
+}
+
+// Stroke width of a line in the score (straight lines, steps, dashed, curve, outlines) and the shape ratio of the mirror / wedge shapes.
+// The dots, bars, dashes and break points of the other shapes scale with the stroke width.
+void drawAutoStrokeControls(Track& t, const std::string& channel, int shape) {
+    const auto sk = t.scoreAutoStroke.find(channel);
+    float w = sk == t.scoreAutoStroke.end() ? 1.6f : (float)sk->second;
+    ImGui::SetNextItemWidth(S(200));
+    if (ImGui::SliderFloat("##auto_stroke", &w, 0.3f, 8.f, "stroke-width %.1f")) t.scoreAutoStroke[channel] = std::min(8.0f, std::max(0.3f, w));
+    if (ImGui::IsItemHovered()) helpTip("Stroke width of this line in the score (default 1.6).\nStraight lines, steps, dashed line, curve and the outline of the mirror shapes use it directly; the dots, bars, dashes and break points get bigger or smaller by the same ratio.");
+    if (sk != t.scoreAutoStroke.end()) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("reset##auto_stroke_reset")) t.scoreAutoStroke.erase(channel);
+    }
+    if (shape >= 5 && shape <= 7) {
+        const auto cv = t.scoreAutoCurve.find(channel);
+        float ratio = cv == t.scoreAutoCurve.end() ? 1.f : (float)cv->second;
+        ImGui::SetNextItemWidth(S(200));
+        if (ImGui::SliderFloat("##auto_ratio", &ratio, 0.3f, 3.f, "shape ratio %.2f (1 = linear)")) t.scoreAutoCurve[channel] = ratio;
+        if (ImGui::IsItemHovered()) helpTip("Below 1: the shape opens fast and then flattens. Above 1: it stays small and opens late.");
     }
 }
 
-// laneIndex >= 0: the lane of the clip (gives the "Edit MIDI notes" button)
-void drawClipScoreMenu(Clip& c, int laneIndex = -1) {
-    const bool midiOn = parseClip(c).midiEnabled;
-    ImGui::TextDisabled("Score lane of this clip");
+void drawAutoScoreMenu(Track& t, const std::string& channel) {
+    ImGui::TextDisabled("Automation %s in the score", channel.c_str());
+    drawLaneName("##auto_name", t.scoreAutoNames[channel], t.scoreLabel.empty() ? t.name : t.scoreLabel);
+    const auto it = t.scoreAuto.find(channel);
+    int mode = it == t.scoreAuto.end() ? 1 : it->second;
     ImGui::SetNextItemWidth(S(220));
-    scoreLaneCombo("##cl_lane", c.scoreLane, true);
-    ImGui::Separator();
-    if (midiOn) {
-        ImGui::TextColored(ImVec4(0.45f, 0.80f, 0.55f, 1.f), "Notes: MIDI input");
-        ImGui::TextDisabled("The MIDI regions are the input of this clip. Edit them in the MIDI editor.");
-        if (laneIndex >= 0) {
-            if (ImGui::SmallButton("Edit MIDI notes")) openMidiEditorFor(laneIndex, c);
-            ImGui::SameLine();
-        }
-        ImGui::SetNextItemWidth(S(210));
-        ImGui::Combo("##cl_midi", &c.scoreMidi, "Show every note\0Show overall up / down\0Hide the notes\0Show pitch range band\0Every note with its name\0");
-    } else {
-        ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.f), "Notes: made inside the code");
-        ImGui::TextDisabled("No MIDI input. Write the notes you want to see in the score (no sound):");
-        ImGui::SetNextItemWidth(S(330));
-        inputStr("##cl_written", c.scoreWritten, 0);
-        const int n = (int)scoreWrittenNotes(c.scoreWritten, std::max(0.1, c.dur)).size();
-        ImGui::TextDisabled("name[:length]  C4 E4:2 - G3+D4   (- rest, + chord)   %d note(s)", n);
-        if (n > 0) {
-            ImGui::SetNextItemWidth(S(210));
-            ImGui::Combo("##cl_midi", &c.scoreMidi, "Show every note\0Show overall up / down\0Hide the notes\0Show pitch range band\0Every note with its name\0");
-        }
-        ImGui::SetNextItemWidth(S(220));
-        ImGui::Combo("Sound shape##cl_style", &c.scoreStyle, "Shape\0Line\0Grains\0Block\0");
-        ImGui::SetNextItemWidth(S(100));
-        ImGui::InputDouble("##cl_flo", &c.scoreFreqLo, 0.0, 0.0, "%.0f Hz");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(S(100));
-        ImGui::InputDouble("##cl_fhi", &c.scoreFreqHi, 0.0, 0.0, "%.0f Hz");
-        ImGui::SameLine(); ImGui::TextDisabled("frequency band (0 = off)");
-        c.scoreFreqLo = std::max(0.0, c.scoreFreqLo); c.scoreFreqHi = std::max(0.0, c.scoreFreqHi);
+    if (ImGui::Combo("##auto_mode", &mode, "Not in the score\0Full curve\0Compact contour\0")) t.scoreAuto[channel] = mode;
+    if (mode == 1) {   // how the line looks
+        const auto sh = t.scoreAutoShape.find(channel);
+        int shape = sh == t.scoreAutoShape.end() ? 0 : sh->second;
+        ImGui::SetNextItemWidth(S(260));
+        if (ImGui::Combo("##auto_shape", &shape, "Line looks like: curve (smooth, filled)\0Steps\0Straight lines\0Line (no dots)\0Dashed line\0Mirror, smooth (grows up and down)\0Mirror, boxes (stepped)\0Hairpin (straight wedge, < >)\0Bars\0")) t.scoreAutoShape[channel] = shape;
+        if (ImGui::IsItemHovered()) helpTip("How the automation is drawn in the score.\nMirror / boxes / hairpin: the value is the HEIGHT of a shape that is mirrored around a centre line, e.g. 0..127 becomes a shape that slowly gets bigger (like a crescendo).");
+        drawAutoStrokeControls(t, channel, shape);
     }
-    ImGui::Separator();
-    ImGui::SetNextItemWidth(S(110));
-    inputStr("##cl_dyn", c.scoreDynamic, 0);
-    ImGui::SameLine(); ImGui::TextDisabled("dynamic: mf, pp<ff, f>p (empty = from velocity)");
-    ImGui::SetNextItemWidth(S(220));
-    inputStr("##cl_lbl", c.scoreLabel, 0);
-    ImGui::SameLine(); ImGui::TextDisabled("text in score");
-    if (ImGui::SmallButton("Open score editor")) g_scoreOpen = true;
+}
+
+// What a clip is in the score. Lanes, notes and automation are settings of the lanes, not of the clip.
+void drawClipScoreMenu(Clip& c, Track* lane = nullptr) {
+    ImGui::TextDisabled("This clip in the score");
+    ImGui::SetNextItemWidth(S(240));
+    ImGui::Combo("Looks like##cl_style", &c.scoreStyle, "Shape (amplitude + frequency)\0Line\0Grains (scattered)\0Block\0Sliced wave (granular)\0FM graph\0Dots and lines (keys, leads)\0");
+    if (ImGui::IsItemHovered()) helpTip("The score shows what is INSIDE the audio, so pick the picture of the technique: sliced wave for granular sound, FM graph for FM, dots and lines for played keys / leads.");
+    ImGui::SetNextItemWidth(S(240));
+    ImGui::Combo("Shown as##cl_detail", &c.scoreDetail, "Overall (the whole shape of the sound)\0Detailed (+ data sent to channel \"score\")\0");
+    if (ImGui::IsItemHovered()) helpTip("Overall: the shape the instrument generates (amplitude shape and where its spectrum sits), measured when you press Render audio. It is not the MIDI notes.\n\nDetailed: also everything the code sends to the channel \"score\", of any type (numbers, signals, strings):\n  Csound:  chnset kFreq, \"score\"   (aSig for a signal, Sname for text)\n  Pure Data:  [s score]\n  SuperCollider:  put  { send: \"score\" }  in the <caw> block; the control values after the 2nd output go there.\nRender audio records it, the score draws it.");
+    ImGui::SetNextItemWidth(S(200));
+    ImGui::Combo("Role##cl_role", &c.scoreRole, "Generator\0Effect\0Generator and effect\0");
+    ImGui::Checkbox("Write the coding language", &c.scoreShowLang);
+    if (lane) {   // automation of this clip: how it appears in the score (set here, next to the code)
+        const ParsedTrack pc = parseClip(c);
+        if (!pc.params.empty()) {
+            ImGui::Separator();
+            ImGui::TextDisabled("Automation of this clip in the score");
+            for (const CawParam& prm : pc.params) {
+                ImGui::PushID(prm.chn.c_str());
+                drawAutoScoreMenu(*lane, prm.chn);
+                ImGui::PopID();
+            }
+        }
+    }
 }
 
 void drawScoreMarkList(const char* idPrefix, std::vector<ScoreMark>& list, bool section) {
@@ -1293,189 +1343,6 @@ bool inputMulti(const char* label, std::string& s, ImVec2 size) {
     return ImGui::InputTextMultiline(label, s.data(), s.capacity() + 1, size, ImGuiInputTextFlags_CallbackResize, multiCb, &ctx);
 }
 
-void scoreCreateLanesFromTracks() {
-    ScoreInfo& sc = g_proj.score;
-    auto norm = [](std::string v) { for (char& ch : v) ch = (char)std::tolower((unsigned char)ch); return v; };
-    for (Track& t : g_proj.tracks) {
-        if (t.scoreLane != 0 || t.scoreKind == 3) continue;
-        const std::string nm = t.scoreLabel.empty() ? t.name : t.scoreLabel;
-        int found = 0;                                    // same name = same lane
-        for (const ScoreLaneDef& d : sc.lanes) if (norm(d.name) == norm(nm)) { found = d.id; break; }
-        if (found) { t.scoreLane = found; continue; }
-        ScoreLaneDef l;
-        l.id = sc.nextLaneId++;
-        l.name = nm;
-        l.sub = t.scoreSub;
-        l.kind = t.scoreKind;
-        l.clef = t.scoreClef;
-        sc.lanes.push_back(l);
-        t.scoreLane = l.id;
-    }
-}
-
-void scoreDeleteLane(size_t index) {
-    ScoreInfo& sc = g_proj.score;
-    if (index >= sc.lanes.size()) return;
-    const int id = sc.lanes[index].id;
-    for (Track& t : g_proj.tracks) {
-        if (t.scoreLane == id) t.scoreLane = 0;
-        for (Clip& c : t.clips) if (c.scoreLane == id) c.scoreLane = 0;
-    }
-    sc.lanes.erase(sc.lanes.begin() + (long)index);
-}
-
-
-// ---- live score preview: the same primitives that are written to SVG are drawn here, so every edit shows at once
-std::vector<ScorePage> g_prevPages;
-std::string g_prevSig, g_prevErr;
-bool g_prevDetailed = true, g_prevBW = false;
-int g_prevPage = 0;
-float g_prevZoom = 1.f, g_prevTimer = 1.f, g_prevSpecTimer = 0.f;
-
-void drawScorePreview(float dt) {
-    if (!g_scorePreviewOpen) return;
-    ImGui::SetNextWindowSize(ImVec2(S(980), S(700)), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(S(160), S(60)), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Score preview", &g_scorePreviewOpen)) {
-        // ---- rebuild when the project (or an option) changed
-        g_prevTimer += dt;
-        g_prevSpecTimer += dt;
-        if (g_proj.score.spectrum && g_prevSpecTimer > 2.f) { g_prevSpecTimer = 0.f; refreshScoreSpectrum(false); }
-        if (g_prevTimer > 0.2f) {
-            g_prevTimer = 0.f;
-            std::string sig = serializeProject(g_proj);
-            sig += g_prevDetailed ? "|d" : "|o";
-            sig += g_prevBW ? "|b" : "|c";
-            sig += g_scoreSpec.valid() ? "|s" + std::to_string(g_scoreSpec.data.size()) : "|n";
-            if (sig != g_prevSig) {
-                g_prevSig = std::move(sig);
-                ScoreRenderOptions opt;
-                opt.detailed = g_prevDetailed;
-                opt.blackWhite = g_prevBW;
-                opt.spectrum = g_scoreSpec.valid() ? &g_scoreSpec : nullptr;
-                const std::string fallback = g_projectPath.empty() ? std::string("Untitled") : std::filesystem::path(g_projectPath).stem().string();
-                g_prevErr.clear();
-                if (!buildScorePages(g_proj, fallback, opt, g_prevPages, g_prevErr)) g_prevPages.clear();
-            }
-        }
-        // ---- toolbar
-        if (ImGui::RadioButton("Overview", !g_prevDetailed)) { g_prevDetailed = false; g_prevPage = 0; g_prevSig.clear(); }
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Full score", g_prevDetailed)) { g_prevDetailed = true; g_prevSig.clear(); }
-        ImGui::SameLine();
-        if (ImGui::Checkbox("Black", &g_prevBW)) g_prevSig.clear();
-        ImGui::SameLine();
-        const int pageCount = (int)g_prevPages.size();
-        g_prevPage = std::max(0, std::min(g_prevPage, std::max(0, pageCount - 1)));
-        if (ImGui::Button("<") && g_prevPage > 0) --g_prevPage;
-        ImGui::SameLine();
-        ImGui::Text("page %d / %d", pageCount ? g_prevPage + 1 : 0, pageCount);
-        ImGui::SameLine();
-        if (ImGui::Button(">") && g_prevPage + 1 < pageCount) ++g_prevPage;
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(S(110));
-        ImGui::SliderFloat("##prevzoom", &g_prevZoom, 0.5f, 3.f, "zoom %.1f");
-        ImGui::SameLine();
-        if (ImGui::Button("Score editor")) g_scoreOpen = true;
-        ImGui::SameLine();
-        if (ImGui::Button("Export SVG")) generateScore(g_prevDetailed, g_prevBW);
-        if (!g_prevErr.empty()) ImGui::TextColored(ImVec4(0.95f, 0.5f, 0.3f, 1.f), "%s", g_prevErr.c_str());
-
-        // ---- the page
-        ImGui::BeginChild("##scpage", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
-        if (!g_prevPages.empty()) {
-            const ScorePage& pg = g_prevPages[(size_t)g_prevPage];
-            const float scale = std::max(0.2f, (ImGui::GetContentRegionAvail().x - S(8)) / (float)pg.w * g_prevZoom);
-            const ImVec2 org = ImGui::GetCursorScreenPos();
-            ImGui::Dummy(ImVec2((float)pg.w * scale, (float)pg.h * scale));
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->PushClipRect(org, ImVec2(org.x + (float)pg.w * scale, org.y + (float)pg.h * scale), true);
-            dl->AddRectFilled(org, ImVec2(org.x + (float)pg.w * scale, org.y + (float)pg.h * scale), IM_COL32(255, 255, 255, 255));
-            auto P = [&](float x, float y) { return ImVec2(org.x + x * scale, org.y + y * scale); };
-            auto C = [](uint32_t c) { return IM_COL32((c >> 24) & 255, (c >> 16) & 255, (c >> 8) & 255, c & 255); };
-            auto dashed = [&](ImVec2 a, ImVec2 b, ImU32 col, float th, float d0, float d1) {
-                const float dx = b.x - a.x, dy = b.y - a.y, len = std::sqrt(dx * dx + dy * dy);
-                if (len < 0.5f || d0 <= 0.f) { dl->AddLine(a, b, col, th); return; }
-                const float on = d0 * scale, off = std::max(d1, 1.f) * scale, step = on + off;
-                for (float t = 0.f; t < len; t += step) {
-                    const float t2 = std::min(len, t + on);
-                    dl->AddLine(ImVec2(a.x + dx * t / len, a.y + dy * t / len), ImVec2(a.x + dx * t2 / len, a.y + dy * t2 / len), col, th);
-                }
-            };
-            ImFont* font = ImGui::GetFont();
-            for (const ScorePrim& pr : pg.prims) {
-                const float th = std::max(1.f, pr.sw * scale);
-                switch (pr.kind) {
-                    case ScorePrim::Line:
-                        if (pr.stroke & 255) dashed(P(pr.x, pr.y), P(pr.w, pr.h), C(pr.stroke), th, pr.dash0, pr.dash1);
-                        break;
-                    case ScorePrim::Rect:
-                        if (pr.fill & 255) dl->AddRectFilled(P(pr.x, pr.y), P(pr.x + pr.w, pr.y + pr.h), C(pr.fill));
-                        if (pr.stroke & 255) dl->AddRect(P(pr.x, pr.y), P(pr.x + pr.w, pr.y + pr.h), C(pr.stroke), 0.f, 0, th);
-                        break;
-                    case ScorePrim::Polygon: {
-                        const size_t n = pr.pts.size() / 2;
-                        if ((pr.fill & 255) && n >= 4 && n % 2 == 0) {   // envelope: upper edge then lower edge reversed -> fill as quads
-                            const size_t m = n / 2;
-                            for (size_t i = 0; i + 1 < m; ++i) {
-                                ImVec2 q[4] = { P(pr.pts[2 * i], pr.pts[2 * i + 1]), P(pr.pts[2 * (i + 1)], pr.pts[2 * (i + 1) + 1]),
-                                                P(pr.pts[2 * (n - 2 - i)], pr.pts[2 * (n - 2 - i) + 1]), P(pr.pts[2 * (n - 1 - i)], pr.pts[2 * (n - 1 - i) + 1]) };
-                                dl->AddConvexPolyFilled(q, 4, C(pr.fill));
-                            }
-                        }
-                        if (pr.stroke & 255) {
-                            std::vector<ImVec2> v;
-                            for (size_t i = 0; i < n; ++i) v.push_back(P(pr.pts[2 * i], pr.pts[2 * i + 1]));
-                            if (v.size() >= 2) dl->AddPolyline(v.data(), (int)v.size(), C(pr.stroke), ImDrawFlags_Closed, th);
-                        }
-                        break;
-                    }
-                    case ScorePrim::Polyline: {
-                        const size_t n = pr.pts.size() / 2;
-                        if (!(pr.stroke & 255) || n < 2) break;
-                        if (pr.dash0 > 0.f) {
-                            for (size_t i = 0; i + 1 < n; ++i) dashed(P(pr.pts[2 * i], pr.pts[2 * i + 1]), P(pr.pts[2 * i + 2], pr.pts[2 * i + 3]), C(pr.stroke), th, pr.dash0, pr.dash1);
-                        } else {
-                            std::vector<ImVec2> v;
-                            for (size_t i = 0; i < n; ++i) v.push_back(P(pr.pts[2 * i], pr.pts[2 * i + 1]));
-                            dl->AddPolyline(v.data(), (int)v.size(), C(pr.stroke), 0, th);
-                        }
-                        break;
-                    }
-                    case ScorePrim::Ellipse: {
-                        const float a = pr.angle * 3.14159265f / 180.f, ca = std::cos(a), sa = std::sin(a);
-                        ImVec2 v[14];
-                        for (int i = 0; i < 14; ++i) {
-                            const float t = (float)i / 14.f * 6.2831853f, ex = pr.w * std::cos(t), ey = pr.h * std::sin(t);
-                            v[i] = P(pr.x + ex * ca - ey * sa, pr.y + ex * sa + ey * ca);
-                        }
-                        dl->AddConvexPolyFilled(v, 14, C(pr.fill));
-                        break;
-                    }
-                    case ScorePrim::Circle:
-                        if (pr.fill & 255) dl->AddCircleFilled(P(pr.x, pr.y), std::max(0.8f, pr.w * scale), C(pr.fill));
-                        if (pr.stroke & 255) dl->AddCircle(P(pr.x, pr.y), std::max(0.8f, pr.w * scale), C(pr.stroke), 0, th);
-                        break;
-                    case ScorePrim::Text: {
-                        const float fs = pr.size * scale;
-                        if (fs < 4.f) break;   // too small to read
-                        ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0.f, pr.text.c_str());
-                        float x = pr.x * scale;
-                        if (pr.anchor == 1) x -= sz.x * 0.5f; else if (pr.anchor == 2) x -= sz.x;
-                        const ImVec2 pos(org.x + x, org.y + pr.y * scale - fs * 0.82f);
-                        dl->AddText(font, fs, pos, C(pr.fill), pr.text.c_str());
-                        if (pr.bold) dl->AddText(font, fs, ImVec2(pos.x + 0.6f, pos.y), C(pr.fill), pr.text.c_str());
-                        break;
-                    }
-                }
-            }
-            dl->PopClipRect();
-        }
-        ImGui::EndChild();
-    }
-    ImGui::End();
-}
-
 void drawScoreEditor() {
     if (!g_scoreOpen) return;
     ImGui::SetNextWindowSize(ImVec2(S(680), S(720)), ImGuiCond_FirstUseEver);
@@ -1484,21 +1351,34 @@ void drawScoreEditor() {
         ScoreInfo& sc = g_proj.score;
         const float labelW = S(120);
         auto row = [&](const char* name) { ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(name); ImGui::SameLine(labelW); ImGui::SetNextItemWidth(S(400)); };
-        ImGui::TextDisabled("Score for contemporary music. Saved with the project; clip names + Info text become the labels.");
-        if (ImGui::Button("Open live preview")) g_scorePreviewOpen = true;
-        ImGui::SameLine();
-        if (ImGui::Button("Load 3-min example")) { buildScoreExample(); g_scorePreviewOpen = true; }
-        ImGui::SameLine();
-        ImGui::TextDisabled("change anything, the preview updates at once");
+        ImGui::TextDisabled("Score for contemporary music. Muted tracks and clips are not drawn, like in an audio render.");
         if (ImGui::BeginTabBar("##score_tabs")) {
             if (ImGui::BeginTabItem("Piece")) {
-                row("Title");    inputStr("##sc_title", sc.title, 0);
-                row("Subtitle"); inputStr("##sc_sub", sc.subtitle, 0);
-                row("Composer"); inputStr("##sc_comp", sc.composer, 0);
+                row("Title");     inputStr("##sc_title", sc.title, 0);
+                row("Subtitle");  inputStr("##sc_sub", sc.subtitle, 0);
+                row("Composer");  inputStr("##sc_comp", sc.composer, 0);
+                row("Copyright"); inputStr("##sc_copy", sc.copyright, 0);
                 row("Cover notes");
-                inputMulti("##sc_notes", sc.notes, ImVec2(S(400), S(70)));
-                row("Piece is for");
-                ImGui::Combo("##sc_mode", &sc.mode, "Electronics only (no 5-line staves)\0Instruments + electronics\0");
+                inputMulti("##sc_notes", sc.notes, ImVec2(S(400), S(90)));
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Layout")) {
+                row("Clip analysis");
+                ImGui::Checkbox("Render audio measures every clip##sc_an", &sc.analyze);
+                if (ImGui::IsItemHovered()) helpTip("While rendering, every clip is measured (loudness, where its spectrum sits) and the data sent to the channel \"score\" is recorded. The score then draws the real shape of each sound. Press Render audio after changing sounds.");
+                row("Line weight");
+                float lw = (float)sc.lineWeight;
+                if (ImGui::SliderFloat("##sc_lw", &lw, 0.4f, 3.f, "%.2f x")) sc.lineWeight = lw;
+                row("Seconds / system");
+                float v = (float)sc.sysSec;
+                if (ImGui::SliderFloat("##sc_sys", &v, 10.f, 300.f, "%.0f s")) sc.sysSec = v;
+                ImGui::TextDisabled("How many seconds fit on one line of the score: more seconds = a denser line.");
+                row("Systems / page");
+                ImGui::InputInt("##sc_spp", &sc.systemsPerPage, 1, 1);
+                sc.systemsPerPage = std::min(12, std::max(0, sc.systemsPerPage));
+                ImGui::SameLine(); ImGui::TextDisabled("0 = as many as fit");
+                ImGui::Checkbox("Cover page (lanes, sections, notes, key)", &sc.coverPage);
+                ImGui::Checkbox("Cue list pages (all clip texts)", &sc.eventList);
                 ImGui::Checkbox("Spectrum lane (spectrogram of the rendered audio)", &sc.spectrum);
                 if (sc.spectrum) {
                     ImGui::SameLine();
@@ -1506,34 +1386,6 @@ void drawScoreEditor() {
                     if (g_scoreSpecMsg.empty()) refreshScoreSpectrum(false);
                     ImGui::TextDisabled("%s", g_scoreSpecMsg.c_str());
                 }
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Full score")) {
-                ImGui::TextDisabled("Pages read left to right, top to bottom, page after page (A4 landscape).");
-                row("Tempo (bpm)");
-                float bpm = (float)sc.tempo;
-                if (ImGui::InputFloat("##sc_bpm", &bpm, 1.f, 10.f, "%.0f")) sc.tempo = bpm <= 0.f ? 0.0 : std::min(400.0, std::max(20.0, (double)bpm));
-                ImGui::SameLine(); ImGui::TextDisabled("0 = time only (seconds)");
-                if (sc.tempo > 0.0) {
-                    row("Time signature");
-                    ImGui::SetNextItemWidth(S(60));
-                    ImGui::InputInt("##sc_mn", &sc.meterNum, 0, 0);
-                    sc.meterNum = std::min(32, std::max(1, sc.meterNum));
-                    ImGui::SameLine(); ImGui::TextUnformatted("/"); ImGui::SameLine();
-                    int di = sc.meterDen == 2 ? 0 : sc.meterDen == 8 ? 2 : sc.meterDen == 16 ? 3 : 1;
-                    ImGui::SetNextItemWidth(S(70));
-                    if (ImGui::Combo("##sc_md", &di, "2\0004\0008\00016\0")) sc.meterDen = di == 0 ? 2 : di == 2 ? 8 : di == 3 ? 16 : 4;
-                    ImGui::TextDisabled("Barlines and bar numbers appear; every system ends on a barline.");
-                }
-                row("Seconds / system");
-                float v = (float)sc.sysSec;
-                if (ImGui::SliderFloat("##sc_sys", &v, 10.f, 300.f, "%.0f s")) sc.sysSec = v;
-                row("Systems / page");
-                ImGui::InputInt("##sc_spp", &sc.systemsPerPage, 1, 1);
-                sc.systemsPerPage = std::min(12, std::max(0, sc.systemsPerPage));
-                ImGui::SameLine(); ImGui::TextDisabled("0 = as many as fit");
-                ImGui::Checkbox("Cover page (lanes, sections, notes, key)", &sc.coverPage);
-                ImGui::Checkbox("Cue list pages (all clip texts)", &sc.eventList);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Sections and markers")) {
@@ -1556,74 +1408,39 @@ void drawScoreEditor() {
                 }
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Lanes")) {
-                ImGui::Checkbox("Tracks with the same name are ONE lane", &sc.mergeSameName);
-                ImGui::TextDisabled("Rename a track (or its score name) to move it into another lane.");
-                ImGui::Separator();
-                ImGui::TextUnformatted("What the score shows now");
+            if (ImGui::BeginTabItem("Map")) {
+                ImGui::Checkbox("Lanes with the same name are ONE lane", &sc.mergeSameName);
+                ImGui::TextDisabled("Resulting lanes of the score:");
                 for (const ScoreLaneInfo& li : scoreLaneSummary(g_proj)) {
-                    std::string tr;
-                    for (size_t i = 0; i < li.tracks.size(); ++i) tr += (i ? ", " : "") + li.tracks[i];
-                    ImGui::BulletText("%s  [%s%s]  <- %s", li.name.c_str(), li.staff ? (li.noClef ? "staff, no clef" : "staff") : "graphic", li.merged ? ", merged by name" : "", tr.c_str());
+                    std::string from;
+                    for (size_t i = 0; i < li.tracks.size(); ++i) from += (i ? ", " : "") + li.tracks[i];
+                    ImGui::BulletText("%s  [%s%s]  <- %s", li.name.c_str(), li.staff ? "staff" : "graphic", li.merged ? ", merged" : "", from.c_str());
                     if (!li.automation.empty()) {
                         std::string am;
                         for (size_t i = 0; i < li.automation.size(); ++i) am += (i ? ", " : "") + li.automation[i];
-                        ImGui::Indent(S(24)); ImGui::TextDisabled("automation lanes: %s", am.c_str()); ImGui::Unindent(S(24));
+                        ImGui::Indent(S(24)); ImGui::TextDisabled("automation: %s", am.c_str()); ImGui::Unindent(S(24));
                     }
                 }
                 ImGui::Separator();
-                ImGui::TextUnformatted("Your own lanes (optional): put tracks or single clips into them");
-                int del = -1, up = -1;
-                for (int i = 0; i < (int)sc.lanes.size(); ++i) {
-                    ScoreLaneDef& l = sc.lanes[(size_t)i];
-                    ImGui::PushID(l.id + 5000);
-                    ImGui::SetNextItemWidth(S(170));
-                    inputStr("##ln_name", l.name, 0);
-                    if (sc.mode == 1) {
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(S(170));
-                        ImGui::Combo("##ln_kind", &l.kind, "Auto\0Instrument (5 lines)\0Electronics (graphic)\0");
-                        if (l.kind == 1) {
-                            ImGui::SameLine();
-                            ImGui::SetNextItemWidth(S(100));
-                            ImGui::Combo("##ln_clef", &l.clef, "Clef auto\0Treble\0Bass\0No clef\0");
-                        }
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("up")) up = i;
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("x")) del = i;
-                    ImGui::SetNextItemWidth(S(330));
-                    inputStr("##ln_sub", l.sub, 0);
-                    ImGui::SameLine(); ImGui::TextDisabled("small line (instrument, speakers, sample file)");
-                    ImGui::PopID();
-                }
-                if (up > 0) std::swap(sc.lanes[(size_t)up], sc.lanes[(size_t)up - 1]);
-                if (del >= 0) scoreDeleteLane((size_t)del);
-                if (ImGui::Button("+ Lane")) {
-                    ScoreLaneDef l;
-                    l.id = sc.nextLaneId++;
-                    l.name = "Lane " + std::to_string(sc.lanes.size() + 1);
-                    sc.lanes.push_back(l);
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Create lanes from tracks")) scoreCreateLanesFromTracks();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Makes one lane for every track name that has no lane yet");
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Tracks and clips")) {
                 for (size_t ti = 0; ti < g_proj.tracks.size(); ++ti) {
                     Track& t = g_proj.tracks[ti];
                     ImGui::PushID((int)ti + 1000);
                     if (ImGui::TreeNode(t.name.c_str())) {
                         drawTrackScoreMenu(t);
-                        if (!t.clips.empty() && ImGui::TreeNode("Clips")) {
-                            for (Clip& c : t.clips) {
-                                ImGui::PushID(c.id);
-                                if (ImGui::TreeNode(c.name.c_str())) { drawClipScoreMenu(c, (int)ti); ImGui::TreePop(); }
-                                ImGui::PopID();
-                            }
-                            ImGui::TreePop();
+                        if (trackHasMidi(t)) { ImGui::Separator(); drawMidiScoreMenu(t); }
+                        for (const auto& lane : t.automation) {
+                            if (lane.second.empty()) continue;
+                            ImGui::Separator();
+                            ImGui::PushID(lane.first.c_str());
+                            drawAutoScoreMenu(t, lane.first);
+                            ImGui::PopID();
+                        }
+                        for (Clip& c : t.clips) {
+                            ImGui::Separator();
+                            ImGui::PushID(c.id);
+                            ImGui::TextUnformatted(c.name.c_str());
+                            drawClipScoreMenu(c, &t);
+                            ImGui::PopID();
                         }
                         ImGui::TreePop();
                     }
@@ -1645,220 +1462,15 @@ void drawScoreEditor() {
     ImGui::End();
 }
 
-struct ExRng {
-    uint32_t s;
-    double next() { s = s * 1664525u + 1013904223u; return ((s >> 8) & 0xFFFF) / 65535.0; }
-};
-
-std::vector<int> exScale(int root, const std::vector<int>& steps, int octaves) {
-    std::vector<int> out;
-    for (int o = 0; o < octaves; ++o) for (int st : steps) out.push_back(root + 12 * o + st);
-    return out;
-}
-
-// One Csound clip + one free MIDI clip with a wandering melodic line.
-void exPhrase(int lane, double s, double e, const char* code, const std::string& name, const std::string& info,
-              const std::vector<int>& scale, int center, int amp, double noteLen, int vel, uint32_t seed) {
-    addClip(lane, s, e - s, code, name);
-    Track& tr = g_proj.tracks[(size_t)lane];
-    Clip& c = tr.clips.back();
-    c.note = info;
-    MidiClip mc;
-    mc.id = newMidiId();
-    mc.clipId = c.id;
-    mc.start = s;
-    mc.dur = e - s;
-    ExRng r{seed * 2654435761u + 12345u};
-    double t = 0.0;
-    int k = 0;
-    while (t < mc.dur - 0.4) {
-        double len = noteLen * (0.5 + r.next() * 1.1);
-        if (t + len > mc.dur) len = mc.dur - t;
-        int idx = center + (int)std::lround(amp * std::sin(k * 0.55 + seed) + (r.next() - 0.5) * 3.0);
-        idx = std::max(0, std::min((int)scale.size() - 1, idx));
-        MidiNote n;
-        n.start = t;
-        n.dur = std::max(0.1, len * 0.92);
-        n.pitch = scale[(size_t)idx];
-        n.velocity = std::max(1, std::min(127, vel + (int)((r.next() - 0.5) * 24.0)));
-        mc.notes.push_back(n);
-        t += len;
-        if (r.next() < 0.18) t += noteLen * 0.5;
-        ++k;
-    }
-    tr.midiClips.push_back(std::move(mc));
-}
-
-// A slow chord: notes enter one after the other and ring until the end of the clip.
-void exChord(int lane, double s, double e, const char* code, const std::string& name, const std::string& info, const std::vector<int>& pitches, int vel) {
-    addClip(lane, s, e - s, code, name);
-    Track& tr = g_proj.tracks[(size_t)lane];
-    Clip& c = tr.clips.back();
-    c.note = info;
-    MidiClip mc;
-    mc.id = newMidiId();
-    mc.clipId = c.id;
-    mc.start = s;
-    mc.dur = e - s;
-    for (size_t i = 0; i < pitches.size(); ++i) {
-        MidiNote n;
-        n.start = 0.8 * (double)i;
-        n.dur = std::max(0.5, mc.dur - n.start - 0.1);
-        n.pitch = pitches[i];
-        n.velocity = vel;
-        mc.notes.push_back(n);
-    }
-    tr.midiClips.push_back(std::move(mc));
-}
-
-void exAuto(int lane, const std::string& channel, std::initializer_list<AutoPoint> pts) {
-    Track& tr = g_proj.tracks[(size_t)lane];
-    tr.automation[channel] = std::vector<AutoPoint>(pts);
-    tr.automationHeights[channel] = 42.f;
-}
-
-// File > Load 3-min score example: a ready 3 minute piece (clarinet, kamancheh, cello, pad, granular texture, noise bed)
-// with sections, time markers and automation, to try the score export and the score editor.
-void buildScoreExample() {
-    if (g_playing) stopPlayback();
-    const CsoundSettings keep = g_proj.cs;
-    g_proj = Project();
-    g_proj.cs = keep;
-    g_proj.cs.renderFile = "gloom_guardian.wav";
-    g_codeEditors.clear();
-    g_clipCodeEditors.clear();
-    g_selMidiClips.clear();
-    g_mcDragId = -1;
-    g_midiDragTrackId = g_midiDragNote = -1;
-    g_midiSelectedTrackId = g_midiSelectedNote = -1;
-    g_nextTrackId = 1;
-    g_nextClipId = 1;
-    clearAutoSelection();
-
-    const std::vector<int> phrygian = {0, 1, 4, 5, 7, 8, 10};   // D phrygian dominant, a good colour for clarinet + kamancheh
-    const std::vector<int> clarScale = exScale(62, phrygian, 3);
-    const std::vector<int> kamScale = exScale(64, phrygian, 3);
-    const std::vector<int> celloScale = exScale(38, phrygian, 2);
-
-    const int clar = addTrack("Clarinet", kLead);
-    exPhrase(clar, 6, 20, kLead, "Clar1", "opening, soft", clarScale, 7, 4, 0.9, 50, 1);
-    exPhrase(clar, 30, 46, kLead, "Clar2", "answers the pad", clarScale, 9, 5, 0.8, 60, 2);
-    exPhrase(clar, 58, 84, kLead, "Clar3", "long arch", clarScale, 10, 6, 1.1, 75, 3);
-    exPhrase(clar, 100, 128, kLead, "Clar4", "time turns", clarScale, 8, 6, 0.7, 95, 4);
-    exPhrase(clar, 140, 160, kLead, "Clar5", "falling", clarScale, 11, 5, 1.2, 70, 5);
-    exPhrase(clar, 164, 178, kLead, "Clar6", "last breath", clarScale, 6, 3, 1.6, 40, 6);
-
-    const int kam = addTrack("Kamancheh", kLeadPluck);
-    exPhrase(kam, 12, 34, kLeadPluck, "Kam1", "ornamented line", kamScale, 8, 5, 0.6, 70, 11);
-    exPhrase(kam, 48, 76, kLeadPluck, "Kam2", "with the noise bed", kamScale, 10, 6, 0.55, 85, 12);
-    exPhrase(kam, 88, 118, kLeadPluck, "Kam3", "fast, nervous", kamScale, 9, 7, 0.4, 100, 13);
-    exPhrase(kam, 130, 156, kLeadPluck, "Kam4", "slows down", kamScale, 7, 4, 1.0, 75, 14);
-    exPhrase(kam, 160, 178, kLeadPluck, "Kam5", "fades", kamScale, 5, 3, 1.4, 45, 15);
-
-    const int cello = addTrack("Cello", kBassDeep);
-    exPhrase(cello, 0, 38, kBassDeep, "Cello1", "slow roots", celloScale, 4, 3, 3.2, 70, 21);
-    exPhrase(cello, 96, 138, kBassDeep, "Cello2", "pulse under the noise", celloScale, 5, 4, 2.4, 95, 22);
-    exPhrase(cello, 150, 180, kBassDeep, "Cello3", "sinks", celloScale, 3, 3, 3.6, 60, 23);
-
-    const int pad = addTrack("Pad", kPad);
-    exChord(pad, 0, 48, kPad, "Pad1", "D drone", {50, 57, 65}, 60);
-    exChord(pad, 96, 150, kPad, "Pad2", "tension", {50, 56, 62, 69}, 80);
-    exChord(pad, 150, 180, kPad, "Pad3", "open fifth", {38, 50, 57}, 50);
-
-    const int tex = addTrack("Granular texture", kRunDemo);
-    addClip(tex, 8, 22, kRunDemo, "Tex1");
-    g_proj.tracks[(size_t)tex].clips.back().runs = 3;
-    g_proj.tracks[(size_t)tex].clips.back().note = "sparse grains";
-    g_proj.tracks[(size_t)tex].clips.back().scoreStyle = 2;
-    addClip(tex, 70, 26, kRunDemo, "Tex2");
-    g_proj.tracks[(size_t)tex].clips.back().runs = 5;
-    g_proj.tracks[(size_t)tex].clips.back().note = "dense, rising";
-    addClip(tex, 118, 30, kRunDemo, "Tex3");
-    g_proj.tracks[(size_t)tex].clips.back().runs = 6;
-    g_proj.tracks[(size_t)tex].clips.back().note = "swarm";
-    g_proj.tracks[(size_t)tex].clips.back().scoreStyle = 2;
-
-    const int noise = addTrack("Noise bed", kNoiseBed);
-    addClip(noise, 36, 68, kNoiseBed, "Noise1");
-    g_proj.tracks[(size_t)noise].clips.back().note = "rises with the filter";
-    addClip(noise, 128, 52, kNoiseBed, "Noise2");
-    g_proj.tracks[(size_t)noise].clips.back().note = "burns out";
-
-    exAuto(noise, "cutoff", {{0, 400}, {36, 400}, {104, 6000}, {128, 900}, {180, 200}});
-    exAuto(noise, "volume", {{0, 0.1}, {60, 0.35}, {104, 0.5}, {128, 0.3}, {180, 0.05}});
-    exAuto(cello, "drive", {{0, 1.5}, {100, 4.0}, {180, 2.0}});
-    exAuto(kam, "bright", {{0, 2500}, {60, 6000}, {118, 1200}, {180, 800}});
-    exAuto(pad, "detune", {{0, 0.01}, {96, 0.08}, {180, 0.02}});
-    g_proj.tracks[(size_t)noise].scoreAuto["volume"] = 2;
-    g_proj.tracks[(size_t)noise].scoreAuto["cutoff"] = 1;
-    g_proj.tracks[(size_t)kam].scoreAuto["bright"] = 1;
-    g_proj.tracks[(size_t)cello].scoreAuto["drive"] = 2;
-
-
-    // score lanes: three instruments + one electronics line that holds three tracks
-    {
-        ScoreInfo& sl = g_proj.score;
-        auto addLane = [&](const std::string& name, const std::string& subText, int kind, int clef) {
-            ScoreLaneDef l;
-            l.id = sl.nextLaneId++;
-            l.name = name; l.sub = subText; l.kind = kind; l.clef = clef;
-            sl.lanes.push_back(l);
-            return l.id;
-        };
-        g_proj.tracks[(size_t)clar].scoreLane = addLane("Clarinet in Bb", "", 1, 1);
-        g_proj.tracks[(size_t)kam].scoreLane = addLane("Kamancheh", "", 1, 1);
-        g_proj.tracks[(size_t)cello].scoreLane = addLane("Cello", "", 1, 2);
-        const int el = addLane("Electronics", "4 speakers", 2, 0);
-        g_proj.tracks[(size_t)pad].scoreLane = el;
-        g_proj.tracks[(size_t)tex].scoreLane = el;
-        g_proj.tracks[(size_t)noise].scoreLane = el;
-        // frequency band (vertical position on the electronics axis) of every electronic clip
-        auto band = [&](int lane, const char* nm, double lo, double hi) {
-            for (Clip& c : g_proj.tracks[(size_t)lane].clips) if (c.name == nm) { c.scoreFreqLo = lo; c.scoreFreqHi = hi; }
-        };
-        band(pad, "Pad1", 80, 400);   band(pad, "Pad2", 100, 900);   band(pad, "Pad3", 60, 300);
-        band(tex, "Tex1", 800, 6000); band(tex, "Tex2", 1500, 9000); band(tex, "Tex3", 2000, 12000);
-        band(noise, "Noise1", 300, 3000); band(noise, "Noise2", 200, 6000);
-        g_proj.score.spectrum = true;
-        // the fast kamancheh clip is shown as an overall up / down line instead of every note
-        for (Clip& c : g_proj.tracks[(size_t)kam].clips) if (c.name == "Kam3") c.scoreMidi = 1;
-        // dynamics (hairpins) on a few clips
-        auto dyn = [&](int lane, const char* nm, const char* d) { for (Clip& c : g_proj.tracks[(size_t)lane].clips) if (c.name == nm) c.scoreDynamic = d; };
-        dyn(clar, "Clar1", "p"); dyn(clar, "Clar3", "mp<f"); dyn(clar, "Clar6", "p>pp");
-        dyn(noise, "Noise1", "pp<ff"); dyn(noise, "Noise2", "ff>pp"); dyn(tex, "Tex2", "p<f");
-    }
-
-    ScoreInfo& sc = g_proj.score;
-    sc.title = "Gloom Guardian";
-    sc.subtitle = "Dance of Sorrow  -  3 minute example";
-    sc.composer = "Parham Izadyar";
-    sc.sysSec = 45.0;
-    sc.tempo = 80.0;            // 80 bpm, 4/4: one bar = 3 s, a system of 45 s = 15 bars
-    sc.meterNum = 4; sc.meterDen = 4;
-    sc.mode = 1;
-    sc.notes = "Clarinet and kamancheh play from the written staves.\nThe cello follows its staff in bass clef.\nElectronics (pad, granular texture, noise bed) follow the graphic shapes: thickness = density, dots = grains.\nAutomation (filter, volume, bright, drive, detune) has its own lane under the instrument it belongs to.";
-    sc.sections = {{0, "A", "low pad, clarinet"}, {40, "B", "kamancheh enters"}, {100, "C", "time turns"}, {140, "D", "dissolve"}};
-    sc.markers = {{100, "time turns", ""}, {150, "last gesture", ""}};
-
-    normalizeClips();
-    g_trackCounter = (int)g_proj.tracks.size();
-    g_selTrack = g_selClip = -1;
-    g_play = 0.0;
-    g_projectPath.clear();
-    historyReset();
-    logLine("[caw] Loaded the 3-minute score example. Open Score > Score editor to edit sections, markers and lanes, then Score > Full score to export.");
-}
-
 void drawMainMenuBar() {
     if (!ImGui::BeginMenuBar()) return;
     if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Open project...")) openProject();
+        if (ImGui::MenuItem("New project", "Ctrl+N")) newProject();
+        if (ImGui::MenuItem("Open project...", "Ctrl+O")) openProject();
         if (ImGui::MenuItem("Save", "Ctrl+S")) saveProject(false);
         if (ImGui::MenuItem("Save As...")) saveProject(true);
         ImGui::Separator();
-        if (ImGui::MenuItem("Load 3-min score example")) buildScoreExample();
-        ImGui::Separator();
-        if (ImGui::MenuItem("Exit", "Ctrl+Q")) g_quitRequested = true;
+        if (ImGui::MenuItem("Exit", "Ctrl+Q")) appRequestClose();
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Edit")) {
@@ -1866,7 +1478,8 @@ void drawMainMenuBar() {
         if (ImGui::MenuItem("Redo", "Ctrl+Y", false, canRedo())) redo();
         ImGui::Separator();
         if (ImGui::MenuItem("Select tool", "1", g_tool == Tool::Select)) g_tool = Tool::Select;
-        if (ImGui::MenuItem("Pen tool (draw automation)", "8", g_tool == Tool::Pen)) g_tool = Tool::Pen;
+        if (ImGui::MenuItem("Pen 1 (draw automation, simplified to few dots)", "8", g_tool == Tool::Pen)) g_tool = Tool::Pen;
+        if (ImGui::MenuItem("Pen 2 (draw automation, keeps every dot)", "9", g_tool == Tool::Pen2)) g_tool = Tool::Pen2;
         if (ImGui::MenuItem("Cut tool (split MIDI regions)", "3", g_tool == Tool::Cut)) g_tool = Tool::Cut;
         if (ImGui::MenuItem("Join MIDI regions", "4", g_tool == Tool::Join)) runJoinTool();
         ImGui::Separator();
@@ -1881,13 +1494,12 @@ void drawMainMenuBar() {
     }
     if (ImGui::BeginMenu("View")) {
         ImGui::MenuItem("Monitor panel", nullptr, &g_showMonitor);
+        ImGui::MenuItem("Help panel (bottom)", nullptr, &g_helpOn);
         ImGui::Separator();
-        ImGui::MenuItem("Master meter", nullptr, &g_viewMeter);
+        ImGui::MenuItem("Master meter (right panel)", nullptr, &g_viewMeter);
         ImGui::MenuItem("Spectrum", nullptr, &g_viewSpectrum);
         ImGui::MenuItem("Signal scope", nullptr, &g_viewScope);
         ImGui::MenuItem("Console", nullptr, &g_viewConsole);
-        ImGui::Separator();
-        ImGui::MenuItem("Demo signal (test tones)", nullptr, &g_demo);
         ImGui::Separator();
         ImGui::TextDisabled("Timeline");
         if (ImGui::MenuItem("Hide / show all automation lanes", "Alt+H")) toggleHideAllAutomation();
@@ -1905,9 +1517,7 @@ void drawMainMenuBar() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Score")) {
-        if (ImGui::MenuItem("Score preview (live)...")) g_scorePreviewOpen = true;
         if (ImGui::MenuItem("Score editor...")) g_scoreOpen = true;
-        if (ImGui::MenuItem("Load 3-min example + preview")) { buildScoreExample(); g_scorePreviewOpen = true; g_scoreOpen = true; }
         ImGui::Separator();
         if (ImGui::MenuItem("Overview, one page (colour)")) generateScore(false, false);
         if (ImGui::MenuItem("Overview, one page (black)")) generateScore(false, true);
@@ -2011,7 +1621,7 @@ void pollMonitor() {
 void drainPlayOutput() {
     for (const std::string& l : g_playProc.takeOutput()) {
         if (handleMonitorLine(l)) continue;
-        logLine(clipLineMessage(l));
+        logCsoundLine(l);
     }
 }
 
@@ -2035,17 +1645,18 @@ void stopPlayback() {
     g_playWaiting = false;
 }
 
-// liveMode = "Play Csound": CsoundQt-style run of the WHOLE project from 0:00 (every instrument defined,
+// liveMode = "Run": CsoundQt-style run of the WHOLE project from 0:00 (every instrument defined,
 // the timeline clips only trigger instruments, Csound stays alive until Stop).
 void startPlaybackNow(bool liveMode) {
     if (g_renderActive) { logLine("[caw] A render is running - wait for it or cancel it first."); return; }
-    const std::string csdPath = std::filesystem::absolute("caw_play.csd").string();
+    diagClearAll();
+    const std::string csdPath = (workDir() / "caw_play.csd").string();
     if (!writeTextFile(csdPath, buildCsd(g_proj, liveMode ? "engine" : "dac", g_play, &g_orcSpans))) {
         logLine("[caw] ERROR: could not write " + csdPath);
         return;
     }
     const std::string cmd = "\"" + csoundExePath() + "\" \"" + csdPath + "\"";
-    logLine(liveMode ? "[caw] Play Csound (engine runs like CsoundQt until Stop; the timeline only triggers instruments): " + cmd
+    logLine(liveMode ? "[caw] Run (engine runs like CsoundQt until Stop; the timeline only triggers instruments): " + cmd
                      : "[caw] Play from " + std::to_string(g_play) + " s: " + cmd);
     if (!g_playProc.start(cmd, false)) {
         logLine("[caw] ERROR: " + g_playProc.lastError());
@@ -2066,6 +1677,7 @@ void startPlaybackNow(bool liveMode) {
     g_monSeen = false;
     g_monWarned = false;
     g_monRunT = 0.f;
+    g_scopeDivSent = false;
     g_playing = true;
     g_liveCsound = liveMode;
     g_playWaiting = true;
@@ -2076,9 +1688,11 @@ void startPlaybackNow(bool liveMode) {
 
 void startRenderNow() {
     if (g_renderActive) return;
+    diagClearAll();
     if (g_playing) stopPlayback();
-    const std::string csdPath = std::filesystem::absolute("caw_render.csd").string();
-    g_renderPath = std::filesystem::absolute(g_proj.cs.renderFile.empty() ? "render.wav" : g_proj.cs.renderFile).string();
+    const std::string csdPath = (workDir() / "caw_render.csd").string();
+    g_renderPath = renderFilePath().string();
+    { std::error_code rec; std::filesystem::remove(scoreProbePath(), rec); }   // the score probe writes a fresh file
     if (!writeTextFile(csdPath, buildCsd(g_proj, "render", 0.0, &g_orcSpans))) {
         logLine("[caw] ERROR: could not write " + csdPath);
         return;
@@ -2093,7 +1707,7 @@ void startRenderNow() {
 }
 
 void startPlayback(bool liveMode) { ensurePdRendered([liveMode] { startPlaybackNow(liveMode); }); }
-void startRender() { ensurePdRendered([] { startRenderNow(); }); }
+void startRender() { g_runMask = 7; ensurePdRendered([] { startRenderNow(); }); }
 
 void cancelRender() {
     g_renderProc.stop();
@@ -2126,7 +1740,7 @@ void collectTimelineEvents(double t0, double t1, bool active, double now, std::v
     for (const Track& t : g_proj.tracks) {
         if (t.muted || (anySolo && !t.solo)) continue;
         for (const Clip& clip : t.clips) {
-            if (clip.muted) continue;
+            if (clip.muted || !langOn(clip.lang)) continue;
             const ParsedTrack pc = parseClip(clip);
             if (pc.midiEnabled) {
                 // played by its MIDI clips below
@@ -2138,7 +1752,7 @@ void collectTimelineEvents(double t0, double t1, bool active, double now, std::v
         }
         for (const MidiClip& mc : t.midiClips) {
             const Clip* target = findClip(mc.clipId);
-            if (!target || target->muted) continue;
+            if (!target || target->muted || !langOn(target->lang)) continue;
             if (target->lang >= 1) {   // Pure Data / SuperCollider: the notes are inside the rendered wav (timeline 0 s = wav 0 s), start it once
                 if (pdMidiStarted.insert(target->id).second) emit(target->name, 0.0, midiWavLength(g_proj, target->id), 0.f, 0.f, true);
                 continue;
@@ -2198,7 +1812,7 @@ void silenceEngine() {
 
 void tickTimeline(float dt) {
     // The timeline only moves the playhead and, if the Csound engine is up, triggers its instruments.
-    // It never starts Csound by itself: that is the job of the "Play Csound" button.
+    // It never starts Csound by itself: that is the job of the "Run" button.
     const double lookahead = 0.06;
     if (g_drag == Drag::Playhead) { g_resync = 2; return; }  // wait until the playhead is released
     const bool engineUp = g_liveCsound && !g_playWaiting && g_playProc.running();
@@ -2258,12 +1872,16 @@ std::vector<PdJob> g_pdQueue;
 PdJob g_pdCurrent;
 bool g_pdBusy = false;
 bool g_pdErrorSeen = false;
+std::string g_pdPrevText;                  // Pd: the previous output line ("osc~x 440" comes before its "... couldn't create")
+bool g_scSkip = false;                     // SuperCollider: inside RECEIVER / CALL STACK (names there contain "Error", they are no errors)
+int g_pdJobErrors = 0;                     // error rows of this render so far
+std::map<std::string, int> g_pdRepeat;     // error text -> how many times it came again during this render (shown once, counted)
 float g_pdT = 0.f;
 std::function<void()> g_afterPd;
 std::map<std::string, size_t> g_pdDone;           // clip name -> hash of what was rendered
 
 std::string pdPatchDir() {
-    const std::filesystem::path dir = std::filesystem::absolute("caw_pd");
+    const std::filesystem::path dir = workDir() / "caw_pd";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     return dir.string();
@@ -2336,14 +1954,18 @@ bool startScJob(const PdJob& job) {
     auto fwd = [](std::string s) { std::replace(s.begin(), s.end(), '\\', '/'); return s; };
     std::error_code ec;
     fs::remove(dir / (job.name + ".wav"), ec);
+    diagClearClip(job.name);
     std::ostringstream o;
     o << std::setprecision(9);
-    o << "(\nvar dur, sr, nch, def, events, opts;\n";
+    o << "(\nvar dur, sr, nch, def, events, opts;\n~cawOk = true;\n";   // ~cawOk: the wrapper below checks that the script compiled and started
+
     o << "dur = " << std::max(0.05, job.dur) << "; sr = " << sr << "; nch = " << nCh << ";\n";
     const int copies = std::min(256, std::max(1, job.copies));
     o << "try {\n";
     // p4, p5 ... (the <caw> {p: ...} lines, or the MIDI pitch / velocity) and indx / iRun are plain variables inside the code
-    o << "def = SynthDef(\\cawsc, {\n  var sig = {\n" << scParamDeclarations(job.code, job.pv) << job.code << "\n  }.value;\n";
+    o << "def = SynthDef(\\cawsc, {\n  var sig = {\n" << scParamDeclarations(job.code, job.pv);
+    { const std::string soFar = o.str(); g_scCodeLine = 1 + (int)std::count(soFar.begin(), soFar.end(), '\n'); }   // the clip code starts on this line of the script (sclang error lines count from here)
+    o << job.code << "\n  }.value;\n";
     o << "  sig = sig.asArray;\n  if(sig.size == 1, { sig = [sig[0], sig[0]] });\n";
     o << "  sig = (sig ++ (0 ! nch)).keep(nch);\n";
     o << "  sig = sig.collect({ |s| if(s.rate == \\control, { K2A.ar(s) }, { s }) });\n";
@@ -2399,8 +2021,22 @@ bool startScJob(const PdJob& job) {
         logLine("[caw] ERROR: could not write the SuperCollider script in " + dir.string());
         return false;
     }
+    // sclang does not stop when a script does not compile (syntax error, unknown variable or class) and, with its output going to a pipe,
+    // keeps the error message in a buffer: nothing reached the console and the render ran into the timeout. The wrapper loads the script,
+    // and if the script did not start it tells so and quits, which also writes out sclang's messages (line N char M of the error).
+    const fs::path runner = dir / ("cawsc_" + job.name + "_run.scd");
+    {
+        std::ostringstream w;
+        w << "(\n~cawOk = false;\n\"" << fwd(script.string()) << "\".load;\n"
+          << "if(~cawOk != true, { \"ERROR: SuperCollider could not compile the code of clip " << job.name << " (the message above says where)\".postln; 1.exit });\n"
+          << "SystemClock.sched(" << (std::max(0.05, job.dur) + 90.0) << ", { \"ERROR: SuperCollider did not finish clip " << job.name << " in time\".postln; 1.exit });\n)\n";
+        if (!writeTextFile(runner.string(), w.str())) {
+            logLine("[caw] ERROR: could not write the SuperCollider script in " + dir.string());
+            return false;
+        }
+    }
     const std::string exe = scExePath();
-    const std::string cmd = "\"" + exe + "\" -D \"" + script.string() + "\"";
+    const std::string cmd = "\"" + exe + "\" -D \"" + runner.string() + "\"";
     logLine("[caw] SuperCollider: rendering " + job.name + " (" + std::to_string(job.dur) + " s)...");
     if (!g_pdProc.start(cmd, false)) {
         logLine("[caw] ERROR: could not start SuperCollider (" + g_pdProc.lastError() + "). Tried: " + exe + ". Install SuperCollider (supercollider.github.io) and set the full path to sclang.exe in Settings > SuperCollider executable, e.g. C:\\Program Files\\SuperCollider-3.13.0\\sclang.exe");
@@ -2409,6 +2045,7 @@ bool startScJob(const PdJob& job) {
     g_pdCurrent = job;
     g_pdBusy = true;
     g_pdErrorSeen = false;
+    g_pdRepeat.clear(); g_pdPrevText.clear(); g_scSkip = false; g_pdJobErrors = 0;
     g_pdT = -60.f;   // sclang needs time to start: the timeout counts from 60 s later
     return true;
 }
@@ -2554,13 +2191,14 @@ bool startPdJob(const PdJob& job) {
         "#X obj 10 60 throw~ caw_L;\n#X obj 120 60 throw~ caw_R;\n#X connect 0 0 2 0;\n#X connect 1 0 3 0;\n";
     std::error_code ec;
     fs::remove(dir / (job.name + ".wav"), ec);
+    diagClearClip(job.name);
     if (!write(dir / ("cawpd_" + job.name + ".pd"), userPatch) || !write(dir / ("cawpd_main_" + job.name + ".pd"), main) ||
         !write(dir / "caw_dac.pd", dacAbs)) {
         logLine("[caw] ERROR: could not write the Pure Data files in " + dir.string());
         return false;
     }
     const std::string exe = pdExePath();
-    const std::string cmd = "\"" + exe + "\" -nogui -nosound -batch -noprefs -r " + std::to_string(pdSr) +
+    const std::string cmd = "\"" + exe + "\" -nogui -stderr -nosound -batch -noprefs -r " + std::to_string(pdSr) +
                             " -path \"" + dir.string() + "\"" + (job.extraPath.empty() ? std::string() : " -path \"" + job.extraPath + "\"") + " -open \"" + (dir / ("cawpd_main_" + job.name + ".pd")).string() + "\"";
     logLine("[caw] Pure Data: rendering " + job.name + " (" + std::to_string(job.dur) + " s)...");
     if (!g_pdProc.start(cmd, false)) {
@@ -2570,6 +2208,7 @@ bool startPdJob(const PdJob& job) {
     g_pdCurrent = job;
     g_pdBusy = true;
     g_pdErrorSeen = false;
+    g_pdRepeat.clear(); g_pdPrevText.clear(); g_scSkip = false; g_pdJobErrors = 0;
     g_pdT = 0.f;
     return true;
 }
@@ -2586,11 +2225,11 @@ void startNextPdJob() {
     if (g_afterPd) { auto f = std::move(g_afterPd); g_afterPd = nullptr; f(); }
 }
 
-void ensurePdRendered(std::function<void()> after) {
+void ensurePdRendered(std::function<void()> after, const std::string& only) {
     if (g_pdBusy || !g_pdQueue.empty()) { logLine("[caw] Pure Data / SuperCollider is still rendering - try again in a moment."); return; }
     for (const Track& t : g_proj.tracks)
         for (const Clip& c : t.clips) {
-            if (c.lang < 1) continue;
+            if (c.lang < 1 || (only.empty() ? !langOn(c.lang) : c.name != only)) continue;
             bool queued = false;
             for (const PdJob& q : g_pdQueue) if (q.name == c.name) queued = true;
             if (queued) continue;
@@ -2644,6 +2283,253 @@ void ensurePdRendered(std::function<void()> after) {
     startNextPdJob();
 }
 
+// A line of the clip code with <caw>...</caw> taken out (what the SuperCollider script holds) -> the line in the editor.
+int unstrippedLine(const std::string& code, int n) {
+    const size_t a = code.find("<caw>"), e = code.find("</caw>");
+    if (a == std::string::npos || e == std::string::npos || e < a) return n;
+    const int before = (int)std::count(code.begin(), code.begin() + (long)a, '\n');
+    const int inside = (int)std::count(code.begin() + (long)a, code.begin() + (long)(e + 6), '\n');
+    return n > before + 1 ? n + inside : n;
+}
+
+// sclang: "line 12 char 5" counts lines of the whole script; the clip code starts at g_scCodeLine.
+int scEditorLine(const std::string& clipName, int scriptLine, const std::string& jobCode) {
+    const int n = scriptLine - g_scCodeLine + 1;
+    const int total = 1 + (int)std::count(jobCode.begin(), jobCode.end(), '\n');
+    if (n < 1 || n > total) return 0;
+    const Clip* c = clipByName(clipName);
+    return c ? unstrippedLine(c->code, n) : n;
+}
+
+// ---- Pure Data / SuperCollider output -> console rows with the clip, the line of its code and the start time of the clip.
+// Pd and sclang do not tell the line the way Csound does, so it is found here: sclang compile errors say "line N char M" (of the script),
+// sclang run-time errors and Pd errors say only a name ("Message 'foo' not understood", "nosuch: no such array"): the code is searched for it.
+struct LineHit { int line = 0; std::string text; };
+
+std::string trimText(std::string s) {
+    while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
+    while (!s.empty() && std::isspace((unsigned char)s.back())) s.pop_back();
+    return s;
+}
+std::string shortText(std::string s, size_t n = 90) {
+    s = trimText(s);
+    if (s.size() > n) { s.resize(n); s += "..."; }
+    return s;
+}
+
+// The lines of a clip's editor text (1-based) as (number, text).
+std::vector<LineHit> editorLines(const std::string& code) {
+    std::vector<LineHit> out;
+    std::istringstream in(code);
+    std::string row;
+    int no = 0;
+    while (std::getline(in, row)) {
+        ++no;
+        if (!row.empty() && row.back() == '\r') row.pop_back();
+        out.push_back({no, row});
+    }
+    return out;
+}
+
+// Pd prints the text of the object it means ("osc~x 440 ... couldn't create", "+: no method for 'foo'", "nosuch: no such array"):
+// find it in the readable object list of the clip. Best match wins: the whole object text, then objects with that name, then objects
+// that have it as an argument. One hit = sure; several = the first is the best guess.
+std::vector<LineHit> pdFindLines(const std::string& clipName, const std::string& msg) {
+    std::vector<LineHit> exact, byName, byArg;
+    const Clip* c = clipByName(clipName);
+    if (!c || c->lang != 1 || c->code.find("#N") == std::string::npos) return exact;
+    std::string patch, caw;
+    splitCaw(c->code, patch, caw);
+    const std::string readable = pdToReadable(patch) + (caw.empty() ? std::string() : "\n" + caw);
+    std::string cand = msg;
+    if (cand.rfind("error: ", 0) == 0) cand = cand.substr(7);
+    size_t cut = cand.find(" ... couldn't create");
+    if (cut == std::string::npos) cut = cand.find(": ");
+    if (cut != std::string::npos) cand = cand.substr(0, cut);
+    cand = trimText(cand);
+    if (cand.empty()) return exact;
+    const std::string firstWord = cand.substr(0, cand.find(' '));
+    static const std::regex objRe(R"re(^(?:\d+:\s+(?:obj|msg|text)\s+|\s+\(inside a subpatch\)\s+(?:obj|msg|text)\s+)(.*)$)re");
+    for (const LineHit& row : editorLines(readable)) {
+        std::smatch m;
+        if (!std::regex_match(row.text, m, objRe)) continue;
+        const std::string body = trimText(m[1].str());
+        if (body == cand) { exact.push_back({row.line, body}); continue; }
+        std::istringstream words(body);
+        std::string w;
+        bool first = true, arg = false;
+        while (words >> w) {
+            if (first) { if (w == firstWord) { byName.push_back({row.line, body}); arg = false; break; } first = false; }
+            else if (w == firstWord) arg = true;
+        }
+        if (arg) byArg.push_back({row.line, body});
+    }
+    return !exact.empty() ? exact : (!byName.empty() ? byName : byArg);
+}
+
+// sclang run-time errors have no line ("ERROR: Message 'fooBar' not understood."): look for the name in the code of the clip.
+std::vector<LineHit> scGuessLines(const std::string& clipName, const std::string& msg) {
+    std::vector<LineHit> withDot, any;
+    static const std::regex nameRe(R"re(Message '(\w+)' not understood)re");
+    std::smatch m;
+    const Clip* c = clipByName(clipName);
+    if (!c || !std::regex_search(msg, m, nameRe)) return withDot;
+    const std::string name = m[1].str();
+    const std::regex dot("\\." + name + "\\b"), word("\\b" + name + "\\b");
+    bool inCaw = false;
+    for (const LineHit& row : editorLines(c->code)) {
+        if (row.text.find("<caw>") != std::string::npos) inCaw = true;
+        const bool skip = inCaw || trimText(row.text).rfind("//", 0) == 0;
+        if (row.text.find("</caw>") != std::string::npos) inCaw = false;
+        if (skip) continue;
+        if (std::regex_search(row.text, dot)) withDot.push_back({row.line, trimText(row.text)});
+        else if (std::regex_search(row.text, word)) any.push_back({row.line, trimText(row.text)});
+    }
+    return !withDot.empty() ? withDot : any;
+}
+
+std::string clipLineSnippet(const std::string& clipName, int line) {
+    const Clip* c = clipByName(clipName);
+    if (!c) return std::string();
+    for (const LineHit& row : editorLines(c->code)) if (row.line == line) return shortText(row.text);
+    return std::string();
+}
+
+
+// The error row above that is still waiting for its line (sclang prints the line after the message).
+LogLine* lastErrorRow() {
+    if (g_errCtx.row < 0 || g_errCtx.row >= (int)g_log.size()) return nullptr;
+    LogLine& r = g_log[(size_t)g_errCtx.row];
+    return (r.level == kLogError && r.lang == g_pdCurrent.lang && r.clip == g_pdCurrent.name) ? &r : nullptr;
+}
+LogLine* pendingErrorRow() { LogLine* r = lastErrorRow(); return (r && r->line == 0) ? r : nullptr; }
+
+// Adds ">> clip line N: code" to the text of a row, marks the other candidate lines "maybe" in the editor.
+void describeHits(LogLine& row, const std::string& clipName, const std::vector<LineHit>& hits, const std::string& mark) {
+    if (hits.empty()) return;
+    row.text += "   >> clip line " + std::to_string(hits[0].line) + ": " + shortText(hits[0].text);
+    if (hits.size() > 1) {
+        row.text += "   (or line";
+        for (size_t k = 1; k < hits.size() && k < 5; ++k) row.text += (k > 1 ? ", " : " ") + std::to_string(hits[k].line);
+        row.text += hits.size() > 5 ? ", ...)" : ")";
+        if (const Clip* c = clipByName(clipName))
+            for (size_t k = 1; k < hits.size(); ++k) {
+                auto& marks = g_diagMarks[c->id];
+                if (!marks.count(hits[k].line)) marks[hits[k].line] = "maybe: " + shortText(mark, 200);
+            }
+    }
+}
+
+// One output line of a Pure Data / SuperCollider render.
+void logPdLine(const std::string& raw) {
+    const bool sc = g_pdCurrent.lang == 2;
+    const std::string name = g_pdCurrent.name;
+    const std::string prefix = std::string(sc ? "[SC " : "[Pd ") + name + "] ";
+    std::string l = raw;
+    if (!sc) {
+        static const std::regex levelRe(R"re(^verbose\(\d+\):\s?)re");   // Pd 0.52+ prints the log level in front when it writes to stderr
+        l = std::regex_replace(l, levelRe, "");
+        const std::string t = trimText(l);
+        // Pd 0.52+ prints a failed object on two lines: its text, then "... couldn't create"
+        if (t == "... couldn't create" && !g_pdPrevText.empty()) l = g_pdPrevText + " ... couldn't create";
+        else g_pdPrevText = t;
+    } else {
+        if (l.rfind("RECEIVER:", 0) == 0 || l.find("CALL STACK:") != std::string::npos) g_scSkip = true;
+        if (l.rfind("^^", 0) == 0) {   // end of the call stack: repeats the error line
+            g_scSkip = false;
+            LogLine d = classifyLog(prefix + l); d.level = kLogDetail; pushLog(std::move(d));
+            return;
+        }
+        if (l.rfind("ERROR:", 0) == 0) g_scSkip = false;
+        if (g_scSkip) { LogLine d = classifyLog(prefix + l); d.level = kLogDetail; pushLog(std::move(d)); return; }
+        if (l.rfind("Perhaps you", 0) == 0 || l.rfind("opening bracket was", 0) == 0) {   // sclang's explanation belongs to the error above
+            if (LogLine* row = lastErrorRow()) { if (row->text.find(trimText(l)) == std::string::npos) row->text += "   (" + trimText(l) + ")"; return; }
+        }
+        if (l.rfind("ERROR: Command line parse failed", 0) == 0) { LogLine d = classifyLog(prefix + l); d.level = kLogDetail; pushLog(std::move(d)); return; }
+    }
+
+    LogLine ll = classifyLog(prefix + l);
+    ll.level = classifyLog(l).level;       // the level comes from the message, not from the clip name in the tag
+    const bool wrapperEnd = sc && (l.rfind("ERROR: SuperCollider could not compile", 0) == 0 || l.rfind("ERROR: SuperCollider code failed", 0) == 0 ||
+                                   l.rfind("ERROR: SuperCollider did not finish", 0) == 0);
+    if (wrapperEnd) ll.level = g_pdJobErrors > 0 ? kLogImportant : kLogError;   // closing line of the wrapper: an error of its own only when no message above explains it
+    bool errLine = ll.level == kLogError;
+    if (errLine && !wrapperEnd) ++g_pdJobErrors;
+    if (errLine) {                         // the same error again and again (a run-time error in a loop): shown once, counted
+        const auto it = g_pdRepeat.find(l);
+        if (it != g_pdRepeat.end()) { ++it->second; return; }
+        g_pdRepeat[l] = 0;
+    }
+
+    int line = 0;
+    std::vector<LineHit> hits;
+    if (sc) {
+        static const std::regex posRe(R"re(\bline\s+(\d+)(?:\s+char\s+(\d+))?)re", std::regex_constants::icase);
+        std::smatch m;
+        if (!errLine && g_errCtx.left > 0 && std::regex_search(l, m, posRe)) {
+            // "line 9 char 15:" counts the lines of the script: the clip line goes to the error message above it
+            int ed = scEditorLine(name, std::atoi(m[1].str().c_str()), g_pdCurrent.code);
+            --g_errCtx.left;
+            bool past = false;
+            if (ed == 0) {   // sclang saw the problem after the end of the clip code (a bracket that is not closed): the end of the clip is where to look
+                const int total = 1 + (int)std::count(g_pdCurrent.code.begin(), g_pdCurrent.code.end(), '\n');
+                const int n = std::atoi(m[1].str().c_str()) - g_scCodeLine + 1;
+                if (n > total && n <= total + 8) { ed = scEditorLine(name, g_scCodeLine + total - 1, g_pdCurrent.code); past = ed > 0; }
+            }
+            if (ed > 0) {
+                const std::string where = past ? "   >> after the end of the clip code (clip line " + std::to_string(ed) + "): a bracket or quote is probably not closed"
+                                               : "   >> clip line " + std::to_string(ed) + (m[2].matched ? ", char " + m[2].str() : std::string()) + ": " + clipLineSnippet(name, ed);
+                if (LogLine* row = pendingErrorRow()) {
+                    fillLoc(*row, name, ed, g_errCtx.text);
+                    row->text += where;
+                    ll.level = kLogDetail;   // the position row itself is only shown in "Everything"
+                    pushLog(std::move(ll));
+                    return;
+                }
+                if (const Clip* c = clipByName(name)) {   // the error row above has its line already: only make sure the editor has the red mark
+                    auto& marks = g_diagMarks[c->id];
+                    if (!marks.count(ed)) marks[ed] = shortText(g_errCtx.text, 300);
+                }
+                ll.level = kLogDetail;
+                pushLog(std::move(ll));
+                return;
+            }
+        } else if (errLine) {
+            hits = scGuessLines(name, l);
+            if (!hits.empty()) line = hits[0].line;
+        }
+    } else if (errLine) {
+        hits = pdFindLines(name, l);
+        if (!hits.empty()) line = hits[0].line;
+    } else if (ll.level == kLogImportant) {   // a warning ("+~: extra arguments ignored"): the line goes into the text, no red tag
+        const std::vector<LineHit> w = pdFindLines(name, l);
+        if (!w.empty()) describeHits(ll, name, w, l);
+    }
+
+    const std::string mark = errLine ? l : g_errCtx.text;
+    if (errLine) { g_errCtx.left = 6; g_errCtx.text = l; g_errCtx.row = -1; }
+    else if (g_errCtx.left > 0) --g_errCtx.left;
+    if (ll.level == kLogError) {
+        fillLoc(ll, name, line, mark);
+        if (line > 0) describeHits(ll, name, hits, mark);
+        if (errLine && line == 0 && sc) g_errCtx.rowText = ll.text;
+    }
+    const bool wait = errLine && sc && ll.clipId >= 0;   // sclang prints its explanation / the line after the message
+    pushLog(std::move(ll));
+    if (wait) g_errCtx.row = (int)g_log.size() - 1;
+}
+
+// At the end of a render: the errors that came again and again were shown once.
+void logPdRepeats() {
+    for (const auto& kv : g_pdRepeat)
+        if (kv.second > 0) {
+            LogLine r = classifyLog(std::string(g_pdCurrent.lang == 2 ? "[SC " : "[Pd ") + g_pdCurrent.name + "] " + "the last message above came " + std::to_string(kv.second) + " more time(s): " + shortText(kv.first, 70));
+            r.level = kLogImportant;
+            pushLog(std::move(r));
+        }
+    g_pdRepeat.clear();
+}
+
 void pollPdJob(float dt) {
     if (!g_pdBusy) return;
     g_pdT += dt;
@@ -2651,7 +2537,7 @@ void pollPdJob(float dt) {
         std::string low = l;
         std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)std::tolower(c); });
         if (low.find("error") != std::string::npos || low.find("couldn't create") != std::string::npos || low.find("unknown option") != std::string::npos) g_pdErrorSeen = true;
-        logLine(std::string(g_pdCurrent.lang == 2 ? "[SC " : "[Pd ") + g_pdCurrent.name + "] " + l);
+        logPdLine(l);
     }
     const bool timeout = g_pdT > g_pdCurrent.dur + 60.0;
     if (g_pdProc.finished() || timeout) {
@@ -2659,6 +2545,7 @@ void pollPdJob(float dt) {
         g_pdBusy = false;
         std::error_code ec;
         const bool ok = std::filesystem::exists(pdWavPath(g_pdCurrent.name), ec);
+        logPdRepeats();
         if (ok && !g_pdErrorSeen) {
             g_pdDone[g_pdCurrent.name] = g_pdCurrent.hash;
             logLine(std::string("[caw] ") + (g_pdCurrent.lang == 2 ? "SuperCollider: " : "Pure Data: ") + g_pdCurrent.name + " rendered.");
@@ -2673,11 +2560,20 @@ void pollPdJob(float dt) {
 
 // "Run clip": run only this clip (no audio), so syntax / init errors show in the console with the line number of the clip.
 void runClipNow(const Clip& clip);
-void runClip(const Clip& clip) { Clip copy = clip; g_runPendingName = clip.name; ensurePdRendered([copy] { runClipNow(copy); }); }
+const char* langName(int lang) { return lang == 1 ? "Pure Data" : lang == 2 ? "SuperCollider" : "Csound"; }
+
+// Run clip: only the language of this clip runs. A Pd / SuperCollider clip is rendered alone first, other clips are not touched.
+void runClip(const Clip& clip) {
+    Clip copy = clip;
+    g_runPendingName = clip.name;
+    logLine(std::string("[caw] Run ") + langName(clip.lang) + " clip " + clip.name);
+    if (clip.lang == 0) runClipNow(copy);
+    else ensurePdRendered([copy] { runClipNow(copy); }, clip.name);
+}
 
 void runClipNow(const Clip& clip) {
     if (g_renderActive) { logLine("[caw] A render is running - wait for it or cancel it first."); return; }
-    if (g_liveCsound && !g_playWaiting && g_playProc.running()) {   // "Play Csound" is running: play the whole clip in that engine
+    if (g_liveCsound && !g_playWaiting && g_playProc.running()) {   // "Run" is running: play the whole clip in that engine
         const ParsedTrack pc = parseClip(clip);
         OscMsg m;
         m.address = "/caw/i";
@@ -2687,14 +2583,15 @@ void runClipNow(const Clip& clip) {
         std::vector<OscMsg> one;
         one.push_back(std::move(m));
         if (sendOsc(one)) g_runName = clip.name, g_runLeft = clip.dur;
-        if (g_runLeft > 0.0 && g_runName == clip.name) logLine("[caw] Run clip " + clip.name + ": playing the whole clip (" + std::to_string(clip.dur) + " s) in the running Csound. Restart Play Csound if you changed the code since it started.");
+        if (g_runLeft > 0.0 && g_runName == clip.name) logLine("[caw] Run clip " + clip.name + ": playing the whole clip (" + std::to_string(clip.dur) + " s) in the running Csound. Restart Run if you changed the code since it started.");
         else logLine("[caw] Could not send the clip to Csound (UDP socket error).");
         return;
     }
+    diagClearClip(clip.name);
     g_testProc.stop();
     g_test = TestRun();
     g_test.name = clip.name;
-    const std::string csdPath = std::filesystem::absolute("caw_test.csd").string();
+    const std::string csdPath = (workDir() / "caw_test.csd").string();
     OrcSpan span;
     const std::string csd = buildClipTestCsd(g_proj, clip, span);
     g_orcSpans.assign(1, span);
@@ -2731,19 +2628,46 @@ void stopClipRun(const Clip& clip) {
 }
 
 // "line 12" in a Csound message -> "instr Lead1, line 5 of the clip" (lines outside any clip stay as they are)
-std::string clipLineMessage(const std::string& l) {
+bool resolveOrcLine(const std::string& l, std::string& text, std::string& name, int& src) {
     static const std::regex lineRe(R"re(\bline\s+(\d+))re", std::regex_constants::icase);
     std::smatch m;
-    if (g_orcSpans.empty() || l.find("score") != std::string::npos || !std::regex_search(l, m, lineRe)) return l;
+    if (g_orcSpans.empty() || l.find("score") != std::string::npos || !std::regex_search(l, m, lineRe)) return false;
     const int orcLine = std::atoi(m[1].str().c_str());
     for (const OrcSpan& sp : g_orcSpans) {
         const int idx = orcLine - sp.first;
         if (idx < 0 || idx >= (int)sp.lineMap.size()) continue;
-        const int src = sp.lineMap[(size_t)idx];
+        src = sp.lineMap[(size_t)idx];
+        name = sp.name;
         const std::string where = "instr " + sp.name + ", " + (src > 0 ? "clip line " + std::to_string(src) : std::string("generated line (<caw> / cawRun)"));
-        return l.substr(0, (size_t)m.position(0)) + where + l.substr((size_t)(m.position(0) + m.length(0)));
+        text = l.substr(0, (size_t)m.position(0)) + where + l.substr((size_t)(m.position(0) + m.length(0)));
+        return true;
     }
-    return l;
+    return false;
+}
+
+// One output line of Csound (play, render, run clip): the line number of the orchestra becomes clip + clip line, and the clip's start time is added.
+// The line number often comes on its own line right after the error ("line 12:"), so a line that follows an error belongs to it.
+void logCsoundLine(const std::string& raw) {
+    std::string text, name;
+    int src = 0;
+    const bool mapped = resolveOrcLine(raw, text, name, src);
+    LogLine l = classifyLog(mapped ? text : raw);
+    const bool errLine = l.level == kLogError;
+    if (mapped && g_errCtx.left > 0) l.level = kLogError;
+    const std::string mark = errLine ? raw : g_errCtx.text;
+    if (errLine) { g_errCtx.left = 6; g_errCtx.text = raw; }
+    else if (g_errCtx.left > 0) --g_errCtx.left;
+    if (l.level == kLogError) {
+        if (mapped) fillLoc(l, name, src, mark);
+        else if (!l.clip.empty()) fillLoc(l, l.clip, 0, raw);
+    }
+    pushLog(std::move(l));
+}
+
+std::string clipLineMessage(const std::string& l) {
+    std::string text, name;
+    int src = 0;
+    return resolveOrcLine(l, text, name, src) ? text : l;
 }
 
 void pollTestAndScan(float dt) {
@@ -2754,7 +2678,7 @@ void pollTestAndScan(float dt) {
             std::string low = l;
             std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)std::tolower(c); });
             if (low.find("error") != std::string::npos || low.find("failed") != std::string::npos) g_test.sawError = true;
-            logLine(clipLineMessage(l));
+            logCsoundLine(l);
         }
         if (g_testProc.finished()) {
             const int code = g_testProc.exitCode();
@@ -2790,8 +2714,15 @@ void pollProcesses(float dt) {
         }
         for (const std::string& l : g_playProc.takeOutput()) {
             if (handleMonitorLine(l)) { g_sectionSeen = true; continue; }
-            logLine(clipLineMessage(l));
+            logCsoundLine(l);
             if (l.find("SECTION 1") != std::string::npos) g_sectionSeen = true;
+        }
+        if (!g_scopeDivSent && g_liveCsound && !g_playWaiting) {   // tell the engine how long one scope screen is
+            OscMsg m;
+            m.address = "/caw/a";
+            m.name = "cawScopeDiv";
+            m.values = {0.f, 0.05f, (float)scopeDiv(), (float)scopeDiv()};
+            g_scopeDivSent = sendOsc(std::vector<OscMsg>{m});
         }
         if (g_playWaiting) {
             g_playWaitT += dt;
@@ -2813,7 +2744,7 @@ void pollProcesses(float dt) {
 
     // ---- render
     if (g_renderProc.active()) {
-        for (const std::string& l : g_renderProc.takeOutput()) logLine(clipLineMessage(l));
+        for (const std::string& l : g_renderProc.takeOutput()) logCsoundLine(l);
         if (g_renderProc.finished()) {
             int code = g_renderProc.exitCode();
             g_renderProc.stop();
@@ -2924,7 +2855,7 @@ void runJoinTool() {
 }
 
 // Play button: only plays the timeline clips (moves the playhead and triggers instruments of a RUNNING Csound).
-// It never starts Csound. Use "Play Csound" for that. Without a running engine the playhead just moves, silently.
+// It never starts Csound. Use "Run" for that. Without a running engine the playhead just moves, silently.
 bool timelinePlaying() { return g_timelineRun; }
 
 void toggleTimelinePlay() {
@@ -2999,7 +2930,7 @@ void showAllMidi() {
 }
 
 // ---------------------------------------------------------------- transport
-// One row. Left: the controls you always need (go to start, Play, Play Csound, time). Middle: tabs (Edit / Project / Score) that
+// One row. Left: the controls you always need (go to start, Play, Run, time). Middle: tabs (Edit / Project / Score) that
 // swap the group of buttons next to them. Right: a status pill that is always visible (Csound state, rendering, sample rate).
 int g_transportTab = 0;   // 0 Edit, 1 Project, 2 Score
 
@@ -3015,8 +2946,12 @@ void drawTransport() {
     ImVec4 statusCol(0.55f, 0.55f, 0.60f, 1.f);
     if (g_renderActive) { std::snprintf(statusText, sizeof statusText, "Rendering..."); statusCol = ImVec4(0.95f, 0.60f, 0.20f, 1.f); }
     else if (g_playing && g_playWaiting) { std::snprintf(statusText, sizeof statusText, "Starting Csound..."); statusCol = ImVec4(0.95f, 0.60f, 0.20f, 1.f); }
-    else if (g_liveCsound) { std::snprintf(statusText, sizeof statusText, "Csound running"); statusCol = ImVec4(0.40f, 0.85f, 0.50f, 1.f); }
-    else { std::snprintf(statusText, sizeof statusText, "Csound stopped"); }
+    else if (g_liveCsound) {
+        const char* what = g_runMask == 1 ? "Csound" : g_runMask == 2 ? "Pd" : g_runMask == 4 ? "SuperCollider" : "Csound + Pd + SC";
+        std::snprintf(statusText, sizeof statusText, "%s running", what);
+        statusCol = ImVec4(0.40f, 0.85f, 0.50f, 1.f);
+    }
+    else { std::snprintf(statusText, sizeof statusText, "Stopped"); }
     char engineText[96];
     std::snprintf(engineText, sizeof engineText, "%d Hz | ksmps %d | %d ch", cs.sr, cs.ksmps, cs.nchnls);
     const float dotW = S(14);
@@ -3040,7 +2975,7 @@ void drawTransport() {
         dl->AddText(ImVec2(x + dotW, yMid - sz.y * 0.5f), ImGui::ColorConvertFloat4ToU32(statusCol), statusText);
     }
 
-    // ---- always visible: go to start, Play, Play Csound, time
+    // ---- always visible: go to start, Play, Run, time
     if (ImGui::Button("|<")) seekTimeline(0.0);
     ImGui::SameLine();
     const bool tlPlaying = timelinePlaying();
@@ -3048,15 +2983,27 @@ void drawTransport() {
     if (ImGui::Button(tlPlaying ? " Stop " : " Play ")) toggleTimelinePlay();
     if (tlPlaying) ImGui::PopStyleColor();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Play the timeline: moves the playhead and triggers the clips in a running Csound. It never starts Csound, press Play Csound for that.");
+        helpTip("Play the timeline: moves the playhead and triggers the clips in a running Csound. It never starts Csound, press Run for that.");
     ImGui::SameLine();
-    if (g_liveCsound) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.42f, 0.24f, 1.f));
-    if (ImGui::Button(g_liveCsound ? "Stop Csound" : "Play Csound")) {
-        if (g_liveCsound) stopPlayback();
-        else startPlayback(true);
+    {   // one engine button per language, and one for all three. The running one turns into Stop.
+        struct Run { const char* label; int mask; const char* tip; };
+        static const Run runs[] = {
+            {"Csound", 1, "Run only the Csound clips"}, {"Pd", 2, "Run only the Pure Data clips"},
+            {"SC", 4, "Run only the SuperCollider clips"}, {"Run all", 7, "Run Csound, Pure Data and SuperCollider together"}};
+        for (const Run& r : runs) {
+            const bool on = g_liveCsound && g_runMask == r.mask;
+            if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.42f, 0.24f, 1.f));
+            std::string label = (on ? "Stop " : "") + std::string(r.label);
+            if (ImGui::Button(label.c_str())) {
+                const bool wasLive = g_liveCsound;
+                if (wasLive) stopPlayback();
+                if (!(on && wasLive)) { g_runMask = r.mask; startPlayback(true); }
+            }
+            if (on) ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) helpTip("%s. The orchestra stays alive until you press Stop; the timeline (Play) only triggers the languages that are running.", r.tip);
+            ImGui::SameLine(0, S(3));
+        }
     }
-    if (g_liveCsound) ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start Csound like CsoundQt: the whole orchestra runs until you press Stop Csound. The timeline (Play) only triggers instruments in it; code changes need a restart.");
     ImGui::SameLine();
     int ms = (int)(g_play * 1000.0);
     ImGui::AlignTextToFramePadding();
@@ -3089,21 +3036,17 @@ void drawTransport() {
                 else g_tool = tool;
             }
             if (active) ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+            if (ImGui::IsItemHovered()) helpTip("%s", tip);
         };
         toolButton("Select [1]", Tool::Select, "Select tool (1): click to select, Ctrl+click adds, drag an empty area to box-select clips, MIDI regions or automation dots, drag to move, Del deletes, double-click a dot to type its value");
         ImGui::SameLine(0, S(3));
-        toolButton("Pen [8]", Tool::Pen, "Pen tool (8): press and drag across an automation lane to write automation");
+        toolButton("Pen1 [8]", Tool::Pen, "Pen 1 (8): press and drag across an automation lane; the stroke becomes a few dots joined by straight lines (a sine wave becomes a triangle wave)");
+        ImGui::SameLine(0, S(3));
+        toolButton("Pen2 [9]", Tool::Pen2, "Pen 2 (9): press and drag across an automation lane; every point of the stroke is kept, only the start and the end show a dot");
         ImGui::SameLine(0, S(3));
         toolButton("Cut [3]", Tool::Cut, "Cut tool (3): click a MIDI region (in the MIDI lane) to split it at the mouse. Csound clips are never cut. Drag a clip's left or right edge to change its length.");
         ImGui::SameLine(0, S(3));
         toolButton("Join [4]", Tool::Join, "Join tool (4): joins the selected MIDI regions right away. With nothing selected, click a MIDI region to join it with the next one. Csound clips are never joined.", true);
-        ImGui::SameLine(0, S(14));
-        if (ImGui::Button("+ Track")) {
-            g_selTrack = addTrack("Track" + std::to_string(++g_trackCounter), kLead);
-            g_selClip = -1;
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add a lane. Double-click the lane to add clips: every clip is its own instrument.");
         ImGui::SameLine(0, S(14));
         const float zoomRoom = groupMaxX - ImGui::GetCursorPosX();
         if (zoomRoom > S(120)) {
@@ -3118,7 +3061,7 @@ void drawTransport() {
             if (ImGui::Button("Cancel render")) cancelRender();
         } else {
             if (ImGui::Button("Render audio")) startRender();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Render the whole project to an audio file (see Settings for file name and format)");
+            if (ImGui::IsItemHovered()) helpTip("Render the whole project to an audio file (see Settings for file name and format)");
         }
         if (fits(S(200))) {
             ImGui::SameLine(0, S(14));
@@ -3137,7 +3080,7 @@ void drawTransport() {
             if (ImGui::MenuItem("One page (black)")) generateScore(false, true);
             ImGui::EndPopup();
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The whole piece on one page");
+        if (ImGui::IsItemHovered()) helpTip("The whole piece on one page");
         ImGui::SameLine(0, S(3));
         if (ImGui::Button("Full score")) ImGui::OpenPopup("##genscore_full");
         if (ImGui::BeginPopup("##genscore_full")) {
@@ -3145,11 +3088,8 @@ void drawTransport() {
             if (ImGui::MenuItem("Full score (black)")) generateScore(true, true);
             ImGui::EndPopup();
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Several pages, systems from left to right, like a printed score (open the .html and print it to PDF)");
+        if (ImGui::IsItemHovered()) helpTip("Several pages, systems from left to right, like a printed score (open the .html and print it to PDF)");
         ImGui::SameLine(0, S(14));
-        if (ImGui::Button("Preview")) g_scorePreviewOpen = true;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Live score preview: updates while you edit");
-        ImGui::SameLine(0, S(3));
         if (ImGui::Button("Score editor")) g_scoreOpen = true;
     }
 
@@ -3158,9 +3098,118 @@ void drawTransport() {
 }
 
 // ---------------------------------------------------------------- arrange view
-void drawArrange(float belowH) {
+// ---- marker / graph track items on the timeline
+bool primsConvex(const std::vector<ImVec2>& v) {
+    if (v.size() < 3) return false;
+    int sign = 0;
+    for (size_t i = 0; i < v.size(); ++i) {
+        const ImVec2 &a = v[i], &b = v[(i + 1) % v.size()], &c = v[(i + 2) % v.size()];
+        const float cr = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+        if (std::fabs(cr) < 1e-4f) continue;
+        const int sg = cr > 0 ? 1 : -1;
+        if (sign == 0) sign = sg; else if (sign != sg) return false;
+    }
+    return true;
+}
+void drawShapePrims(ImDrawList* dl, int shape, float x0, float y0, float x1, float y1, ImU32 line, ImU32 fillSoft, double ratio = 1.0) {
+    for (const markgfx::Prim& p : markgfx::shapePrims(shape, x0, y0, x1, y1, ratio)) {
+        std::vector<ImVec2> v;
+        for (const auto& q : p.pts) v.push_back(ImVec2((float)q.first, (float)q.second));
+        if (p.fill && (p.solid || primsConvex(v))) dl->AddConvexPolyFilled(v.data(), (int)v.size(), p.solid ? line : fillSoft);
+        if (v.size() >= 2) dl->AddPolyline(v.data(), (int)v.size(), line, p.closed ? ImDrawFlags_Closed : 0, S((float)p.sw));
+    }
+}
+ImU32 codeTokColor(int kind) {
+    static const ImU32 cols[] = { IM_COL32(225, 226, 232, 255), IM_COL32(197, 134, 192, 255), IM_COL32(181, 206, 168, 255),
+                                  IM_COL32(206, 145, 120, 255), IM_COL32(106, 153, 85, 255), IM_COL32(86, 156, 214, 255) };
+    return cols[std::min(5, std::max(0, kind))];
+}
+// draws one item in the box (x0,top)-(x1,bot); `rgb` is the item colour. Size (percent) shrinks shapes and boxes inside the row (the score shows the full size),
+// Font size changes the text.
+void drawMarkItem(ImDrawList* dl, int trackIdx, const Track& track, const TrackMark& mk, float x0, float x1, float top, float bot, uint32_t rgb) {
+    const ImU32 line = trackColor(trackIdx, 235, rgb), soft = trackColor(trackIdx, 80, rgb);
+    const float rowH = bot - top;
+    const float scale = (float)std::min(400, std::max(40, mk.size)) / 100.f;
+    // on the timeline a shape or box is at most as big as its row; the score shows the full size
+    const float h = std::min(rowH, rowH * scale);
+    const float sTop = top + (rowH - h) * 0.5f, sBot = sTop + h;
+    ImFont* font = ImGui::GetFont();
+    const float fs = ImGui::GetFontSize() * (mk.font > 0 ? (float)mk.font / 9.f : 1.f);
+    auto centered = [&](float cx, float cy, const char* t) {
+        const ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0.f, t);
+        dl->AddText(font, fs, ImVec2(cx - sz.x * 0.5f, cy - sz.y * 0.5f), IM_COL32(240, 241, 245, 255), t);
+    };
+    if (track.kind == 2) {   // graph track: graphic-score shapes only
+        const float tw = mk.text.empty() ? 0.f : font->CalcTextSizeA(fs, FLT_MAX, 0.f, mk.text.c_str()).x + S(8);
+        const float textX = (float)markgfx::shapeRight(mk.shape, x0, sTop, x1, sBot, mk.ratio / 100.0) + S(4);
+        dl->PushClipRect(ImVec2(x0, std::min(top, sTop)), ImVec2(std::max(std::max(x1, x0 + h) + S(2), textX + tw), std::max(bot, sBot)), true);
+        drawShapePrims(dl, mk.shape, x0, sTop, x1, sBot, line, soft, mk.ratio / 100.0);
+        if (!mk.text.empty()) dl->AddText(font, fs, ImVec2(textX, (top + bot) * 0.5f - fs * 0.5f), IM_COL32(235, 236, 240, 255), mk.text.c_str());
+        dl->PopClipRect();
+        return;
+    }
+    const std::string label = mk.text;
+    if (mk.type == 1) {   // letter box
+        const float w = std::max(h, font->CalcTextSizeA(fs, FLT_MAX, 0.f, label.c_str()).x + S(12));
+        dl->AddRectFilled(ImVec2(x0, sTop), ImVec2(x0 + w, sBot), soft, S(2));
+        dl->AddRect(ImVec2(x0, sTop), ImVec2(x0 + w, sBot), line, S(2), 0, S(1.8f));
+        centered(x0 + w * 0.5f, (sTop + sBot) * 0.5f, label.c_str());
+    } else if (mk.type == 2) {   // cue
+        const float cx = x0 + h * 0.5f, cy = (sTop + sBot) * 0.5f;
+        if (mk.shape == 0) { dl->AddCircleFilled(ImVec2(cx, cy), h * 0.5f, soft); dl->AddCircle(ImVec2(cx, cy), h * 0.5f, line, 0, S(1.8f)); }
+        else if (mk.shape == 1) { dl->AddRectFilled(ImVec2(x0, sTop), ImVec2(x0 + h, sBot), soft, S(2)); dl->AddRect(ImVec2(x0, sTop), ImVec2(x0 + h, sBot), line, S(2), 0, S(1.8f)); }
+        else if (mk.shape == 2) {
+            const ImVec2 d[4] = { ImVec2(x0, cy), ImVec2(cx, sTop), ImVec2(x0 + h, cy), ImVec2(cx, sBot) };
+            dl->AddConvexPolyFilled(d, 4, soft); dl->AddPolyline(d, 4, line, ImDrawFlags_Closed, S(1.8f));
+        } else if (mk.shape == 4) {   // [ Q ]
+            const float t = std::min(S(5), h * 0.3f), xl = x0 + S(1), xr = x0 + h - S(1);
+            const ImVec2 lb[4] = { ImVec2(xl + t, sTop), ImVec2(xl, sTop), ImVec2(xl, sBot), ImVec2(xl + t, sBot) };
+            const ImVec2 rb[4] = { ImVec2(xr - t, sTop), ImVec2(xr, sTop), ImVec2(xr, sBot), ImVec2(xr - t, sBot) };
+            dl->AddPolyline(lb, 4, line, 0, S(1.8f)); dl->AddPolyline(rb, 4, line, 0, S(1.8f));
+        } else dl->AddLine(ImVec2(x0 + S(2), sBot - S(1)), ImVec2(x0 + h - S(2), sBot - S(1)), line, S(2));
+        centered(cx, cy - (mk.shape == 3 ? S(1) : 0.f), "Q");
+        if (!label.empty()) dl->AddText(font, fs, ImVec2(x0 + h + S(5), cy - fs * 0.5f), IM_COL32(235, 236, 240, 255), label.c_str());
+    } else if (mk.type == 4) {   // span bracket: horizontal line, 90 degree ends, comment centred above (ends down) or below (ends up)
+        const float tk = std::min(rowH * 0.35f, S(7.f) * scale), up = mk.shape == 1 ? 1.f : 0.f;
+        const float yl = up > 0.5f ? top + tk + S(1) : bot - tk - S(1), ye = up > 0.5f ? top + S(1) : bot - S(1);
+        const float xe = std::max(x1, x0 + S(24));
+        const ImVec2 br[4] = { ImVec2(x0, ye), ImVec2(x0, yl), ImVec2(xe, yl), ImVec2(xe, ye) };
+        dl->AddPolyline(br, 4, line, 0, S(1.8f));
+        if (!label.empty()) {
+            const ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0.f, label.c_str());
+            dl->AddText(font, fs, ImVec2((x0 + xe) * 0.5f - sz.x * 0.5f, up > 0.5f ? yl + S(2) : yl - sz.y - S(2)), IM_COL32(235, 236, 240, 255), label.c_str());
+        }
+    } else if (mk.type == 3) {   // code, coding-style font, colors of the chosen language
+        dl->AddRectFilled(ImVec2(x0, top), ImVec2(x1, bot), IM_COL32(24, 25, 30, 255), S(3));
+        dl->AddRect(ImVec2(x0, top), ImVec2(x1, bot), line, S(3), 0, S(1.2f));
+        ImFont* mono = g_codeFonts[0] ? g_codeFonts[0] : font;
+        const float cfs = fs * 0.85f;
+        dl->PushClipRect(ImVec2(x0 + S(3), top), ImVec2(x1 - S(2), bot), true);
+        float y = top + S(2);
+        std::istringstream lines(label);
+        std::string ln;
+        while (std::getline(lines, ln) && y + cfs <= bot + 1.f) {
+            float x = x0 + S(6);
+            for (const markgfx::Tok& tk : markgfx::highlightLine(ln, mk.lang)) {
+                dl->AddText(mono, cfs, ImVec2(x, y), codeTokColor(tk.kind), tk.text.c_str());
+                x += mono->CalcTextSizeA(cfs, FLT_MAX, 0.f, tk.text.c_str()).x;
+            }
+            y += cfs + S(1);
+        }
+        dl->PopClipRect();
+    } else {   // comment
+        dl->AddRectFilled(ImVec2(x0, top), ImVec2(x1, bot), soft, S(3));
+        dl->AddRect(ImVec2(x0, top), ImVec2(x1, bot), line, S(3), 0, S(1.5f));
+        dl->AddRectFilled(ImVec2(x0, top), ImVec2(x0 + S(4), bot), trackColor(trackIdx, 255, rgb), S(2));
+        dl->PushClipRect(ImVec2(x0 + S(6), top), ImVec2(x1 - S(2), bot), true);
+        dl->AddText(font, fs, ImVec2(x0 + S(8), top + S(3)), IM_COL32(235, 236, 240, 255), label.c_str(), nullptr, std::max(S(20), x1 - x0 - S(12)));
+        dl->PopClipRect();
+    }
+}
+
+void drawArrange(float belowH, float rightW) {
     ImGuiIO& io = ImGui::GetIO();
-    ImGui::BeginChild("arrange", ImVec2(0, -belowH), false,
+    ImGui::BeginChild("arrange", ImVec2(-rightW, -belowH), false,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
@@ -3175,7 +3224,7 @@ void drawArrange(float belowH) {
     const ImVec2 rulerMin(bodyMin.x, org.y), rulerMax(bodyMax.x, bodyMin.y);
     const ImVec2 hdrMin(org.x, bodyMin.y), hdrMax(bodyMin.x, bodyMax.y);
     const ImVec2 m = io.MousePos;
-    for (Track& tr : g_proj.tracks) tr.height = kFixedTrackH;  // lanes have a fixed height
+    for (Track& tr : g_proj.tracks) tr.height = tr.kind == 2 ? 58.f : kFixedTrackH;  // lanes have a fixed height  // lanes have a fixed height
     const int nT = (int)g_proj.tracks.size();
 
     {   // keep the multi-selection consistent with the primary selection and the existing clips
@@ -3408,7 +3457,40 @@ void drawArrange(float belowH) {
                 g_autoDragMoved = false;
                 const double t = clampTimelineTime(xt(m.x));
                 const double v = valueAtY(m.y, laneY0, laneY1, lo, hi);
-                if (g_tool == Tool::Pen) {
+                // double-click = create the dot AND drag it, all with the same press (Cubase style)
+                const double nowT = ImGui::GetTime();
+                const bool dbl = !isPenTool() && !io.KeyCtrl && !io.KeyShift &&
+                    (ImGui::IsMouseDoubleClicked(0) ||
+                     (nowT - g_autoLastPressT < 0.5 && g_autoLastTrackId == track.id && g_autoLastChannel == channel &&
+                      std::fabs(m.x - g_autoLastPressPos.x) < S(16) && std::fabs(m.y - g_autoLastPressPos.y) < S(16)));
+                const bool lastAddedValid = g_autoLastAddedValid;
+                const AutoPoint lastAdded = g_autoLastAdded;
+                g_autoLastPressT = dbl ? -10.0 : nowT;
+                g_autoLastPressPos = m;
+                g_autoLastTrackId = track.id;
+                g_autoLastChannel = channel;
+                g_autoLastAddedValid = false;
+                if (dbl) {
+                    int idx = hit;
+                    if (idx < 0) {
+                        if (lastAddedValid)   // drop the dot the first click made: the double-click makes the one that is dragged
+                            for (size_t pi = 0; pi < points.size(); ++pi)
+                                if (points[pi].t == lastAdded.t && points[pi].v == lastAdded.v) { points.erase(points.begin() + (long)pi); break; }
+                        points.push_back({t, v});
+                        std::stable_sort(points.begin(), points.end(), [](const AutoPoint& p, const AutoPoint& q) { return p.t < q.t; });
+                        for (int pi = 0; pi < (int)points.size(); ++pi)
+                            if (points[(size_t)pi].t == t && points[(size_t)pi].v == v) { idx = pi; break; }
+                    }
+                    g_autoSel.clear(); g_autoSelMulti.clear();
+                    if (idx >= 0) g_autoSel.insert(idx);
+                    g_autoPressAdded = false;
+                    g_autoDragOrig = points;
+                    g_autoDragStartT = xt(m.x);
+                    g_autoDragStartV = valueAtY(m.y, laneY0, laneY1, lo, hi);
+                    g_autoMode = AutoMode::Move;
+                    break;
+                }
+                if (isPenTool()) {
                     g_autoSel.clear(); g_autoSelMulti.clear();
                     // start the stroke: drop dots that sit right under the pen, then write the first one
                     const double eps = 2.0 / std::max(1.f, g_pps);
@@ -3417,6 +3499,7 @@ void drawArrange(float belowH) {
                     points.push_back({t, v});
                     g_autoPenLastT = t;
                     g_autoPenLastX = m.x;
+                    g_autoPenMinT = g_autoPenMaxT = t;
                     g_autoMode = AutoMode::Pen;
                 } else if (hit >= 0) {
                     if (io.KeyCtrl) {
@@ -3425,11 +3508,15 @@ void drawArrange(float belowH) {
                         g_autoSel.clear(); g_autoSelMulti.clear();
                         g_autoSel.insert(hit);
                     }
+                    // double-click (like Cubase): the first click already dropped a dot, the second press grabs it
+                    // and drags it at once (no selection-tool switch). Right-click a dot to type its exact value.
                     if (ImGui::IsMouseDoubleClicked(0)) {
                         g_autoSel.clear(); g_autoSelMulti.clear();
                         g_autoSel.insert(hit);
-                        g_autoOpenPointPopup = true;
-                        g_autoMode = AutoMode::None;
+                        g_autoDragOrig = points;
+                        g_autoDragStartT = xt(m.x);
+                        g_autoDragStartV = valueAtY(m.y, laneY0, laneY1, lo, hi);
+                        g_autoMode = AutoMode::Move;
                     } else if (g_autoSel.count(hit)) {
                         g_autoDragOrig = points;
                         g_autoDragStartT = xt(m.x);
@@ -3446,9 +3533,17 @@ void drawArrange(float belowH) {
                         std::stable_sort(points.begin(), points.end(), [](const AutoPoint& p, const AutoPoint& q) { return p.t < q.t; });
                         for (int pi = 0; pi < (int)points.size(); ++pi)
                             if (points[(size_t)pi].t == t && points[(size_t)pi].v == v) { g_autoSel.insert(pi); break; }
-                        g_autoPressAdded = true;
+                        g_autoLastAddedValid = true; g_autoLastAdded = g_autoPressPoint;
+                        // create + drag with the SAME press (Cubase style): the new dot follows the mouse while the button is held.
+                        // (Box-select = Shift/Ctrl + drag on empty lane space.)
+                        g_autoPressAdded = false;
+                        g_autoDragOrig = points;
+                        g_autoDragStartT = t;
+                        g_autoDragStartV = v;
+                        g_autoMode = AutoMode::Move;
+                    } else {
+                        g_autoMode = AutoMode::Marquee;
                     }
-                    g_autoMode = AutoMode::Marquee;
                 }
                 break;
             }
@@ -3528,8 +3623,51 @@ void drawArrange(float belowH) {
                     points.push_back({t, v});
                     g_autoPenLastT = t;
                     g_autoPenLastX = m.x;
+                    g_autoPenMinT = std::min(g_autoPenMinT, t);
+                    g_autoPenMaxT = std::max(g_autoPenMaxT, t);
                 }
                 if (!down) {
+                    // the stroke becomes a few straight segments: Ramer-Douglas-Peucker on the dots of the stroke (a sine wave -> a triangle wave)
+                    if (g_tool == Tool::Pen) {   // Pen 1 only
+                        std::stable_sort(points.begin(), points.end(), [](const AutoPoint& p, const AutoPoint& q) { return p.t < q.t; });
+                        size_t i0 = points.size(), i1 = 0;
+                        for (size_t pi = 0; pi < points.size(); ++pi)
+                            if (points[pi].t >= g_autoPenMinT - 1e-9 && points[pi].t <= g_autoPenMaxT + 1e-9) { i0 = std::min(i0, pi); i1 = pi; }
+                        if (i0 < points.size() && i1 > i0 + 1) {
+                            const float usable = std::max(1.f, laneY1 - laneY0 - 2.f * autoPadY);
+                            const float tol = std::max(S(8), usable * 0.18f);
+                            std::vector<ImVec2> px;
+                            for (size_t pi = i0; pi <= i1; ++pi) px.push_back(ImVec2(tx(points[pi].t), yOfValue(points[pi].v, laneY0, laneY1, lo, hi)));
+                            std::vector<char> keep(px.size(), 0);
+                            keep.front() = keep.back() = 1;
+                            std::function<void(size_t, size_t)> rdp = [&](size_t a, size_t b) {
+                                if (b <= a + 1) return;
+                                const float dx = px[b].x - px[a].x, dy = px[b].y - px[a].y;
+                                const float len = std::max(1e-3f, std::sqrt(dx * dx + dy * dy));
+                                float best = 0.f; size_t bi = a;
+                                for (size_t k = a + 1; k < b; ++k) {
+                                    const float d = std::fabs(dy * (px[k].x - px[a].x) - dx * (px[k].y - px[a].y)) / len;
+                                    if (d > best) { best = d; bi = k; }
+                                }
+                                if (best > tol) { keep[bi] = 1; rdp(a, bi); rdp(bi, b); }
+                            };
+                            rdp(0, px.size() - 1);
+                            std::vector<AutoPoint> out(points.begin(), points.begin() + (long)i0);
+                            for (size_t k = 0; k < px.size(); ++k) if (keep[k]) out.push_back(points[i0 + k]);
+                            out.insert(out.end(), points.begin() + (long)i1 + 1, points.end());
+                            points = out;
+                        }
+                    }
+                    if (g_tool == Tool::Pen2) {   // Pen 2 keeps every point, but only the first and the last point of the stroke show a dot
+                        std::stable_sort(points.begin(), points.end(), [](const AutoPoint& p, const AutoPoint& q) { return p.t < q.t; });
+                        size_t i0 = points.size(), i1 = 0;
+                        for (size_t pi = 0; pi < points.size(); ++pi)
+                            if (points[pi].t >= g_autoPenMinT - 1e-9 && points[pi].t <= g_autoPenMaxT + 1e-9) { i0 = std::min(i0, pi); i1 = pi; }
+                        if (i0 < points.size() && i1 > i0 + 1) {
+                            points[i0].line = false; points[i1].line = false;
+                            for (size_t pi = i0 + 1; pi < i1; ++pi) points[pi].line = true;
+                        }
+                    }
                     std::set<int> none;
                     sortLaneKeepSelection(points, none);
                     g_autoMode = AutoMode::None;
@@ -3538,7 +3676,7 @@ void drawArrange(float belowH) {
             if (g_autoMode == AutoMode::None) g_autoDragTrackId = -1;
         }
     }
-    if (g_tool == Tool::Pen && inBody) {
+    if (isPenTool() && inBody) {
         for (int ti = 0; ti < nT; ++ti) {
             const Track& track = g_proj.tracks[(size_t)ti];
             for (const auto& lane : track.automation) {
@@ -3570,7 +3708,8 @@ void drawArrange(float belowH) {
     if (arrangeKeys && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) { g_autoSel.clear(); g_autoSelMulti.clear(); g_selMidiClips.clear(); g_tool = Tool::Select; }
     if (arrangeKeys && !io.KeyCtrl && !io.KeyAlt && !io.KeyShift) {
         if (ImGui::IsKeyPressed(ImGuiKey_1, false)) g_tool = Tool::Select;   // 1 = select
-        if (ImGui::IsKeyPressed(ImGuiKey_8, false)) g_tool = Tool::Pen;      // 8 = pen
+        if (ImGui::IsKeyPressed(ImGuiKey_8, false)) g_tool = Tool::Pen;      // 8 = pen 1
+        if (ImGui::IsKeyPressed(ImGuiKey_9, false)) g_tool = Tool::Pen2;     // 9 = pen 2
         if (ImGui::IsKeyPressed(ImGuiKey_3, false)) g_tool = Tool::Cut;      // 3 = cut
         if (ImGui::IsKeyPressed(ImGuiKey_C, false)) g_tool = g_tool == Tool::Cut ? Tool::Select : Tool::Cut;   // C toggles cut
         if (ImGui::IsKeyPressed(ImGuiKey_4, false)) runJoinTool();           // 4 = join
@@ -3707,8 +3846,150 @@ void drawArrange(float belowH) {
         }
     }
 
-    // ---- mouse interaction
+    // ---- marker tracks: double-click adds a note, drag moves / resizes it, right-click edits
+    bool markerHandled = false;
     if (inBody && !consumed) {
+        const int mti = laneOf(m.y);
+        if (mti >= 0 && (g_proj.tracks[(size_t)mti].kind == 1 || (g_proj.tracks[(size_t)mti].kind == 2 && m.y <= baseBottom[(size_t)mti]))) {
+            markerHandled = true;
+            Track& mt = g_proj.tracks[(size_t)mti];
+            const float top = yTop[(size_t)mti] + S(6), bot = baseBottom[(size_t)mti] - S(6);
+            int hit = -1;
+            if (m.y >= top && m.y <= bot)
+                for (int k = (int)mt.marks.size() - 1; k >= 0; --k) {
+                    const TrackMark& mk = mt.marks[(size_t)k];
+                    if (m.x >= tx(mk.t) && m.x <= std::max(tx(mk.t + mk.dur), tx(mk.t) + S(24))) { hit = k; break; }
+                }
+            if (hit >= 0 && g_markDrag < 0) {
+                const TrackMark& hm = mt.marks[(size_t)hit];
+                if (std::max(tx(hm.t + hm.dur), tx(hm.t) + S(24)) - m.x < S(8)) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            }
+            if (ImGui::IsMouseDoubleClicked(0)) {
+                if (hit < 0) {
+                    TrackMark nm;
+                    nm.t = std::max(0.0, xt(m.x));
+                    nm.dur = 4.0;
+                    nm.text = mt.kind == 2 ? "" : "Note";
+                    nm.scorePos = mt.kind == 2 ? 1 : 0;   // graph track items are made for the score; marker notes only when you choose
+                    mt.marks.push_back(nm);
+                    hit = (int)mt.marks.size() - 1;
+                }
+                g_markTrack = mti; g_markIdx = hit; g_selTrack = mti;
+                ImGui::OpenPopup("##mark_edit");
+            } else if (ImGui::IsMouseClicked(0)) {
+                g_selTrack = mti;
+                if (hit >= 0) {
+                    const TrackMark& hm = mt.marks[(size_t)hit];
+                    g_markDrag = hit; g_markDragTrack = mti;
+                    g_markDragMode = std::max(tx(hm.t + hm.dur), tx(hm.t) + S(24)) - m.x < S(8) ? 2 : 1;
+                    g_markGrab = xt(m.x) - hm.t;
+                }
+            } else if (ImGui::IsMouseClicked(1) && hit >= 0) {
+                g_markTrack = mti; g_markIdx = hit;
+                ImGui::OpenPopup("##mark_edit");
+            }
+        }
+    }
+    if (g_markDrag >= 0 && g_markDragTrack >= 0 && g_markDragTrack < (int)g_proj.tracks.size()) {
+        Track& mt = g_proj.tracks[(size_t)g_markDragTrack];
+        if (g_markDrag < (int)mt.marks.size() && ImGui::IsMouseDown(0)) {
+            TrackMark& mk = mt.marks[(size_t)g_markDrag];
+            if (g_markDragMode == 2) mk.dur = std::max(0.1, xt(m.x) - mk.t);
+            else mk.t = std::max(0.0, xt(m.x) - g_markGrab);
+        } else g_markDrag = -1;
+    } else g_markDrag = -1;
+    if (ImGui::BeginPopup("##mark_edit")) {
+        if (g_markTrack >= 0 && g_markTrack < nT && g_markIdx >= 0 && g_markIdx < (int)g_proj.tracks[(size_t)g_markTrack].marks.size()) {
+            TrackMark& mk = g_proj.tracks[(size_t)g_markTrack].marks[(size_t)g_markIdx];
+            const bool graphItem = g_proj.tracks[(size_t)g_markTrack].kind == 2;
+            ImGui::TextDisabled(graphItem ? "Graph item (drawn in the score)" : "Marker (timeline, optionally in the score)");
+            if (graphItem) {
+                // graph: only graphic-score shapes (grain cloud, glissando, swell...). Start and length: drag the item on the timeline.
+                ImGui::SetNextItemWidth(S(190));
+                ImGui::Combo("Shape##mark_shape", &mk.shape, markgfx::kShapeNames, markgfx::kShapeCount);
+                mk.shape = std::min(markgfx::kShapeCount - 1, std::max(0, mk.shape));
+            } else {
+                ImGui::SetNextItemWidth(S(190));
+                ImGui::Combo("Type##mark_type", &mk.type, markgfx::kMarkTypeNames, markgfx::kMarkTypeCount);
+                mk.type = std::min(markgfx::kMarkTypeCount - 1, std::max(0, mk.type));
+                if (mk.type == 2) {
+                    ImGui::SetNextItemWidth(S(190));
+                    mk.shape = std::min(markgfx::kCueCount - 1, std::max(0, mk.shape));
+                    ImGui::Combo("Q style##mark_cue", &mk.shape, markgfx::kCueNames, markgfx::kCueCount);
+                } else if (mk.type == 3) {
+                    ImGui::SetNextItemWidth(S(190));
+                    ImGui::Combo("Language##mark_lang", &mk.lang, markgfx::kLangNames, 3);
+                } else if (mk.type == 4) {
+                    ImGui::SetNextItemWidth(S(190));
+                    mk.shape = std::min(1, std::max(0, mk.shape));
+                    ImGui::Combo("Direction##mark_bracket", &mk.shape, markgfx::kBracketNames, 2);
+                }
+            }
+            {
+                const char* poss[] = {"Not in the score", "Above the lane", "Below the lane"};
+                ImGui::SetNextItemWidth(S(190));
+                ImGui::Combo("In score##mark_pos", &mk.scorePos, poss, 3);
+                if (ImGui::IsItemHovered()) helpTip("Shows this item in the score, above or below its lane. Marker track: the lane that has the same name as the marker track.");
+            }
+            {   // size: shape / box size in percent, font size of the text
+                int sz = mk.size;
+                ImGui::SetNextItemWidth(S(190));
+                if (ImGui::SliderInt("Size##mark_size", &sz, 40, 400, "%d %%")) mk.size = sz;
+                if (ImGui::IsItemHovered()) helpTip(graphItem ? "Size of the shape in the score. The timeline row shows it at most as big as the row (100 %)." : "Size of the box, letter box or cue in the score.");
+                {
+                    int fnt = mk.font > 0 ? mk.font : 9;
+                    ImGui::SetNextItemWidth(S(190));
+                    if (ImGui::SliderInt("Font size##mark_font", &fnt, 6, 40, "%d pt")) mk.font = fnt;
+                    if (ImGui::IsItemHovered()) helpTip("Size of the text, on the timeline and in the score.");
+                }
+                if (graphItem && mk.shape >= 3 && mk.shape <= 5) {
+                    int rt = mk.ratio;
+                    ImGui::SetNextItemWidth(S(190));
+                    if (ImGui::SliderInt("Ratio##mark_ratio", &rt, 30, 300, "%d %%")) mk.ratio = rt;
+                    if (ImGui::IsItemHovered()) helpTip("Curve of the swell / fade. 100 % = straight edges, above 100 % = slow start (curves in), below 100 % = fast start (curves out).");
+                }
+            }
+            if (graphItem) {   // preview of the shape
+                const ImVec2 pp = ImGui::GetCursorScreenPos();
+                const float pw = S(190), ph = S(44);
+                ImGui::Dummy(ImVec2(pw, ph));
+                const uint32_t pc = mk.color ? mk.color : g_proj.tracks[(size_t)g_markTrack].color;
+                ImDrawList* pdl = ImGui::GetWindowDrawList();
+                pdl->AddRectFilled(pp, ImVec2(pp.x + pw, pp.y + ph), IM_COL32(20, 21, 26, 255), S(3));
+                drawShapePrims(pdl, mk.shape, pp.x + S(4), pp.y + S(4), pp.x + pw - S(4), pp.y + ph - S(4), trackColor(g_markTrack, 235, pc), trackColor(g_markTrack, 80, pc), mk.ratio / 100.0);
+                ImGui::TextDisabled("Text beside the shape (a few letters)");
+                ImGui::SetNextItemWidth(S(190));
+                inputStr("##mark_gtext", mk.text, 0, nullptr);
+            }
+            if (!graphItem) {
+                const char* what = mk.type == 1 ? "Letters (A, B, C...)" : mk.type == 2 ? "Cue label (1, intro...)" : mk.type == 3 ? "Code" : mk.type == 4 ? "Comment (centred on the bracket)" : "Comment";
+                ImGui::TextDisabled("%s", what);
+                if (mk.type == 1 || mk.type == 2 || mk.type == 4) {
+                    ImGui::SetNextItemWidth(S(190));
+                    inputStr("##mark_short", mk.text, 0, nullptr);
+                } else if (mk.type == 3) {
+                    ImFont* cf = g_codeFonts[0];
+                    if (cf) ImGui::PushFont(cf);
+                    inputMulti("##mark_text", mk.text, ImVec2(S(320), S(110)));
+                    if (cf) ImGui::PopFont();
+                } else inputMulti("##mark_text", mk.text, ImVec2(S(280), S(90)));
+            }
+            float rgb[3] = {0.9f, 0.6f, 0.2f};
+            const uint32_t cur = mk.color ? mk.color : g_proj.tracks[(size_t)g_markTrack].color;
+            if (cur) { rgb[0] = ((cur >> 16) & 0xFF) / 255.f; rgb[1] = ((cur >> 8) & 0xFF) / 255.f; rgb[2] = (cur & 0xFF) / 255.f; }
+            if (ImGui::ColorEdit3("Color##mark_color", rgb, ImGuiColorEditFlags_NoInputs))
+                mk.color = ((uint32_t)std::lround(rgb[0] * 255.f) << 16) | ((uint32_t)std::lround(rgb[1] * 255.f) << 8) | (uint32_t)std::lround(rgb[2] * 255.f);
+            if (ImGui::Button("Delete note")) {
+                g_proj.tracks[(size_t)g_markTrack].marks.erase(g_proj.tracks[(size_t)g_markTrack].marks.begin() + g_markIdx);
+                g_markIdx = -1;
+                ImGui::CloseCurrentPopup();
+            }
+        } else ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    // ---- mouse interaction
+    if (inBody && !consumed && !markerHandled) {
         int ti = laneOf(m.y);
         int ci = clipAt(ti, m.x);
         if (ci >= 0 && g_drag == Drag::None) {
@@ -3859,7 +4140,7 @@ void drawArrange(float belowH) {
                 setPrimaryFromSet();
             } else if (g_drag == Drag::Marquee && g_marqDblKind != 0 && g_marqLane >= 0 && g_marqLane < nT) {
                 Track& lane = g_proj.tracks[(size_t)g_marqLane];
-                if (g_marqDblKind == 1) {
+                if (g_marqDblKind == 1 && lane.kind == 0) {
                     // new clip = new, independent instrument (own name, code copy, color, MIDI)
                     std::string code = lane.code;
                     if (g_selTrack == g_marqLane && g_selClip >= 0 && g_selClip < (int)lane.clips.size()) code = lane.clips[(size_t)g_selClip].code;
@@ -3919,7 +4200,7 @@ void drawArrange(float belowH) {
             if (g_dragOrig.size() == 1 && g_dragMidiOrig.empty() && g_selTrack >= 0 && g_selTrack < nT && g_selClip >= 0 &&
                 g_selClip < (int)g_proj.tracks[(size_t)g_selTrack].clips.size()) {
                 int nt = laneOf(m.y);
-                if (nt >= 0 && nt != g_selTrack) {  // drag a single clip to another track
+                if (nt >= 0 && nt != g_selTrack && g_proj.tracks[(size_t)nt].kind == 0) {  // drag a single clip to another track (never onto a graph / marker track)
                     auto& from = g_proj.tracks[(size_t)g_selTrack].clips;
                     Clip tmp = from[(size_t)g_selClip];
                     from.erase(from.begin() + g_selClip);
@@ -3955,6 +4236,11 @@ void drawArrange(float belowH) {
         // one Del removes everything that is selected, on every lane: MIDI regions AND Csound clips (the dots went above)
         if (!g_selMidiClips.empty()) deleteSelectedMidiClips();
         if (!g_selClips.empty()) deleteSelectedClips();
+    }
+    if (arrangeKeys && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) && !g_selMidiClips.empty()) {
+        // Enter: the selected MIDI clips open together in ONE piano roll (a single one opens its own piano roll)
+        if (g_selMidiClips.size() == 1) { if (MidiClip* one = findMidiClip(*g_selMidiClips.begin())) one->editorOpen = true; }
+        else { g_multiMidiIds.assign(g_selMidiClips.begin(), g_selMidiClips.end()); g_multiMidiOpen = true; }
     }
     if (arrangeKeys && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false) && !g_selClips.empty())
         duplicateSelectedClips();
@@ -4038,6 +4324,23 @@ void drawArrange(float belowH) {
         Track& track = g_proj.tracks[(size_t)i];
         float laneY = baseBottom[(size_t)i];
         const ParsedTrack parsed = parseTrack(track);
+        if (track.kind == 1 || track.kind == 2) {   // marker track: comment boxes; graph track: the same items in its first row
+            const float top = yTop[(size_t)i] + S(6), bot = baseBottom[(size_t)i] - S(6);
+            if (baseBottom[(size_t)i] >= bodyMin.y && yTop[(size_t)i] <= bodyMax.y) {
+                if (track.marks.empty() && track.kind == 1)
+                    dl->AddText(ImVec2(bodyMin.x + S(8), yTop[(size_t)i] + S(6)), IM_COL32(122, 124, 133, 255), "Marker track: double-click to add a marker (comment, letter box, cue Q, code or span bracket). Drag to move, drag the right edge to change the length, right-click for more.");
+                for (size_t k = 0; k < track.marks.size(); ++k) {
+                    const TrackMark& mk = track.marks[k];
+                    const float x0 = tx(mk.t), x1 = std::max(tx(mk.t + mk.dur), x0 + S(24));
+                    if (x1 < bodyMin.x || x0 > bodyMax.x) continue;
+                    const uint32_t rgb = mk.color ? mk.color : track.color;
+                    drawMarkItem(dl, i, track, mk, x0, x1, top, bot, rgb);
+                }
+            }
+            if (track.kind == 1) continue;
+        }
+        if (track.kind == 2 && track.marks.empty() && baseBottom[(size_t)i] >= bodyMin.y && yTop[(size_t)i] <= bodyMax.y)
+            dl->AddText(ImVec2(bodyMin.x + S(8), yTop[(size_t)i] + S(6)), IM_COL32(122, 124, 133, 255), "Graph: double-click here to add graphic-score shapes (clouds, glissandi, swells...). Drag to move, drag the right edge to change the length, right-click for size and shape. One lane in the score with up to 8 lines (use + on the left). It makes no sound.");
         int automationLaneIndex = 0;
         for (const auto& [channel, points] : track.automation) {
             if (!autoShown(track, channel)) continue;
@@ -4066,7 +4369,7 @@ void drawArrange(float belowH) {
                 const float y = valueY(initial);
                 dl->AddLine(ImVec2(a.x, y), ImVec2(b.x, y), trackColor(i, 200, laneColor), S(1.5f));
                 dl->AddText(ImVec2(a.x + S(8), laneY + S(3)), IM_COL32(135, 135, 144, 255),
-                            g_tool == Tool::Pen ? "Pen: press and drag to write automation"
+                            isPenTool() ? "Pen: press and drag to write automation"
                                                         : "Click to add a dot | drag to box-select | Pen tool (8) to draw");
             } else {
                 std::vector<ImVec2> poly;
@@ -4090,6 +4393,13 @@ void drawArrange(float belowH) {
                         dl->AddCircleFilled(point, S(6), IM_COL32(255, 255, 255, 255));
                         dl->AddCircle(point, S(8), trackColor(i, 255, laneColor), 0, S(2));
                     } else {
+                        // pen strokes read as a plain line: dots packed close together on both sides are not drawn
+                        // (a lone dot, or one at the end of a stroke, is still shown and can be grabbed)
+                        const float packed = S(9);
+                        const bool denseL = pi > 0 && std::fabs(point.x - poly[(size_t)pi - 1].x) < packed;
+                        const bool denseR = pi + 1 < (int)poly.size() && std::fabs(poly[(size_t)pi + 1].x - point.x) < packed;
+                        if (denseL && denseR) continue;
+                        if (points[(size_t)pi].line) continue;   // inside a Pen 2 stroke: only the start and the end of the stroke have dots
                         dl->AddCircleFilled(point, S(4), trackColor(i, 255, laneColor));
                         dl->AddCircle(point, S(6), IM_COL32(255, 255, 255, 150), 0, S(1));
                     }
@@ -4187,8 +4497,11 @@ void drawArrange(float belowH) {
         for (int k = 0; k < 3; ++k) dl->AddCircleFilled(ImVec2(r0.x + S(8), (y0 + y1) * 0.5f + (k - 1) * S(6)), S(1.5f), IM_COL32(120, 120, 130, 255));
         ImGui::PopID();
 
-        // per-track meter: one bar per output channel (mono 1, stereo 2, quad 4 ...) and a red clip LED
-        if (headerW >= S(230)) {
+        // per-track meter: one bar per output channel (mono 1, stereo 2, quad 4 ...) and a red clip LED. Always shown: the other elements give way.
+        float meterReserve = 0.f;
+        for (const LaneMeterInfo& lm : (g_liveCsound ? g_engineMeters : g_idleMeters))
+            if (lm.trackId == t.id) { meterReserve = lm.channels * S(8) + S(12); break; }
+        {
             const std::vector<LaneMeterInfo>& layout = g_liveCsound ? g_engineMeters : g_idleMeters;
             for (const LaneMeterInfo& lm : layout) {
                 if (lm.trackId != t.id) continue;
@@ -4203,7 +4516,7 @@ void drawArrange(float belowH) {
                     dl->AddRectFilled(ImVec2(lx0, y0 + S(5)), ImVec2(lx1, y0 + S(5) + ledH), clipped ? IM_COL32(240, 50, 40, 255) : IM_COL32(60, 26, 26, 255), S(1.5f));
                     if (ImGui::IsMouseHoveringRect(ImVec2(lx0, y0 + S(3)), ImVec2(lx1, y0 + S(5) + ledH + S(2))) && ImGui::IsMouseClicked(0)) g_laneClipped.erase(meterIdx);
                 }
-                if (bot - top > S(10)) {
+                if (bot - top > S(4)) {
                     for (int c = 0; c < lm.channels; ++c) {
                         const float bx0 = mx0 + c * (barW + barGap), bx1 = bx0 + barW;
                         dl->AddRectFilled(ImVec2(bx0, top), ImVec2(bx1, bot), IM_COL32(22, 22, 25, 255));
@@ -4224,24 +4537,22 @@ void drawArrange(float belowH) {
         }
 
         const float fh = ImGui::GetFrameHeight();
-        // the panel hides elements as it gets narrower
-        const bool showX = headerW >= S(110), showM = headerW >= S(80), showS = headerW >= S(105);
-        const float nameW = std::min(S(170), std::max(S(30), headerW - S(22) - (showX ? S(24) : 0.f)));
+        // the panel hides elements as it gets narrower; the meter stays, the name gives way
+        const bool showM = headerW >= S(80), showS = headerW >= S(105);
+        const float nameRoom = headerW - S(22) - meterReserve;
+        const float nameW = std::min(S(170), nameRoom);
         ImGui::PushID(i);
-        ImGui::SetCursorScreenPos(ImVec2(r0.x + S(16), y0 + S(6)));
-        ImGui::SetNextItemWidth(nameW);
-        if (inputStr("##name", t.name, 0, nameFilter)) g_selTrack = i;
-        if (!ImGui::IsItemActive()) ensureUniqueInstrumentName(i);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lane name. Every clip on the lane is its own instr (right-click a clip to rename it).");
-        if (showX) {
-            ImGui::SameLine(0, S(3));
-            if (ImGui::SmallButton("X")) del = i;
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete this track");
+        if (nameRoom >= S(30)) {
+            ImGui::SetCursorScreenPos(ImVec2(r0.x + S(16), y0 + S(6)));
+            ImGui::SetNextItemWidth(nameW);
+            if (inputStr("##name", t.name, 0, nameFilter)) g_selTrack = i;
+            if (!ImGui::IsItemActive()) ensureUniqueInstrumentName(i);
+            if (ImGui::IsItemHovered()) helpTip(t.kind == 2 ? "Name of the graph (its lane name in the score). Right-click the track for more." : t.kind == 1 ? "Name of the marker track. Right-click the track for more." : "Lane name. Every clip on the lane is its own instr (right-click a clip to rename it). Right-click the track for more.", t.name.c_str());
         }
         if (headerW >= S(50)) {   // second row: + (lanes), M, S
             ImGui::SetCursorScreenPos(ImVec2(r0.x + S(18), y0 + S(6) + fh + S(4)));
             if (ImGui::SmallButton("+")) ImGui::OpenPopup("add_automation_lane");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show / add automation lanes and the MIDI lane");
+            if (ImGui::IsItemHovered()) helpTip("Show / add automation lanes and the MIDI lane");
             if (ImGui::BeginPopup("add_automation_lane")) {
                 const ParsedTrack parsed = parseTrack(t);
                 const bool laneHasMidi = trackHasMidi(t);
@@ -4249,7 +4560,7 @@ void drawArrange(float belowH) {
                 for (const CawParam& param : parsed.params) {
                     ImGui::PushID(param.chn.c_str());
                     const bool exists = t.automation.find(param.chn) != t.automation.end();
-                    const bool shown = exists && autoShown(t, param.chn);
+                    const bool shown = exists && t.hiddenAutomation.count(param.chn) == 0;
                     if (ImGui::MenuItem(param.chn.c_str(), nullptr, shown)) {
                         if (!exists) {
                             t.automation.emplace(param.chn, std::vector<AutoPoint>{});
@@ -4270,28 +4581,45 @@ void drawArrange(float belowH) {
                 ImGui::EndPopup();
             }
             if (showM) {
-                ImGui::SameLine(0, S(4));
+                ImGui::SameLine(0, S(8));
                 if (t.muted) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.48f, 0.20f, 0.18f, 1.f));
                 if (ImGui::SmallButton("M")) t.muted = !t.muted;
                 if (t.muted) ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip(t.muted ? "Unmute track" : "Mute track");
+                if (ImGui::IsItemHovered()) helpTip(t.muted ? "Unmute track" : "Mute track");
             }
             if (showS) {
-                ImGui::SameLine(0, S(3));
+                ImGui::SameLine(0, S(8));
                 if (t.solo) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.42f, 0.24f, 1.f));
                 if (ImGui::SmallButton("S")) t.solo = !t.solo;
                 if (t.solo) ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip(t.solo ? "Unsolo track" : "Solo track");
+                if (ImGui::IsItemHovered()) helpTip(t.solo ? "Unsolo track" : "Solo track");
             }
             if (headerW >= S(135)) {
-                ImGui::SameLine(0, S(3));
-                if (ImGui::SmallButton("Sc")) ImGui::OpenPopup("track_score_popup");
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Score: lane, automation and clip options for the printed score");
+                ImGui::SameLine(0, S(8));
+                { ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(S(7), 0.f));
+                  if (ImGui::SmallButton("sco##trk")) ImGui::OpenPopup("track_score_popup");
+                  ImGui::PopStyleVar(); }
+                if (ImGui::IsItemHovered()) helpTip(t.kind == 2 ? "Score: the lane of the whole graph. Give it the same name as another track and the graph is drawn in that track's lane (overlap or separated)." : "Score: the name of this track lane (the same name = the same lane) and how it shows");
                 if (ImGui::BeginPopup("track_score_popup")) { drawTrackScoreMenu(t); ImGui::EndPopup(); }
+            }
+            if (headerW >= S(165) && t.kind != 1 && !t.automation.empty()) {   // arrow: fold / unfold all the automation sub-tracks
+                ImGui::SameLine(0, S(8));
+                const bool folded = g_collapsedAuto.count(t.id) > 0;
+                const float asz = ImGui::GetFontSize();   // small arrow, same height as the M / S / sco buttons
+                const ImVec2 ap = ImGui::GetCursorScreenPos();
+                if (ImGui::InvisibleButton("##fold_auto", ImVec2(asz, asz))) { if (folded) g_collapsedAuto.erase(t.id); else g_collapsedAuto.insert(t.id); clearAutoSelection(); }
+                {
+                    const ImU32 ac = ImGui::IsItemHovered() ? IM_COL32(255, 255, 255, 255) : IM_COL32(170, 172, 182, 255);
+                    const float cx = ap.x + asz * 0.5f, cy = ap.y + asz * 0.5f, r = asz * 0.26f;
+                    if (folded) ImGui::GetWindowDrawList()->AddTriangleFilled(ImVec2(cx - r * 0.7f, cy - r), ImVec2(cx - r * 0.7f, cy + r), ImVec2(cx + r, cy), ac);
+                    else ImGui::GetWindowDrawList()->AddTriangleFilled(ImVec2(cx - r, cy - r * 0.7f), ImVec2(cx + r, cy - r * 0.7f), ImVec2(cx, cy + r), ac);
+                }
+                if (ImGui::IsItemHovered()) helpTip(folded ? "Show the automation sub-tracks" : "Hide all the automation sub-tracks (the data stays)");
             }
         }
         ImGui::PopID();
         if (ImGui::IsMouseHoveringRect(r0, r1) && ImGui::IsMouseClicked(0) && edgeTrack < 0) g_selTrack = i;
+        if (ImGui::IsMouseHoveringRect(r0, r1) && ImGui::IsMouseClicked(1)) { g_ctxTrack = i; g_selTrack = i; ImGui::OpenPopup("##track_ctx"); }
 
         float laneTop = y1;
         int automationLaneIndex = 0;
@@ -4308,42 +4636,89 @@ void drawArrange(float belowH) {
                 ImGui::PushID(i);
                 ImGui::PushID(channel.c_str());
                 float rgb[3] = {((laneColor >> 16) & 0xFF) / 255.f, ((laneColor >> 8) & 0xFF) / 255.f, (laneColor & 0xFF) / 255.f};
-                ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(62), laneTop + S(2)));
+                ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(76), laneTop + S(2)));
                 if (headerW >= S(200) && ImGui::ColorEdit3("##automation_color", rgb, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_NoTooltip)) {
                     t.automationColors[channel] = 0x01000000u |
                         ((uint32_t)std::lround(rgb[0] * 255.f) << 16) |
                         ((uint32_t)std::lround(rgb[1] * 255.f) << 8) |
                         (uint32_t)std::lround(rgb[2] * 255.f);
                 }
-                if (headerW >= S(200) && ImGui::IsItemHovered()) ImGui::SetTooltip("Automation lane color");
+                if (headerW >= S(200) && ImGui::IsItemHovered()) helpTip("Automation lane color");
                 if (headerW >= S(90)) {
-                    ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(32), laneTop + S(2)));
+                    ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(40), laneTop + S(2)));
                     if (ImGui::Button("-", ImVec2(S(24), 0))) { removeAutoTrack = i; removeAutoChannel = channel; }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hide this automation lane (data is kept, use + to show it again)");
+                    if (ImGui::IsItemHovered()) helpTip("Hide this automation lane (data is kept, use + to show it again)");
                 }
-                if (headerW >= S(240)) {   // put this automation in the printed score
-                    ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(94), laneTop + S(2)));
+                const float graphComboW = 0.f;
+                if (t.kind == 2 && headerW >= S(240)) {   // graph line: row 2 = shape and how it joins the other lines; row 1 right = M S color -
+                    const float rowY = laneTop + S(4) + ImGui::GetFrameHeight() + S(6);
+                    const auto shIt = t.scoreAutoShape.find(channel);
+                    int gshape = shIt == t.scoreAutoShape.end() ? 0 : shIt->second;
+                    const float gcw = std::min(S(118), std::max(S(70), (headerW - S(16 + 8 + 6 + 28 + 10)) / 2.f));
+                    ImGui::SetCursorScreenPos(ImVec2(org.x + S(16), rowY));
+                    ImGui::SetNextItemWidth(gcw);
+                    if (ImGui::Combo("##graph_shape", &gshape, "Curve\0Steps\0Straight\0Line, no dots\0Dashed\0Mirror smooth\0Mirror boxes\0Hairpin < >\0Bars\0")) t.scoreAutoShape[channel] = gshape;
+                    if (ImGui::IsItemHovered()) helpTip("Shape of this line in the score");
+                    const auto mgIt = t.scoreAutoMerge.find(channel);
+                    int gmerge = mgIt == t.scoreAutoMerge.end() ? 0 : mgIt->second;
+                    ImGui::SetCursorScreenPos(ImVec2(org.x + S(16 + 8) + gcw, rowY));
+                    ImGui::SetNextItemWidth(gcw);
+                    if (ImGui::Combo("##graph_merge", &gmerge, "Combine\0Half combine\0Separated\0")) t.scoreAutoMerge[channel] = gmerge;
+                    if (ImGui::IsItemHovered()) helpTip("How this line joins the other lines of the graph in the score:\nCombine = one shape together with the other combined lines.\nHalf combine = drawn over them at 50%.\nSeparated = a strip of its own.");
+                    {   // look: stroke width and shape ratio
+                        ImGui::SetCursorScreenPos(ImVec2(org.x + S(16 + 8 + 8) + gcw * 2.f, rowY));
+                        const bool customLook = t.scoreAutoStroke.count(channel) > 0 || t.scoreAutoCurve.count(channel) > 0;
+                        if (customLook) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.93f, 0.50f, 0.15f, 0.85f));
+                        if (ImGui::Button("W##graph_look", ImVec2(S(28), 0))) ImGui::OpenPopup("graph_look_popup");
+                        if (customLook) ImGui::PopStyleColor();
+                        if (ImGui::IsItemHovered()) helpTip("Stroke width of the line and shape ratio (orange = changed)");
+                        if (ImGui::BeginPopup("graph_look_popup")) {
+                            ImGui::TextDisabled("Line %s in the score", channel.c_str());
+                            drawAutoStrokeControls(t, channel, gshape);
+                            ImGui::EndPopup();
+                        }
+                    }
+                    {   // Y = how tall the line is in the score (how far it goes up and down)
+                        const float yx = org.x + S(16) + ImGui::CalcTextSize(headerW >= S(260) ? ("Automation: " + channel).c_str() : channel.c_str()).x + S(10);
+                        if (yx + S(70) < bodyMin.x - S(140)) {
+                            const auto ysIt = t.scoreAutoYSize.find(channel);
+                            int ypct = ysIt == t.scoreAutoYSize.end() ? 100 : ysIt->second;
+                            ImGui::SetCursorScreenPos(ImVec2(yx, laneTop + S(2)));
+                            ImGui::SetNextItemWidth(S(70));
+                            if (ImGui::DragInt("##graph_y", &ypct, 1.f, 50, 400, "Y %d%%")) t.scoreAutoYSize[channel] = std::min(400, std::max(50, ypct));
+                            if (ImGui::IsItemHovered()) helpTip("Y size: how tall this line is in the score, so how far it goes up and down (100% = normal). Drag to change.");
+                        }
+                    }
+                    // M = hide this line in the score, S = show only the soloed lines
+                    const bool gm = t.scoreAutoMuted.count(channel) > 0, gs = t.scoreAutoSolo.count(channel) > 0;
+                    ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(136), laneTop + S(2)));
+                    if (gm) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.48f, 0.20f, 0.18f, 1.f));
+                    if (ImGui::Button("M##gm", ImVec2(S(24), 0))) { if (gm) t.scoreAutoMuted.erase(channel); else t.scoreAutoMuted.insert(channel); }
+                    if (gm) ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered()) helpTip(gm ? "Show this line in the score again" : "Hide this line in the score");
+                    ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(106), laneTop + S(2)));
+                    if (gs) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.42f, 0.24f, 1.f));
+                    if (ImGui::Button("S##gs", ImVec2(S(24), 0))) { if (gs) t.scoreAutoSolo.erase(channel); else t.scoreAutoSolo.insert(channel); }
+                    if (gs) ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered()) helpTip(gs ? "Unsolo this line" : "Show only the soloed lines in the score");
+                }
+                if (t.kind != 2 && headerW >= S(240)) {   // put this automation in the printed score
+                    ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(118), laneTop + S(2)));
                     const auto sm = t.scoreAuto.find(channel);
                     const int smode = sm == t.scoreAuto.end() ? 1 : sm->second;
                     if (smode > 0) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.93f, 0.50f, 0.15f, 0.85f));
-                    if (ImGui::Button("Sc", ImVec2(S(26), 0))) ImGui::OpenPopup("auto_score_popup");
+                    if (ImGui::Button("sco##auto", ImVec2(S(34), 0))) ImGui::OpenPopup("auto_score_popup");
                     if (smode > 0) ImGui::PopStyleColor();
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Score: this automation gets its own lane in the printed score (orange = on)");
-                    if (ImGui::BeginPopup("auto_score_popup")) {
-                        ImGui::TextDisabled("%s in the score", channel.c_str());
-                        int m = smode;
-                        ImGui::SetNextItemWidth(S(250));
-                        if (ImGui::Combo("##autosc", &m, "Not in the score\0Own lane, full curve\0Own lane, compact contour\0")) t.scoreAuto[channel] = m;
-                        ImGui::EndPopup();
-                    }
+                    if (ImGui::IsItemHovered()) helpTip("Score: this automation gets its own lane in the printed score (orange = on)");
+                    if (ImGui::BeginPopup("auto_score_popup")) { drawAutoScoreMenu(t, channel); ImGui::EndPopup(); }
                 }
                 if (t.id == g_autoSelTrackId && channel == g_autoSelChannel && !g_autoSel.empty()) {
                     auto laneIt = t.automation.find(channel);
                     if (laneIt != t.automation.end() && *g_autoSel.rbegin() < (int)laneIt->second.size()) {
                         // the value box sits between the lane name and the buttons on the right (Sc, color, -), never under them
                         const std::string laneLabel = (headerW >= S(260) ? "Automation: " + channel : channel);
-                        const float leftX = org.x + S(16) + ImGui::CalcTextSize(laneLabel.c_str()).x + S(10);
-                        const float rightX = bodyMin.x - (headerW >= S(240) ? S(94) : (headerW >= S(200) ? S(62) : S(32))) - S(8);
+                        const float leftX = org.x + S(16) + ImGui::CalcTextSize(laneLabel.c_str()).x + S(10) + (t.kind == 2 ? S(78) : 0.f) + graphComboW;
+                        const float rightX = bodyMin.x - (headerW >= S(240) ? (t.kind == 2 ? S(136) : S(118)) : (headerW >= S(200) ? S(76) : S(40))) - S(8);
                         if (rightX - leftX >= S(56)) {
                             double lo, hi, initial;
                             laneValueRange(t, channel, lo, hi, initial);
@@ -4355,7 +4730,7 @@ void drawArrange(float belowH) {
                                 for (int idx : g_autoSel) laneIt->second[(size_t)idx].v = value;
                             }
                             if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Value of the %d selected dot(s), range %.4g .. %.4g", (int)g_autoSel.size(), lo, hi);
+                                helpTip("Value of the %d selected dot(s), range %.4g .. %.4g", (int)g_autoSel.size(), lo, hi);
                         }
                     }
                 }
@@ -4373,11 +4748,19 @@ void drawArrange(float belowH) {
             dl->AddRectFilled(ImVec2(ml0.x + S(5), ml0.y), ImVec2(ml0.x + S(7), ml1.y), trackColor(i, 170, t.color));
             dl->AddLine(ml0, ImVec2(ml1.x, midiTop), IM_COL32(12, 12, 14, 255));
             dl->AddText(ImVec2(ml0.x + S(16), midiTop + S(4)), IM_COL32(195, 195, 205, 255), "MIDI piano roll");
+            if (headerW >= S(130)) {
+                ImGui::PushID(i);
+                ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(80), midiTop + S(2)));
+                if (ImGui::Button("sco##midi_score", ImVec2(S(34), 0))) ImGui::OpenPopup("midi_score_popup");
+                if (ImGui::IsItemHovered()) helpTip("Score: the name of the MIDI lane (the same name = the same lane) and how the notes show");
+                if (ImGui::BeginPopup("midi_score_popup")) { drawMidiScoreMenu(t); ImGui::EndPopup(); }
+                ImGui::PopID();
+            }
             if (headerW >= S(90)) {
                 ImGui::PushID(i);
-                ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(32), midiTop + S(2)));
+                ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(40), midiTop + S(2)));
                 if (ImGui::Button("-##hide_midi", ImVec2(S(24), 0))) t.midiHidden = true;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hide the MIDI lane (notes are kept, use + to show it again)");
+                if (ImGui::IsItemHovered()) helpTip("Hide the MIDI lane (notes are kept, use + to show it again)");
                 ImGui::PopID();
             }
             if (ImGui::IsMouseHoveringRect(ml0, ml1) && ImGui::IsMouseClicked(0) && edgeTrack < 0 && edgeAutomationTrack < 0)
@@ -4393,6 +4776,24 @@ void drawArrange(float belowH) {
         g_proj.tracks.erase(g_proj.tracks.begin() + moveFrom);
         g_proj.tracks.insert(g_proj.tracks.begin() + moveTo, std::move(moved));
         for (int k = 0; k < (int)g_proj.tracks.size(); ++k) if (g_proj.tracks[(size_t)k].id == selectedId) g_selTrack = k;
+    }
+
+    if (ImGui::IsMouseHoveringRect(hdrMin, hdrMax) && ImGui::IsMouseClicked(1) && m.y >= yTop[(size_t)nT] && !ImGui::IsPopupOpen("##track_ctx")) { g_ctxTrack = -1; ImGui::OpenPopup("##track_ctx"); }
+    if (ImGui::BeginPopup("##track_ctx")) {
+        if (ImGui::MenuItem("Add Csound track")) { g_selTrack = addLangTrack(0); g_selClip = -1; }
+        if (ImGui::MenuItem("Add Pure Data track")) { g_selTrack = addLangTrack(1); g_selClip = -1; }
+        if (ImGui::MenuItem("Add SuperCollider track")) { g_selTrack = addLangTrack(2); g_selClip = -1; }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Add graph track")) { g_selTrack = addFreeAutomationTrack(); g_selClip = -1; }
+        if (ImGui::IsItemHovered()) helpTip("An automation lane that is not linked to a clip. Its Csound channel is the track name: read it anywhere with  kVal chnget \"Name\".");
+        if (ImGui::MenuItem("Add marker track")) { g_selTrack = addMarkerTrack(); g_selClip = -1; }
+        if (ImGui::IsItemHovered()) helpTip("Comments and guidance for the project: double-click the lane to write a note.");
+        if (g_ctxTrack >= 0 && g_ctxTrack < nT) {
+            ImGui::Separator();
+            ImGui::TextDisabled("%s", g_proj.tracks[(size_t)g_ctxTrack].name.c_str());
+            if (ImGui::MenuItem("Delete track")) del = g_ctxTrack;
+        }
+        ImGui::EndPopup();
     }
 
     if (removeAutoTrack >= 0 && removeAutoTrack < (int)g_proj.tracks.size()) {
@@ -4428,7 +4829,7 @@ void drawArrange(float belowH) {
             const std::string nameBefore = clip->name;
             if (inputStr("##clip_ctx_name", clip->name, 0, nameFilter)) renameClipGroup(*clip, nameBefore);
             if (!ImGui::IsItemActive()) ensureUniqueClipName(*clip);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("This clip's own Csound instr name");
+            if (ImGui::IsItemHovered()) helpTip("This clip's own Csound instr name");
             ImGui::SameLine();
             const uint32_t rgbValue = clipColorValue(g_proj.tracks[(size_t)laneIndex], *clip);
             float rgb[3] = {((rgbValue >> 16) & 0xFF) / 255.f, ((rgbValue >> 8) & 0xFF) / 255.f, (rgbValue & 0xFF) / 255.f};
@@ -4452,12 +4853,12 @@ void drawArrange(float belowH) {
                     if (lane.clips[(size_t)ci].id == g_ctxClipId) { duplicateClipAsNew(laneIndex, ci); break; }
                 ImGui::CloseCurrentPopup();
             }
-            if (ImGui::BeginMenu("Score")) { drawClipScoreMenu(*clip, laneIndex); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Score")) { drawClipScoreMenu(*clip, &g_proj.tracks[(size_t)laneIndex]); ImGui::EndMenu(); }
             if (ImGui::MenuItem("Use as lane template", nullptr, false, true)) {
                 g_proj.tracks[(size_t)laneIndex].code = clip->code;
                 ImGui::CloseCurrentPopup();
             }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("New clips double-clicked on this lane start from this code");
+            if (ImGui::IsItemHovered()) helpTip("New clips double-clicked on this lane start from this code");
             ImGui::Separator();
             if (ImGui::MenuItem("Delete clip", "Del")) {
                 Track& lane = g_proj.tracks[(size_t)laneIndex];
@@ -4486,6 +4887,11 @@ void drawArrange(float belowH) {
             ImGui::TextDisabled("MIDI clip  ->  %s", current ? current->name.c_str() : "(no instrument)");
             ImGui::Separator();
             if (ImGui::MenuItem("Open piano roll")) { mc->editorOpen = true; ImGui::CloseCurrentPopup(); }
+            if (g_selMidiClips.size() > 1 && ImGui::MenuItem("Open the selected clips in ONE piano roll", "Enter")) {
+                g_multiMidiIds.assign(g_selMidiClips.begin(), g_selMidiClips.end());
+                g_multiMidiOpen = true;
+                ImGui::CloseCurrentPopup();
+            }
             if (ImGui::MenuItem("Split at playhead")) {
                 for (int k = 0; k < (int)lane.midiClips.size(); ++k)
                     if (lane.midiClips[(size_t)k].id == g_ctxMidiId) { cutMidiClipAt(midiLane, k, g_play); break; }
@@ -4603,43 +5009,216 @@ void drawArrange(float belowH) {
 }
 
 // ---------------------------------------------------------------- master monitor
+// Cubic interpolation between p1 and p2 (t = 0..1), p0 and p3 are the neighbours.
+float catmullRom(float p0, float p1, float p2, float p3, float t) {
+    return 0.5f * ((2.f * p1) + (-p0 + p2) * t + (2.f * p0 - 5.f * p1 + 4.f * p2 - p3) * t * t + (-p0 + 3.f * p1 - 3.f * p2 + p3) * t * t * t);
+}
+
 struct PRect { ImVec2 a, b; };
 
+// Console error -> the clip: opens its editor, puts the cursor on the line, scrolls the timeline to where the clip starts.
+void gotoClipLine(int clipId, int line) {
+    for (size_t ti = 0; ti < g_proj.tracks.size(); ++ti) {
+        Track& t = g_proj.tracks[ti];
+        for (size_t ci = 0; ci < t.clips.size(); ++ci) {
+            Clip& c = t.clips[ci];
+            if (c.id != clipId) continue;
+            c.editorOpen = true;
+            g_selTrack = (int)ti; g_selClip = (int)ci;
+            g_focusClipWin = clipId;
+            if (line > 0) g_gotoLine[clipId] = line;
+            g_scrollX = (float)std::max(0.0, c.start - 1.0);
+            return;
+        }
+    }
+}
+
 void drawConsolePanel(ImDrawList* dl, const PRect& r, ImU32 panel, ImU32 frame, ImU32 label) {
+    int errCount = 0;
+    for (const LogLine& l : g_log) if (l.level == kLogError) ++errCount;
     dl->AddRectFilled(r.a, r.b, panel, S(4));
     dl->AddRect(r.a, r.b, frame, S(4));
     dl->AddText(ImVec2(r.a.x + S(6), r.a.y + S(3)), label, "CONSOLE");
 
-    ImGui::SetCursorScreenPos(ImVec2(r.b.x - S(150), r.a.y + S(1)));
+    if (r.b.x - r.a.x > S(430)) {   // Problems: only the errors, each with its clip, line and timeline time (click the red tag to jump there)
+        ImGui::SetCursorScreenPos(ImVec2(r.b.x - S(330), r.a.y + S(1)));
+        if (errCount > 0) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.45f, 0.38f, 1.f));
+        ImGui::Checkbox((std::string("Problems ") + std::to_string(errCount) + "##logproblems").c_str(), &g_logProblems);
+        if (errCount > 0) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) helpTip("Show only the errors. Every error tells the clip, the line of its code and where the clip starts on the timeline. Click the tag to open the clip at that line.");
+    }
+    ImGui::SetCursorScreenPos(ImVec2(r.b.x - S(196), r.a.y + S(1)));
+    if (ImGui::SmallButton("Filter")) ImGui::OpenPopup("##consolefilter");
+    if (ImGui::IsItemHovered()) helpTip("How much the console tells, and from which language or clip");
+    ImGui::SameLine();
     ImGui::Checkbox("Auto", &g_logAuto);
     ImGui::SameLine();
     if (ImGui::SmallButton("Clear")) g_log.clear();
+    if (ImGui::BeginPopup("##consolefilter")) {
+        ImGui::TextDisabled("Detail");
+        ImGui::RadioButton("Important: errors, warnings, what runs", &g_logDetail, kLogImportant);
+        ImGui::RadioButton("Messages: + everything the app says", &g_logDetail, kLogMessage);
+        ImGui::RadioButton("Everything: + raw output of Csound, Pd, SC", &g_logDetail, kLogDetail);
+        ImGui::Checkbox("Problems only (errors with clip, line and time)", &g_logProblems);
+        ImGui::Separator();
+        ImGui::TextDisabled("Language");
+        ImGui::Checkbox("Csound", &g_logLang[0]); ImGui::SameLine();
+        ImGui::Checkbox("Pure Data", &g_logLang[1]); ImGui::SameLine();
+        ImGui::Checkbox("SuperCollider", &g_logLang[2]);
+        ImGui::Separator();
+        ImGui::TextDisabled("Clip");
+        ImGui::SetNextItemWidth(S(200));
+        if (ImGui::BeginCombo("##logclip", g_logClip.empty() ? "All clips" : g_logClip.c_str())) {
+            if (ImGui::Selectable("All clips", g_logClip.empty())) g_logClip.clear();
+            for (const Track& t : g_proj.tracks)
+                for (const Clip& c : t.clips)
+                    if (ImGui::Selectable(c.name.c_str(), g_logClip == c.name)) g_logClip = c.name;
+            ImGui::EndCombo();
+        }
+        ImGui::SetNextItemWidth(S(200));
+        ImGui::InputTextWithHint("##logsearch", "search text", g_logSearch, sizeof g_logSearch);
+        ImGui::EndPopup();
+    }
 
     ImGui::SetCursorScreenPos(ImVec2(r.a.x + S(6), r.a.y + S(24)));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.05f, 0.05f, 0.06f, 1.f));
     ImGui::BeginChild("##consolelog", ImVec2(r.b.x - r.a.x - S(12), r.b.y - r.a.y - S(30)), false,
                       ImGuiWindowFlags_HorizontalScrollbar);
-    ImGuiListClipper clipper;
-    clipper.Begin((int)g_log.size());
-    while (clipper.Step()) {
-        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
-            const std::string& l = g_log[(size_t)i];
-            ImVec4 col(0.80f, 0.80f, 0.83f, 1.f);
-            if (l.rfind("[caw]", 0) == 0) col = ImVec4(0.55f, 0.78f, 0.95f, 1.f);
-            if (l.find("error") != std::string::npos || l.find("ERROR") != std::string::npos ||
-                l.find("Error") != std::string::npos || l.find("FAILED") != std::string::npos)
-                col = ImVec4(0.95f, 0.40f, 0.35f, 1.f);
-            else if (l.find("warning") != std::string::npos || l.find("WARNING") != std::string::npos)
-                col = ImVec4(0.95f, 0.80f, 0.35f, 1.f);
-            ImGui::PushStyleColor(ImGuiCol_Text, col);
-            ImGui::TextUnformatted(l.c_str());
-            ImGui::PopStyleColor();
+    static const char* langTag[] = {"Cs", "Pd", "SC"};
+    static const ImVec4 langCol[] = {ImVec4(0.45f, 0.75f, 0.95f, 1.f), ImVec4(0.55f, 0.85f, 0.55f, 1.f), ImVec4(0.95f, 0.70f, 0.35f, 1.f)};
+    std::string needle = g_logSearch;
+    std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    for (size_t li = 0; li < g_log.size(); ++li) {
+        const LogLine& l = g_log[li];
+        if (l.level < g_logDetail || !g_logLang[l.lang] || (!g_logClip.empty() && l.clip != g_logClip)) continue;
+        if (g_logProblems && l.level != kLogError) continue;
+        if (!needle.empty()) {
+            std::string low = l.text;
+            std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            if (low.find(needle) == std::string::npos) continue;
         }
+        ImVec4 col(0.80f, 0.80f, 0.83f, 1.f);
+        if (l.level == kLogError) col = ImVec4(0.95f, 0.40f, 0.35f, 1.f);
+        else if (l.text.find("arning") != std::string::npos || l.text.find("WARNING") != std::string::npos) col = ImVec4(0.95f, 0.80f, 0.35f, 1.f);
+        else if (l.level >= kLogMessage) col = ImVec4(0.55f, 0.78f, 0.95f, 1.f);
+        ImGui::TextColored(langCol[l.lang], "%s", langTag[l.lang]);
+        ImGui::SameLine(0, S(6));
+        if (!l.clip.empty()) { ImGui::TextDisabled("%s", l.clip.c_str()); ImGui::SameLine(0, S(6)); }
+        if (l.clipId >= 0 && l.level == kLogError) {   // where: clip, line of its code, start time on the timeline
+            std::string chip = l.line > 0 ? "line " + std::to_string(l.line) : std::string("clip");
+            if (!l.times.empty()) chip += "  @ " + timeText(l.times.front()) + (l.times.size() > 1 ? "  +" + std::to_string(l.times.size() - 1) : std::string());
+            ImGui::PushID((int)li);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.22f, 0.12f, 0.55f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.30f, 0.15f, 0.85f));
+            if (ImGui::SmallButton(chip.c_str())) gotoClipLine(l.clipId, l.line);
+            if (ImGui::IsItemHovered()) {
+                std::string tip = "Open clip " + l.clip + (l.line > 0 ? " at line " + std::to_string(l.line) : std::string()) + " and show it on the timeline.";
+                if (!l.times.empty()) { tip += "\nThe clip starts at:"; for (size_t k = 0; k < l.times.size() && k < 8; ++k) tip += "\n  " + timeText(l.times[k]); }
+                if (l.playhead >= 0.0) tip += "\nPlayhead when this came: " + timeText(l.playhead);
+                helpTip("%s", tip.c_str());
+            }
+            ImGui::PopStyleColor(2);
+            ImGui::PopID();
+            ImGui::SameLine(0, S(6));
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::TextUnformatted(l.text.c_str());
+        ImGui::PopStyleColor();
     }
-    clipper.End();
     if (g_logAuto && g_logDirty) ImGui::SetScrollHereY(1.0f);
     g_logDirty = false;
     ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+// Master level meter in the right panel: one bar per output channel (nchnls). Click it to reset the clip lights.
+void drawMeterPanel(float dt, float width, float belowH) {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.07f, 0.08f, 1.f));
+    ImGui::BeginChild("meterpanel", ImVec2(width, -belowH), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 org = ImGui::GetCursorScreenPos();
+    const ImVec2 av = ImGui::GetContentRegionAvail();
+    const int masterN = g_liveCsound ? g_engineMaster : masterChannels(g_proj.cs);
+    const ImU32 panel = IM_COL32(14, 14, 16, 255), frame = IM_COL32(40, 40, 46, 255), label = IM_COL32(130, 130, 140, 255);
+
+    if ((int)g_dispDb.size() != masterN) {
+        g_dispDb.assign((size_t)masterN, -90.f);
+        g_holdDb.assign((size_t)masterN, -90.f);
+        g_holdT.assign((size_t)masterN, 0.f);
+        g_clip.assign((size_t)masterN, 0);
+    }
+    for (int ch = 0; ch < masterN; ++ch) {
+        const float pk = (g_monAge < 0.5f && (size_t)ch < g_peakIn.size()) ? g_peakIn[(size_t)ch] : 0.f;
+        const float d = 20.f * std::log10(std::max(pk, 1e-5f));
+        g_dispDb[(size_t)ch] = std::max(d, g_dispDb[(size_t)ch] - 30.f * dt);
+        if (d >= g_holdDb[(size_t)ch]) { g_holdDb[(size_t)ch] = d; g_holdT[(size_t)ch] = 1.5f; }
+        else {
+            g_holdT[(size_t)ch] -= dt;
+            if (g_holdT[(size_t)ch] <= 0.f) g_holdDb[(size_t)ch] = std::max(d, g_holdDb[(size_t)ch] - 20.f * dt);
+        }
+        if (pk >= 1.0f) g_clip[(size_t)ch] = 1;
+    }
+
+    {   // drag the left edge to resize the panel, double-click = automatic width again
+        ImGui::SetCursorScreenPos(org);
+        ImGui::InvisibleButton("##meter_resize", ImVec2(S(6), av.y));
+        const bool active = ImGui::IsItemActive();
+        if (ImGui::IsItemHovered() || active) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) g_meterW = 0.f;
+        if (ImGui::IsItemActivated() && g_meterW <= 0.f) g_meterW = width / g_ui;
+        if (active) g_meterW = std::min(700.f, std::max(80.f, g_meterW - ImGui::GetIO().MouseDelta.x / g_ui));
+        if (active || ImGui::IsItemHovered()) dl->AddLine(ImVec2(org.x + S(2), org.y + S(6)), ImVec2(org.x + S(2), org.y + av.y - S(6)), active ? IM_COL32(237, 128, 38, 255) : IM_COL32(150, 150, 160, 255), S(2));
+    }
+    const ImVec2 mA(org.x + S(8), org.y + S(8)), mB(org.x + av.x - S(4), org.y + av.y - S(8));
+    dl->AddRectFilled(mA, mB, panel, S(4));
+    dl->AddRect(mA, mB, frame, S(4));
+    dl->AddText(ImVec2(mA.x + S(6), mA.y + S(3)), label, "MASTER");
+
+    const float barTop = mA.y + S(34), barBot = mB.y - S(34);
+    const float lo = -60.f, hi = 3.f;
+    auto dbY = [&](float d) { return barBot - (std::min(hi, std::max(lo, d)) - lo) / (hi - lo) * (barBot - barTop); };
+    const float gap = S(masterN > 8 ? 2.f : 8.f);
+    const float bx0 = mA.x + S(34);
+    const float availBars = std::max(S(8), (mB.x - mA.x) - S(34) - S(8));
+    const float barW = std::max(S(2), std::min(S(20), (availBars - gap * (float)(masterN - 1)) / (float)masterN));
+    const bool roomForNumbers = barW + gap >= S(26), roomForLabels = barW + gap >= S(11);
+    for (int ch = 0; ch < masterN; ++ch) {
+        const float x0 = bx0 + ch * (barW + gap), x1 = x0 + barW;
+        dl->AddRectFilled(ImVec2(x0, barTop), ImVec2(x1, barBot), IM_COL32(24, 24, 27, 255));
+        struct Zone { float a, b; ImU32 c; };
+        const Zone zones[] = {{lo, -12.f, IM_COL32(70, 190, 90, 255)}, {-12.f, -3.f, IM_COL32(225, 195, 60, 255)}, {-3.f, hi, IM_COL32(230, 70, 60, 255)}};
+        for (const Zone& z : zones) {
+            const float top = std::min(z.b, g_dispDb[(size_t)ch]);
+            if (top > z.a) dl->AddRectFilled(ImVec2(x0, dbY(top)), ImVec2(x1, dbY(z.a)), z.c);
+        }
+        const float hy = dbY(g_holdDb[(size_t)ch]);
+        dl->AddLine(ImVec2(x0, hy), ImVec2(x1, hy), IM_COL32(245, 245, 245, 255), S(2));
+        dl->AddRectFilled(ImVec2(x0, mA.y + S(18)), ImVec2(x1, mA.y + S(28)), g_clip[(size_t)ch] ? IM_COL32(240, 50, 40, 255) : IM_COL32(50, 24, 24, 255), S(2));
+        if (roomForNumbers) {
+            char buf[16];
+            if (g_holdDb[(size_t)ch] < -90.f) std::snprintf(buf, sizeof buf, "-inf");
+            else std::snprintf(buf, sizeof buf, "%.1f", g_holdDb[(size_t)ch]);
+            dl->AddText(ImVec2(x0, barBot + S(4)), IM_COL32(200, 200, 205, 255), buf);
+        }
+        if (roomForLabels) {
+            char lab[8];
+            if (masterN == 2) std::snprintf(lab, sizeof lab, "%s", ch ? "R" : "L");
+            else if (masterN == 1) std::snprintf(lab, sizeof lab, "M");
+            else std::snprintf(lab, sizeof lab, "%d", ch + 1);
+            dl->AddText(ImVec2(x0 + S(5), barBot + S(18)), label, lab);
+        }
+    }
+    for (float tk : {0.f, -6.f, -12.f, -24.f, -48.f}) {
+        const float y = dbY(tk);
+        char buf[8];
+        std::snprintf(buf, sizeof buf, "%d", (int)tk);
+        dl->AddText(ImVec2(mA.x + S(6), y - S(7)), label, buf);
+        dl->AddLine(ImVec2(bx0 - S(4), y), ImVec2(bx0, y), label);
+    }
+    ImGui::SetCursorScreenPos(mA);
+    if (ImGui::InvisibleButton("##meterreset", ImVec2(mB.x - mA.x, mB.y - mA.y))) std::fill(g_clip.begin(), g_clip.end(), (char)0);
+    if (ImGui::IsItemHovered()) helpTip("%d output channel(s) (nchnls in Settings). Click to reset clip indicators", masterN);
+    endChildTight();
     ImGui::PopStyleColor();
 }
 
@@ -4670,31 +5249,28 @@ void drawMonitor(float dt) {
     const ImVec2 av = ImGui::GetContentRegionAvail();
     const int sr = g_proj.cs.sr;
 
-    static float L[2048], R[2048], mono[2048], db[1024];
-    masterTap().snapshot(L, R, 2048);
+    static float db[1024];
 
     const ImU32 panel = IM_COL32(14, 14, 16, 255), frame = IM_COL32(40, 40, 46, 255);
     const ImU32 label = IM_COL32(130, 130, 140, 255);
 
     // ---------------- panel layout (only the visible ones, in the order the user arranged them)
     const float pad = S(8);
-    const int masterN = g_liveCsound ? g_engineMaster : masterChannels(g_proj.cs);   // master meter follows the outputs (nchnls)
-    const bool visible[kPanelCount] = {g_viewMeter, g_viewSpectrum, g_viewScope, g_viewConsole};
+    const bool visible[kPanelCount] = {g_viewSpectrum, g_viewScope, g_viewConsole};
     std::vector<int> order;
     for (int k = 0; k < kPanelCount; ++k)
         if (visible[g_panelOrder[k]]) order.push_back(g_panelOrder[k]);
     const int n = (int)order.size();
-    const float minW[kPanelCount] = {S(std::min(260.f, 40.f + masterN * 8.f)), S(120), S(100), S(160)};
-    const float flexWeight[kPanelCount] = {0.f, 3.f, 2.f, 0.f};
+    const float minW[kPanelCount] = {S(120), S(100), S(160)};
+    const float flexWeight[kPanelCount] = {3.f, 2.f, 0.f};
     const float total = av.x - 2 * pad - pad * (float)std::max(0, n - 1);
-    float pw[kPanelCount] = {0.f, 0.f, 0.f, 0.f};
+    float pw[kPanelCount] = {0.f, 0.f, 0.f};
     {
         float fixedSum = 0.f, weightSum = 0.f;
         for (int id : order) {
             float fw = g_panelW[id] > 0.f ? S(g_panelW[id]) : 0.f;
             if (fw <= 0.f) {
-                if (id == kPanelMeter) fw = S(std::min(420.f, std::max(104.f, 40.f + masterN * 28.f)));
-                else if (id == kPanelConsole) fw = std::max(S(260), av.x * 0.28f);
+                if (id == kPanelConsole) fw = std::max(S(260), av.x * 0.28f);
             }
             if (fw > 0.f) { pw[id] = std::max(minW[id], fw); fixedSum += pw[id]; }
             else weightSum += flexWeight[id];
@@ -4719,7 +5295,7 @@ void drawMonitor(float dt) {
             cx += pw[id] + pad;
         }
     }
-    const PRect rm = pr[kPanelMeter], rs = pr[kPanelSpectrum], rc = pr[kPanelScope], rk = pr[kPanelConsole];
+    const PRect rs = pr[kPanelSpectrum], rc = pr[kPanelScope], rk = pr[kPanelConsole];
 
     // drag the gap between two neighbouring panels to resize them (double-click = automatic widths again)
     for (int k = 0; k + 1 < n; ++k) {
@@ -4746,113 +5322,30 @@ void drawMonitor(float dt) {
                     active ? IM_COL32(237, 128, 38, 255) : (ImGui::IsItemHovered() ? IM_COL32(150, 150, 160, 255) : IM_COL32(60, 60, 68, 255)), S(2));
     }
 
-    // ---------------- level meter (always updated): one bar per master output channel
-    if ((int)g_dispDb.size() != masterN) {
-        g_dispDb.assign((size_t)masterN, -90.f);
-        g_holdDb.assign((size_t)masterN, -90.f);
-        g_holdT.assign((size_t)masterN, 0.f);
-        g_clip.assign((size_t)masterN, 0);
-    }
-    for (int ch = 0; ch < masterN; ++ch) {
-        float pk = 0.f;
-        if (g_monAge < 0.5f && (size_t)ch < g_peakIn.size()) pk = g_peakIn[(size_t)ch];
-        else if (ch < 2) {
-            const float* x = ch ? R : L;
-            for (int i = 1024; i < 2048; ++i) pk = std::max(pk, std::fabs(x[i]));
-        }
-        float d = 20.f * std::log10(std::max(pk, 1e-5f));
-        g_dispDb[(size_t)ch] = std::max(d, g_dispDb[(size_t)ch] - 30.f * dt);
-        if (d >= g_holdDb[(size_t)ch]) { g_holdDb[(size_t)ch] = d; g_holdT[(size_t)ch] = 1.5f; }
-        else {
-            g_holdT[(size_t)ch] -= dt;
-            if (g_holdT[(size_t)ch] <= 0.f) g_holdDb[(size_t)ch] = std::max(d, g_holdDb[(size_t)ch] - 20.f * dt);
-        }
-        if (pk >= 1.0f) g_clip[(size_t)ch] = 1;
-    }
-
-    if (g_viewMeter) {
-        const ImVec2 mA = rm.a, mB = rm.b;
-        dl->AddRectFilled(mA, mB, panel, S(4));
-        dl->AddRect(mA, mB, frame, S(4));
-        dl->AddText(ImVec2(mA.x + S(6), mA.y + S(3)), label, "MASTER");
-
-        const float barTop = mA.y + S(34), barBot = mB.y - S(34);
-        const float lo = -60.f, hi = 3.f;
-        auto dbY = [&](float d) {
-            float t = (std::min(hi, std::max(lo, d)) - lo) / (hi - lo);
-            return barBot - t * (barBot - barTop);
-        };
-        const float gap = S(masterN > 8 ? 2.f : 8.f);
-        const float bx0 = mA.x + S(34);
-        const float availBars = std::max(S(8), (mB.x - mA.x) - S(34) - S(8));
-        const float barW = std::max(S(2), std::min(S(20), (availBars - gap * (float)(masterN - 1)) / (float)masterN));
-        const bool roomForNumbers = barW + gap >= S(26), roomForLabels = barW + gap >= S(11);
-
-        for (int ch = 0; ch < masterN; ++ch) {
-            float x0 = bx0 + ch * (barW + gap), x1 = x0 + barW;
-            dl->AddRectFilled(ImVec2(x0, barTop), ImVec2(x1, barBot), IM_COL32(24, 24, 27, 255));
-            struct Zone { float a, b; ImU32 c; };
-            const Zone zones[] = {{lo, -12.f, IM_COL32(70, 190, 90, 255)},
-                                  {-12.f, -3.f, IM_COL32(225, 195, 60, 255)},
-                                  {-3.f, hi, IM_COL32(230, 70, 60, 255)}};
-            for (const Zone& z : zones) {
-                float top = std::min(z.b, g_dispDb[(size_t)ch]);
-                if (top > z.a) dl->AddRectFilled(ImVec2(x0, dbY(top)), ImVec2(x1, dbY(z.a)), z.c);
-            }
-            float hy = dbY(g_holdDb[(size_t)ch]);
-            dl->AddLine(ImVec2(x0, hy), ImVec2(x1, hy), IM_COL32(245, 245, 245, 255), S(2));
-            dl->AddRectFilled(ImVec2(x0, mA.y + S(18)), ImVec2(x1, mA.y + S(28)),
-                              g_clip[(size_t)ch] ? IM_COL32(240, 50, 40, 255) : IM_COL32(50, 24, 24, 255), S(2));
-            if (roomForNumbers) {
-                char buf[16];
-                if (g_holdDb[(size_t)ch] < -90.f) std::snprintf(buf, sizeof buf, "-inf");
-                else std::snprintf(buf, sizeof buf, "%.1f", g_holdDb[(size_t)ch]);
-                dl->AddText(ImVec2(x0, barBot + S(4)), IM_COL32(200, 200, 205, 255), buf);
-            }
-            if (roomForLabels) {
-                char lab[8];
-                if (masterN == 2) std::snprintf(lab, sizeof lab, "%s", ch ? "R" : "L");
-                else if (masterN == 1) std::snprintf(lab, sizeof lab, "M");
-                else std::snprintf(lab, sizeof lab, "%d", ch + 1);
-                dl->AddText(ImVec2(x0 + S(5), barBot + S(18)), label, lab);
-            }
-        }
-        static const float ticks[] = {0.f, -6.f, -12.f, -24.f, -48.f};
-        for (float tk : ticks) {
-            float y = dbY(tk);
-            char buf[8];
-            std::snprintf(buf, sizeof buf, "%d", (int)tk);
-            dl->AddText(ImVec2(mA.x + S(6), y - S(7)), label, buf);
-            dl->AddLine(ImVec2(bx0 - S(4), y), ImVec2(bx0, y), label);
-        }
-        ImGui::SetCursorScreenPos(mA);
-        if (ImGui::InvisibleButton("##meterreset", ImVec2(mB.x - mA.x, mB.y - mA.y))) std::fill(g_clip.begin(), g_clip.end(), (char)0);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%d output channel(s) (nchnls in Settings). Click to reset clip indicators", masterN);
-    }
-
     // ---------------- spectrum
     if (g_viewSpectrum) {
+        // band levels from the engine -> a smooth dB curve over the 1024 display bins (cubic interpolation along log frequency)
         if (g_monAge < 0.5f && g_haveBands) {
-            // band levels from the engine -> a smooth dB curve over the 1024 display bins
             const double ratio = std::pow(18000.0 / 25.0, 1.0 / (kMeterBands - 1));
             float bandDb[kMeterBands];
             for (int b = 0; b < kMeterBands; ++b) bandDb[b] = 20.f * std::log10(std::max(g_bandAmp[b] * 1.4142f, 1e-6f));
+            auto at = [&](int i) { return bandDb[std::min(kMeterBands - 1, std::max(0, i))]; };
             for (int k = 0; k < 1024; ++k) {
                 const double f = std::max(1.0, (double)k * sr / 2048.0);
-                const double pos = std::log(f / 25.0) / std::log(ratio);
-                if (pos <= 0.0) db[k] = bandDb[0];
-                else if (pos >= kMeterBands - 1) db[k] = bandDb[kMeterBands - 1];
-                else {
-                    const int b0 = (int)pos;
-                    const float fr = (float)(pos - b0);
-                    db[k] = bandDb[b0] * (1.f - fr) + bandDb[b0 + 1] * fr;
-                }
+                const double pos = std::min((double)(kMeterBands - 1), std::max(0.0, std::log(f / 25.0) / std::log(ratio)));
+                const int i = (int)pos;
+                db[k] = catmullRom(at(i - 1), at(i), at(i + 1), at(i + 2), (float)(pos - i));
             }
         } else {
-            for (int i = 0; i < 2048; ++i) mono[i] = 0.5f * (L[i] + R[i]);
-            computeSpectrum(mono, 2048, db);
+            for (int k = 0; k < 1024; ++k) db[k] = -120.f;
         }
-        for (int k = 0; k < 1024; ++k) g_specSm[k] = std::max(db[k], g_specSm[k] - 45.f * dt);
+        {
+            static const float fall[] = {90.f, 45.f, 20.f};
+            for (int k = 0; k < 1024; ++k) {
+                if (db[k] > g_specSm[k]) g_specSm[k] += (db[k] - g_specSm[k]) * std::min(1.f, dt * 25.f);   // quick, soft rise
+                else g_specSm[k] = std::max(db[k], g_specSm[k] - fall[g_specFall] * dt);
+            }
+        }
 
         const ImVec2 sA = rs.a, sB = rs.b;
         dl->AddRectFilled(sA, sB, panel, S(4));
@@ -4887,7 +5380,7 @@ void drawMonitor(float dt) {
             }
 
             const float binHz = (float)sr / 2048.f;
-            const int step = 2;
+            const int step = g_specDetail == 0 ? 4 : g_specDetail == 1 ? 2 : 1;
             std::vector<ImVec2> pts;
             for (float px = 0.f; px <= w; px += (float)step) {
                 float fa = fLo * std::pow(fHi / fLo, px / w);
@@ -4902,6 +5395,19 @@ void drawMonitor(float dt) {
             }
             if (pts.size() > 1) dl->AddPolyline(pts.data(), (int)pts.size(), IM_COL32(245, 150, 60, 255), 0, S(1.5f));
             ImGui::PopClipRect();
+        }
+        ImGui::SetCursorScreenPos(sA);
+        ImGui::InvisibleButton("##specmenu", ImVec2(sB.x - sA.x, sB.y - sA.y));
+        if (ImGui::BeginPopupContextItem("##specmenu_popup")) {
+            ImGui::TextDisabled("Drawing resolution");
+            ImGui::RadioButton("Coarse", &g_specDetail, 0); ImGui::SameLine();
+            ImGui::RadioButton("Normal", &g_specDetail, 1); ImGui::SameLine();
+            ImGui::RadioButton("Fine", &g_specDetail, 2);
+            ImGui::TextDisabled("Fall speed");
+            ImGui::RadioButton("Fast", &g_specFall, 0); ImGui::SameLine();
+            ImGui::RadioButton("Medium", &g_specFall, 1); ImGui::SameLine();
+            ImGui::RadioButton("Slow", &g_specFall, 2);
+            ImGui::EndPopup();
         }
     }
 
@@ -4920,33 +5426,39 @@ void drawMonitor(float dt) {
             dl->AddLine(ImVec2(x0, mid + hh), ImVec2(x1, mid + hh), IM_COL32(28, 28, 32, 255));
 
             if (g_monAge < 0.5f) {
+                const int sub = g_scopeSmooth == 0 ? 1 : g_scopeSmooth == 1 ? 4 : 8;   // points drawn between two received points
                 for (int ch = 0; ch < 2; ++ch) {
                     const float* x = ch ? g_scopeR : g_scopeL;
+                    auto at = [&](int i) { return x[std::min(kScopePoints - 1, std::max(0, i))]; };
                     std::vector<ImVec2> pts;
-                    for (int i = 0; i < kScopePoints; ++i)
-                        pts.push_back(ImVec2(x0 + (float)i / (float)(kScopePoints - 1) * w, mid - x[i] * hh));
-                    dl->AddPolyline(pts.data(), (int)pts.size(),
-                                    ch ? IM_COL32(237, 128, 38, 220) : IM_COL32(70, 190, 220, 230), 0, S(1.3f));
+                    for (int i = 0; i < kScopePoints - 1; ++i)
+                        for (int k = 0; k < sub; ++k) {
+                            const float t = (float)k / (float)sub;
+                            const float v = sub == 1 ? at(i) : catmullRom(at(i - 1), at(i), at(i + 1), at(i + 2), t);
+                            pts.push_back(ImVec2(x0 + ((float)i + t) / (float)(kScopePoints - 1) * w, mid - std::min(1.f, std::max(-1.f, v)) * hh));
+                        }
+                    pts.push_back(ImVec2(x1, mid - std::min(1.f, std::max(-1.f, at(kScopePoints - 1))) * hh));
+                    dl->AddPolyline(pts.data(), (int)pts.size(), ch ? IM_COL32(237, 128, 38, 220) : IM_COL32(70, 190, 220, 230), 0, S(1.3f));
                 }
-            } else {
-            int start = 0;
-            for (int i = 1; i < 1024; ++i)
-                if (L[i - 1] < 0.f && L[i] >= 0.f) { start = i; break; }  // rising zero crossing trigger
-            const int count = 1024;
-            const int stride = std::max(1, count / std::max(1, (int)w));
-            for (int ch = 0; ch < 2; ++ch) {
-                const float* x = ch ? R : L;
-                std::vector<ImVec2> pts;
-                for (int i = 0; i < count; i += stride) {
-                    float px = x0 + (float)i / (float)(count - 1) * w;
-                    float v = std::min(1.f, std::max(-1.f, x[start + i]));
-                    pts.push_back(ImVec2(px, mid - v * hh));
-                }
-                if (pts.size() > 1)
-                    dl->AddPolyline(pts.data(), (int)pts.size(),
-                                    ch ? IM_COL32(237, 128, 38, 220) : IM_COL32(70, 190, 220, 230), 0, S(1.3f));
             }
+        }
+        ImGui::SetCursorScreenPos(cA);
+        ImGui::InvisibleButton("##scopemenu", ImVec2(cB.x - cA.x, cB.y - cA.y));
+        if (ImGui::BeginPopupContextItem("##scopemenu_popup")) {
+            ImGui::TextDisabled("Curve");
+            ImGui::RadioButton("Straight", &g_scopeSmooth, 0); ImGui::SameLine();
+            ImGui::RadioButton("Smooth", &g_scopeSmooth, 1); ImGui::SameLine();
+            ImGui::RadioButton("Extra smooth", &g_scopeSmooth, 2);
+            ImGui::TextDisabled("Time window (x range)");
+            for (int ms : {100, 200, 500, 1000, 2000}) {
+                char label[16];
+                if (ms >= 1000) std::snprintf(label, sizeof label, "%d s", ms / 1000);
+                else std::snprintf(label, sizeof label, "%d ms", ms);
+                if (ImGui::RadioButton(label, g_scopeMs == ms)) { g_scopeMs = ms; g_scopeDivSent = false; }
+                if (ms != 2000) ImGui::SameLine();
             }
+            ImGui::TextDisabled("Now %d ms (the engine rounds to whole control periods)", scopeWindowMs());
+            ImGui::EndPopup();
         }
     }
 
@@ -4967,7 +5479,7 @@ void drawMonitor(float dt) {
             const float gripW = id == kPanelConsole ? std::max(S(10), std::min(S(86), panelWidth - S(156))) : std::min(S(86), panelWidth);   // keep the console's Auto / Clear reachable
             ImGui::InvisibleButton("##panel_title", ImVec2(gripW, S(20)));
             ImGui::PopID();
-            if (ImGui::IsItemHovered()) { ImGui::SetMouseCursor(ImGuiMouseCursor_Hand); ImGui::SetTooltip("Drag the title onto another panel to change the order"); }
+            if (ImGui::IsItemHovered()) { ImGui::SetMouseCursor(ImGuiMouseCursor_Hand); helpTip("Drag the title onto another panel to change the order"); }
             if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoPreviewTooltip)) {
                 ImGui::SetDragDropPayload("CAW_PANEL", &id, sizeof(int));
                 ImGui::EndDragDropSource();
@@ -5141,10 +5653,10 @@ void drawSettings() {
         ImGui::TextDisabled("ASIO is a PortAudio host API on Windows, not a Csound -+rtaudio module. Pick an ASIO, WASAPI, or DirectSound device below.");
         row("Output soundcard");
         if (devCombo("##out", s.outDev, g_outDevs)) syncOptionsFromSettings(s);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Csound -odac<N>: the device that plays the sound. System default = -odac. None = no soundcard is opened (Csound still runs in real time, you hear nothing)");
+        if (ImGui::IsItemHovered()) helpTip("Csound -odac<N>: the device that plays the sound. System default = -odac. None = no soundcard is opened (Csound still runs in real time, you hear nothing)");
         row("Input soundcard");
         if (devCombo("##in", s.inDev, g_inDevs)) syncOptionsFromSettings(s);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Csound -iadc<N>: the device Csound records from (only needed if instruments use inch / in). None = no input device");
+        if (ImGui::IsItemHovered()) helpTip("Csound -iadc<N>: the device Csound records from (only needed if instruments use inch / in). None = no input device");
         row("");
         if (ImGui::Button("Refresh Csound devices")) refreshAudioDevices();
         ImGui::TextDisabled("Device labels and IDs come directly from the selected Csound audio module.");
@@ -5175,7 +5687,7 @@ void drawSettings() {
             if (inputMulti("##engine_text", text, boxSize, 0)) applyEngineText(s, text);
             editing = ImGui::IsItemActive();
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("This is the only box: type the Csound options (any line starting with -) and the header values.\nChanges apply as you type. The device lists above also write into it.");
+                helpTip("This is the only box: type the Csound options (any line starting with -) and the header values.\nChanges apply as you type. The device lists above also write into it.");
             const std::string problems = engineTextProblems(text);
             if (!problems.empty()) ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.3f, 1.f), "%s", problems.c_str());
             const std::string effective = s.options.empty() ? defaultOptions(s) : s.options;
@@ -5185,7 +5697,7 @@ void drawSettings() {
             if (s.bufSW < s.ksmps) ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.3f, 1.f), "-b should be at least ksmps");
             ImGui::TextDisabled("kr = sr / ksmps = %.2f Hz", (double)s.sr / std::max(1, s.ksmps));
             ImGui::Checkbox("Send meter data from Csound (master, scope, spectrum, track meters)", &s.monitorFeed);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Adds a small monitor instrument to the engine. Untick it if Csound reports an error about it. Applies on the next Play Csound.");
+            if (ImGui::IsItemHovered()) helpTip("Adds a small monitor instrument to the engine. Untick it if Csound reports an error about it. Applies on the next Run.");
             ImGui::TextDisabled(
                 "Options: any Csound flag, e.g.  -odac -+rtaudio=portaudio -b1024 -B4096 -d  (one line or several lines)\n"
                 "sr        audio sample rate in Hz (44100, 48000 ...)\n"
@@ -5226,7 +5738,7 @@ void drawSettings() {
             }
         }
         row("Tail after last clip (s)");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Seconds of silence rendered after the last note so reverbs and releases can ring out");
+        if (ImGui::IsItemHovered()) helpTip("Seconds of silence rendered after the last note so reverbs and releases can ring out");
         if (ImGui::InputDouble("##tail", &s.tail, 0.5, 2.0, "%.1f")) s.tail = std::min(60.0, std::max(0.0, s.tail));
 
     }
@@ -5299,7 +5811,7 @@ void winMaxTitleButton(int key) {
         dl->AddRect(ImVec2(a.x + m, a.y + m), ImVec2(b.x - m, b.y - m), ink, 0.f, 0, 1.2f);
     }
     ImGui::PopClipRect();
-    if (hovered) ImGui::SetTooltip(w.maxed ? "Restore" : "Maximize");
+    if (hovered) helpTip(w.maxed ? "Restore" : "Maximize");
     if (hovered && ImGui::IsMouseClicked(0)) {
         if (w.maxed) { w.maxed = false; w.restore = true; }
         else { w.pos = pos; w.size = size; w.maxed = true; }
@@ -5358,126 +5870,37 @@ const TextEditor::LanguageDefinition& scLanguage() {
     return language;
 }
 
-const char* kScStarter = R"sc(// SuperCollider clip. The last value is the sound: [left, right] (or one mono signal).
-// Extra values after the second are control signals for a  send:  line (see the demo clip ScPad).
-<caw>
-{ chn: "freq", range: (100,1000,1), value: 440 }
-</caw>
-var f = \freq.kr(440);
-var s = SinOsc.ar(f, 0, 0.1);
-[s, s])sc";
+// The <caw> block (automation channels, midi, sends) of a clip's code, with its tags; empty when there is none.
+std::string cawBlockOf(const std::string& code) {
+    const size_t a = code.find("<caw>"), e = code.find("</caw>");
+    return (a != std::string::npos && e != std::string::npos && e > a) ? code.substr(a, e + 6 - a) + "\n" : std::string();
+}
 
-// ---- Data / signal bridge demo: three languages, one sound.
-//   Pd  "PdSeq"    : runs a note sequence (tempo = automation lane). [s pitch] -> Csound Voice1, channel input1
-//   SC  "ScPad"    : plays a pad (depth = automation lane) and sends its slow LFO (3rd output) -> Csound Voice1, channel input2
-//   Csound "Voice1": receives the pitch (input1) and the filter cutoff (input2) from the other two and plays them.
-// All three also send their audio to the master mix.
-const char* kBridgeVoice = R"csd(; Voice1 receives DATA from Pure Data (pitch, input1) and SuperCollider (filter cutoff, input2)
-<caw>
-{chn: "input1", range: (0,127,0.1), value: 60 }
-{chn: "input2", range: (100,5000,1), value: 1200 }
-</caw>
-kNote caw "input1"
-kCut  caw "input2"
-aEnv  linen 1, 0.05, p3, 0.2
-aSaw  vco2 0.25, cpsmidinn(kNote)     ; vco2 takes a k-rate / i-rate amplitude, so the envelope is applied after it
-aSaw  = aSaw * aEnv
-aOut  moogladder aSaw, limit(kCut, 100, 8000), 0.3
-outs aOut, aOut)csd";
-
-const char* kBridgePd =
-    "#N canvas 0 50 450 300 12;\n"
-    "#X obj 30 20 loadbang;\n"
-    "#X obj 30 50 metro 250;\n"
-    "#X obj 30 80 f;\n"
-    "#X obj 70 80 + 1;\n"
-    "#X obj 30 110 expr 48 + (\\$i1 % 4) * 4 + 12 * ((\\$i1 / 4) % 2);\n"
-    "#X obj 30 140 s pitch;\n"
-    "#X obj 150 140 mtof;\n"
-    "#X obj 150 170 osc~;\n"
-    "#X obj 150 200 *~ 0.03;\n"
-    "#X obj 150 230 dac~;\n"
-    "#X obj 200 20 r tempo;\n"
-    "#X connect 0 0 1 0;\n"
-    "#X connect 1 0 2 0;\n"
-    "#X connect 2 0 3 0;\n"
-    "#X connect 3 0 2 1;\n"
-    "#X connect 2 0 4 0;\n"
-    "#X connect 4 0 5 0;\n"
-    "#X connect 4 0 6 0;\n"
-    "#X connect 6 0 7 0;\n"
-    "#X connect 7 0 8 0;\n"
-    "#X connect 8 0 9 0;\n"
-    "#X connect 8 0 9 1;\n"
-    "#X connect 10 0 1 1;\n"
-    "<caw>\n"
-    "{ chn: \"tempo\", range: (120,500,1), value: 250 }\n"
-    "{ send: \"pitch\", to: \"Voice1\", chn: \"input1\" }\n"
-    "</caw>\n";
-
-const char* kBridgeSc = R"sc(// SuperCollider pad. depth = automation lane (\depth.kr). The 3rd value (slow LFO) is sent to Csound Voice1, channel input2 (filter cutoff).
-<caw>
-{ chn: "depth", range: (0,1,0.01), value: 0.5 }
-{ send: "lfo", to: "Voice1", chn: "input2" }
-</caw>
-var depth = \depth.kr(0.5);
-var lfo = SinOsc.kr(0.4).range(300, 3000);
-var wobble = 1 + (SinOsc.kr(0.2) * 0.004 * depth);
-var pad = Mix(SinOsc.ar([220, 277.2, 329.6] * wobble, 0, 0.05));
-[pad, pad, lfo])sc";
-
-const char* kPdStarter =
-    "#N canvas 0 50 450 300 12;\n"
-    "#X obj 30 30 osc~ 440;\n"
-    "#X obj 30 70 *~ 0.1;\n"
-    "#X obj 30 110 dac~;\n"
-    "#X connect 0 0 1 0;\n"
-    "#X connect 1 0 2 0;\n"
-    "#X connect 1 0 2 1;\n";
-
-const char* kPdDemo =
-    "#N canvas 0 50 450 300 12;\n"
-    "#X obj 30 20 r freq;\n"
-    "#X obj 30 50 osc~;\n"
-    "#X obj 30 80 *~ 0.1;\n"
-    "#X obj 30 110 dac~;\n"
-    "#X connect 0 0 1 0;\n"
-    "#X connect 1 0 2 0;\n"
-    "#X connect 2 0 3 0;\n"
-    "#X connect 2 0 3 1;\n"
-    "<caw>\n"
-    "{ chn: \"freq\", range: (100,1000,1), value: 440 }\n"
-    "</caw>\n";
-
-// Language of one clip: Csound code or a Pure Data patch. Switching keeps the other language's text, so you can switch back.
-// Returns true when the language (and so the code) changed.
+// Changing the language empties the code: only the <caw> block stays (the automation channels belong to the clip, not to the language).
 bool languageCombo(const char* id, Clip& clip) {
     static const char* names[] = {"Csound", "Pure Data", "SuperCollider"};
-    static std::map<std::pair<int, int>, std::string> stash;   // (clip id, language) -> text typed in that language
     bool changed = false;
     ImGui::SetNextItemWidth(ImGui::CalcTextSize("SuperCollider").x + ImGui::GetStyle().FramePadding.x * 2.f + ImGui::GetFrameHeight() + S(14));   // fits the longest name
     if (ImGui::BeginCombo(id, names[std::min(2, std::max(0, clip.lang))])) {
         for (int i = 0; i < 3; ++i) {
             if (ImGui::Selectable(names[i], clip.lang == i) && clip.lang != i) {
-                stash[{clip.id, clip.lang}] = clip.code;
+                clip.code = cawBlockOf(clip.code);
                 clip.lang = i;
-                const auto old = stash.find({clip.id, i});
-                clip.code = old != stash.end() ? old->second : (i == 1 ? std::string(kPdStarter) : i == 2 ? std::string(kScStarter) : std::string(kLead));
                 changed = true;
             }
         }
         ImGui::EndCombo();
     }
     if (ImGui::IsItemHovered() && clip.lang == 1)
-        ImGui::SetTooltip("Pure Data: write the patch text (.pd), or one line  load: C:/patches  to load <folder>/<instrument name>.pd. A <caw> block adds automation ([r name]) and sends to Csound. With  midi: \"on\"  in the <caw> block the MIDI lane plays the patch: [r midinote] (pitch velocity, velocity 0 = note off), [r midipitch], [r midivel], [r midigate]. Inputs p4, p5 ...: put [inlet] objects in the patch, the RIGHT-most inlet is p4, the next one to its left p5 ... (Pd sends right to left, so p4 arrives first and the left inlet last). Values come from <caw> lines like {p: 4, from: 60, +4}, one value per copy (the x box); in a MIDI clip p4 = pitch and p5 = velocity unless a p-line sets them. Rendered offline to a wav, [dac~] goes to the clip. Pd path: Settings.");
+        helpTip("Pure Data: write the patch text (.pd), or one line  load: C:/patches  to load <folder>/<instrument name>.pd. A <caw> block adds automation ([r name]) and sends to Csound. With  midi: \"on\"  in the <caw> block the MIDI lane plays the patch: [r midinote] (pitch velocity, velocity 0 = note off), [r midipitch], [r midivel], [r midigate]. Inputs p4, p5 ...: put [inlet] objects in the patch, the RIGHT-most inlet is p4, the next one to its left p5 ... (Pd sends right to left, so p4 arrives first and the left inlet last). Values come from <caw> lines like {p: 4, from: 60, +4}, one value per copy (the x box); in a MIDI clip p4 = pitch and p5 = velocity unless a p-line sets them. Rendered offline to a wav, [dac~] goes to the clip. Pd path: Settings.");
     if (ImGui::IsItemHovered() && clip.lang == 2)
-        ImGui::SetTooltip("SuperCollider: the code is the body of a function, the last value is the sound: [left, right] (or mono). More values after the second are control signals that a  send:  line in the <caw> block delivers to a Csound clip. Automation lane  chn: \"cutoff\"  = \\cutoff.kr(440) in the code. With  midi: \"on\"  in the <caw> block the MIDI lane plays the code: one synth per note with \\note.kr(60) (0..127), \\vel.kr(100) (1..127) and \\gate.kr(1) (0 when the note ends); end it with EnvGen.kr(Env.adsr, gate, doneAction: 2). Rendered offline (Score.recordNRT). Inputs: p4, p5 ... and indx (copy number), iRun (number of copies) are ready-made variables in the code; <caw> lines like {p: 4, from: 60, +4} give every copy (x box) its value; in a MIDI clip p4 = pitch and p5 = velocity unless a p-line sets them. Program path: Settings.");
+        helpTip("SuperCollider: the code is the body of a function, the last value is the sound: [left, right] (or mono). More values after the second are control signals that a  send:  line in the <caw> block delivers to a Csound clip. Automation lane  chn: \"cutoff\"  = \\cutoff.kr(440) in the code. With  midi: \"on\"  in the <caw> block the MIDI lane plays the code: one synth per note with \\note.kr(60) (0..127), \\vel.kr(100) (1..127) and \\gate.kr(1) (0 when the note ends); end it with EnvGen.kr(Env.adsr, gate, doneAction: 2). Rendered offline (Score.recordNRT). Inputs: p4, p5 ... and indx (copy number), iRun (number of copies) are ready-made variables in the code; <caw> lines like {p: 4, from: 60, +4} give every copy (x box) its value; in a MIDI clip p4 = pitch and p5 = velocity unless a p-line sets them. Program path: Settings.");
     return changed;
 }
 
 // Source editor bound to one std::string; each clip (and each lane template) has its own instance.
 // Returns true when the user edited the text this frame.
-bool codeEditorBody(std::unordered_map<int, std::unique_ptr<TextEditor>>& editors, int key, std::string& code, float reserveBottom = 0.f, int lang = 0) {
+bool codeEditorBody(std::unordered_map<int, std::unique_ptr<TextEditor>>& editors, int key, std::string& code, float reserveBottom = 0.f, int lang = 0, bool diag = false) {
     static std::unordered_map<const void*, std::string> lastText;  // what each editor showed last frame
     auto& editor = editors[key];
     if (!editor) {
@@ -5497,11 +5920,18 @@ bool codeEditorBody(std::unordered_map<int, std::unique_ptr<TextEditor>>& editor
     }
     std::string& last = lastText[editor.get()];
     if (code != last) { editor->SetText(code); last = code; }  // changed elsewhere (shared instrument)
+    if (diag) {   // clip editors: red marks on the lines the console reported, and "go to line" from the console
+        const auto mk = g_diagMarks.find(key);
+        editor->SetErrorMarkers(mk == g_diagMarks.end() ? TextEditor::ErrorMarkers() : mk->second);
+        const auto gl = g_gotoLine.find(key);
+        if (gl != g_gotoLine.end()) { editor->SetCursorPosition(TextEditor::Coordinates(std::max(0, gl->second - 1), 0)); g_gotoLine.erase(gl); }
+    }
     const float editorHeight = std::max(S(120), ImGui::GetContentRegionAvail().y - S(4) - reserveBottom);
     editor->Render(("Code##" + std::to_string(key)).c_str(), ImVec2(-FLT_MIN, editorHeight), true);
     if (ImGui::IsMouseClicked(0) && ImGui::IsItemHovered()) g_codeClickHit = true;
     std::string edited = editor->GetText();
     if (edited != last) {
+        if (diag) g_diagMarks.erase(key);   // the lines moved: the old marks would sit on the wrong lines
         code = edited;
         last = std::move(edited);
         if (lang == 0) scanUserOpcodes(code);
@@ -5516,6 +5946,75 @@ bool colorPicker(const char* id, uint32_t& color, uint32_t fallback) {
     if (!ImGui::ColorEdit3(id, rgb, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel)) return false;
     color = 0x01000000u | ((uint32_t)std::lround(rgb[0] * 255.f) << 16) |
             ((uint32_t)std::lround(rgb[1] * 255.f) << 8) | (uint32_t)std::lround(rgb[2] * 255.f);
+    return true;
+}
+
+// ---- Pure Data clips: the patch is built in Pd, the code editor shows it as readable text
+// Splits a clip's code into the patch and its <caw> block.
+void splitCaw(const std::string& code, std::string& patch, std::string& caw) {
+    caw = cawBlockOf(code);
+    patch = code;
+    const size_t a = code.find("<caw>"), e = code.find("</caw>");
+    if (!caw.empty()) {
+        patch.erase(a, e + 6 - a);
+        while (!patch.empty() && (patch.back() == '\n' || patch.back() == '\r')) patch.pop_back();
+        if (!patch.empty()) patch += "\n";
+    }
+}
+
+std::string pdEditFile(const Clip& clip) {
+    const std::filesystem::path dir = workDir() / "pd_edit";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return (dir / (clip.name + ".pd")).string();
+}
+
+// Writes the patch of the clip to a file and opens it in Pure Data.
+void editClipInPd(const Clip& clip) {
+    std::string patch, caw;
+    splitCaw(clip.code, patch, caw);
+    if (patch.find("#N") == std::string::npos) patch = pdEmptyPatch();
+    const std::string file = pdEditFile(clip);
+    if (!writeTextFile(file, patch)) { logLine("[caw] ERROR: could not write " + file); return; }
+    const std::string exe = pdExePath();
+    const std::string args = "\"" + file + "\"";
+    if ((INT_PTR)ShellExecuteA(nullptr, "open", exe.c_str(), args.c_str(), nullptr, SW_SHOWNORMAL) <= 32)
+        logLine("[caw] ERROR: could not start Pure Data (" + exe + "). Set the Pd path in Settings.");
+    else logLine("[caw] Pd clip " + clip.name + " opened in Pure Data. Save the patch there, then press Reload.");
+}
+
+// Takes the patch back from the file Pure Data saved. The <caw> block of the clip stays.
+bool reloadClipFromPd(Clip& clip) {
+    std::ifstream f(pdEditFile(clip), std::ios::binary);
+    if (!f) { logLine("[caw] ERROR: no saved patch for " + clip.name + " yet. Press Edit in Pd first."); return false; }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::string patch, caw, ignored;
+    splitCaw(clip.code, ignored, caw);
+    patch = ss.str();
+    if (!patch.empty() && patch.back() != '\n') patch += "\n";
+    clip.code = patch + caw;
+    logLine("[caw] Pd clip " + clip.name + ": patch reloaded.");
+    return true;
+}
+
+// The readable text of a Pd clip, edited in the code editor. Returns true when the clip code changed.
+bool pdReadableBody(Clip& clip, float reserveBottom) {
+    std::string& text = g_pdReadText[clip.id];
+    std::string& madeFrom = g_pdReadFor[clip.id];
+    if (text.empty() || madeFrom != clip.code) {
+        std::string patch, caw;
+        splitCaw(clip.code, patch, caw);
+        text = pdToReadable(patch) + (caw.empty() ? std::string() : "\n" + caw);
+        madeFrom = clip.code;
+    }
+    if (!codeEditorBody(g_pdReadEditors, clip.id, text, reserveBottom, 1, true)) return false;
+    std::string oldPatch, oldCaw, shown, newCaw;
+    splitCaw(clip.code, oldPatch, oldCaw);
+    splitCaw(text, shown, newCaw);
+    std::string patch = pdApplyReadable(oldPatch, shown);
+    clip.code = patch + newCaw;
+    madeFrom = clip.code;
     return true;
 }
 
@@ -5536,6 +6035,7 @@ void drawEditor() {
             ImGui::SetNextWindowSize(ImVec2(S(720), S(540)), ImGuiCond_FirstUseEver);
             ImGui::SetNextWindowPos(ImVec2(S(300), S(150)), ImGuiCond_FirstUseEver);
             winMaxPrepare(clip.id);
+            if (g_focusClipWin == clip.id) { ImGui::SetNextWindowCollapsed(false); ImGui::SetNextWindowFocus(); g_focusClipWin = -1; }
             const std::string title = "Code editor - " + clip.name + "###clip_editor_" + std::to_string(clip.id);
             bool open = clip.editorOpen;
             if (ImGui::Begin(title.c_str(), &open)) {
@@ -5552,23 +6052,23 @@ void drawEditor() {
                 const std::string nameBefore = clip.name;
                 if (inputStr("##clip_instrument_name", clip.name, 0, nameFilter)) renameClipGroup(clip, nameBefore);
                 if (!ImGui::IsItemActive()) ensureUniqueClipName(clip);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Instrument name (unique in the project)");
+                if (ImGui::IsItemHovered()) helpTip("Instrument name (unique in the project)");
                 ImGui::SameLine();
                 colorPicker("##clip_color", clip.color, lane.color);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clip color");
+                if (ImGui::IsItemHovered()) helpTip("Clip color");
                 ImGui::SameLine();
                 {
                     const float rest = ImGui::GetContentRegionAvail().x - (isMidi ? S(120) : 0.f) - S(270);
                     ImGui::SetNextItemWidth(std::max(S(90), rest));
                     inputStr("##clip_note", clip.note, 0);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Info shown on the clip (empty = first comment line of the code)");
+                    if (ImGui::IsItemHovered()) helpTip("Info shown on the clip (empty = first comment line of the code)");
                 }
                 ImGui::SameLine();
                 const bool clipIsRunning = clipRunning(clip);
-                if (ImGui::SmallButton(clipIsRunning ? "Stop" : "Run clip")) {
+                if (ImGui::SmallButton(clipIsRunning ? "Stop" : (clip.lang == 1 ? "Run Pd" : clip.lang == 2 ? "Run SC" : "Run Csound"))) {
                     if (clipIsRunning) stopClipRun(clip); else runClip(clip);
                 }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip(clipIsRunning ? "Stop this clip" : "Play this clip in the running Csound (Play Csound), or run it alone without sound and print the errors in the console, with the instrument name and the line of this code");
+                if (ImGui::IsItemHovered()) helpTip(clipIsRunning ? "Stop this clip" : "Play this clip in the running Csound (Run), or run it alone without sound and print the errors in the console, with the instrument name and the line of this code");
                 if (clip.lang == 1 && clip.code.find("#N") == std::string::npos) {
                     // the clip only points to a .pd file (load: ...): copy the patch text into the clip so it lives in the project and is visible here
                     ImGui::SameLine();
@@ -5583,7 +6083,7 @@ void drawEditor() {
                             logLine("[caw] Imported the Pure Data patch into clip " + clip.name + " (now saved inside the project).");
                         } else if (!error.empty()) logLine("[caw] ERROR: " + error);
                     }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy the patch of the  load:  line into this clip, so you can see and edit it here and it is saved in the project");
+                    if (ImGui::IsItemHovered()) helpTip("Copy the patch of the  load:  line into this clip, so you can see and edit it here and it is saved in the project");
                 }
                 if (isMidi) {
                     ImGui::SameLine();
@@ -5592,7 +6092,20 @@ void drawEditor() {
 
                 // ---- code
                 const float bottomRow = ImGui::GetFrameHeight() + S(10);
-                if (codeEditorBody(g_clipCodeEditors, clip.id, clip.code, bottomRow, clip.lang) || langChanged) syncSharedCode(clip);
+                bool codeEdited = false;
+                if (clip.lang == 1) {   // Pure Data: build the patch in Pd, change the small things here
+                    if (ImGui::SmallButton("Edit in Pd")) editClipInPd(clip);
+                    if (ImGui::IsItemHovered()) helpTip("Open this patch in Pure Data. Build and connect it there, save it, then press Reload.");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Reload")) codeEdited = reloadClipFromPd(clip);
+                    if (ImGui::IsItemHovered()) helpTip("Take the patch you saved in Pure Data back into this clip");
+                    ImGui::SameLine();
+                    bool raw = g_pdRawClips.count(clip.id) > 0;
+                    if (ImGui::Checkbox("Raw patch text", &raw)) { if (raw) g_pdRawClips.insert(clip.id); else g_pdRawClips.erase(clip.id); }
+                }
+                if (clip.lang == 1 && clip.code.find("#N") != std::string::npos && !g_pdRawClips.count(clip.id)) codeEdited = pdReadableBody(clip, bottomRow) || codeEdited;
+                else codeEdited = codeEditorBody(g_clipCodeEditors, clip.id, clip.code, bottomRow, clip.lang, true) || codeEdited;
+                if (codeEdited || langChanged) syncSharedCode(clip);
 
                 // ---- bottom row: start | duration | end | x times
                 ImGui::SetNextItemWidth(S(120));
@@ -5609,13 +6122,13 @@ void drawEditor() {
                     int runs = clip.runs;
                     ImGui::SetNextItemWidth(S(60));
                     if (ImGui::InputInt("##clip_runs", &runs, 0, 0)) clip.runs = std::min(256, std::max(1, runs));
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("How many times the instrument runs. Csound: with a <caw> {p: ...} / dawrun line that many copies start together at the clip start (restart Csound after changing it), without: the clip is split into this many equal slots. Pure Data / SuperCollider: that many copies of the patch / synth play together; the <caw> {p: 4, ...} lines give every copy its p4, p5 ... (Pd: [inlet] objects, right-most inlet = p4. SuperCollider: variables p4, p5 ..., indx, iRun).");
+                    if (ImGui::IsItemHovered()) helpTip("How many times the instrument runs. Csound: with a <caw> {p: ...} / dawrun line that many copies start together at the clip start (restart Csound after changing it), without: the clip is split into this many equal slots. Pure Data / SuperCollider: that many copies of the patch / synth play together; the <caw> {p: 4, ...} lines give every copy its p4, p5 ... (Pd: [inlet] objects, right-most inlet = p4. SuperCollider: variables p4, p5 ..., indx, iRun).");
                 }
                 {   // score options of this clip
                     ImGui::SameLine();
                     if (ImGui::SmallButton("Score...")) ImGui::OpenPopup("clip_score_popup");
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("How this clip appears in the printed score: lane, MIDI notes (every note / overall up-down), style, text");
-                    if (ImGui::BeginPopup("clip_score_popup")) { drawClipScoreMenu(clip, (int)(&lane - &g_proj.tracks[0])); ImGui::EndPopup(); }
+                    if (ImGui::IsItemHovered()) helpTip("How this clip appears in the printed score: shape, overall or detail, role, language");
+                    if (ImGui::BeginPopup("clip_score_popup")) { drawClipScoreMenu(clip, &lane); ImGui::EndPopup(); }
                 }
                 ImGui::SetWindowFontScale(1.f);
                 if (g_codeFonts[style]) ImGui::PopFont();
@@ -5652,6 +6165,274 @@ const char* midiPitchName(int pitch) {
     static char text[16];
     std::snprintf(text, sizeof(text), "%s%d", names[pitch % 12], pitch / 12 - 1);
     return text;
+}
+
+// ONE piano roll for several MIDI clips (select the MIDI clips in the timeline, press Enter). Every clip keeps its own notes and colour;
+// new notes go to the clip chosen in "Add notes to". Note times are stored relative to their MIDI clip, like in the single editor.
+void drawMultiMidiEditor() {
+    if (!g_multiMidiOpen) return;
+    g_multiMidiIds.erase(std::remove_if(g_multiMidiIds.begin(), g_multiMidiIds.end(), [](int id) { return findMidiClip(id) == nullptr; }), g_multiMidiIds.end());
+    if (g_multiMidiIds.empty()) { g_multiMidiOpen = false; return; }
+    static float scrollX = 0.f, pps = 120.f;
+    static int pitchLow = 48, activeId = -1;
+    static std::set<std::pair<int, int>> sel;                          // (MIDI clip id, note index)
+    struct Orig { int id, idx; double start; int pitch; };
+    static std::vector<Orig> origs;
+    static int dragMode = 0;                                           // 0 none, 1 move, 2 resize
+    static std::pair<int, int> dragNote(-1, -1);
+    static double grabT = 0.0;
+    static int grabP = 0;
+    static bool marquee = false, marqueeMoved = false, marqueeAdd = false, rulerDrag = false;
+    static ImVec2 marqueeStart;
+    if (std::find(g_multiMidiIds.begin(), g_multiMidiIds.end(), activeId) == g_multiMidiIds.end()) activeId = g_multiMidiIds.front();
+    ImGui::SetNextWindowSize(ImVec2(S(1000), S(700)), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(S(280), S(120)), ImGuiCond_FirstUseEver);
+    bool open = true;
+    if (ImGui::Begin("MIDI Editor - several clips###midi_multi_editor", &open)) {
+        ImGuiIO& io = ImGui::GetIO();
+        const ImVec2 mouse = io.MousePos;
+        if (ImGui::IsWindowAppearing()) {
+            double lo = 1e300;
+            for (int id : g_multiMidiIds) if (const MidiClip* mc = findMidiClip(id)) lo = std::min(lo, mc->start);
+            scrollX = (float)std::max(0.0, lo - 0.25);
+            sel.clear();
+        }
+        {
+            ImGui::SetNextItemWidth(S(140));
+            ImGui::SliderFloat("##multi_zoom", &pps, 30.f, 800.f, "%.0f px/s");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Octave -")) pitchLow = std::max(0, pitchLow - 12);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Octave +")) pitchLow = std::min(127 - kMidiVisiblePitches + 1, pitchLow + 12);
+            ImGui::SameLine();
+            if (!sel.empty() && ImGui::SmallButton("Delete notes")) {
+                std::map<int, std::vector<int>> per;
+                for (const auto& s : sel) per[s.first].push_back(s.second);
+                for (auto& [id, list] : per) {
+                    MidiClip* mc = findMidiClip(id);
+                    if (!mc) continue;
+                    std::sort(list.rbegin(), list.rend());
+                    for (int ni : list) if (ni >= 0 && ni < (int)mc->notes.size()) mc->notes.erase(mc->notes.begin() + ni);
+                }
+                sel.clear();
+            }
+            {   // selected notes: pitch / start / duration boxes like the single MIDI editor (adding notes is not possible here)
+                for (auto it = sel.begin(); it != sel.end();) {
+                    const MidiClip* sm = findMidiClip(it->first);
+                    it = (!sm || it->second < 0 || it->second >= (int)sm->notes.size()) ? sel.erase(it) : std::next(it);
+                }
+                if (sel.size() == 1) {
+                    MidiClip* smc = findMidiClip(sel.begin()->first);
+                    MidiNote& selected = smc->notes[(size_t)sel.begin()->second];
+                    ImGui::Text("Selected note:");
+                    ImGui::SameLine(); ImGui::Text("%s", midiPitchName(selected.pitch));
+                    ImGui::SameLine(); ImGui::SetNextItemWidth(S(100)); ImGui::InputInt("##multi_pitch", &selected.pitch, 0, 0);
+                    selected.pitch = std::min(127, std::max(0, selected.pitch));
+                    ImGui::SameLine(); ImGui::SetNextItemWidth(S(120)); ImGui::InputDouble("##multi_start", &selected.start, 0.0, 0.0, "+%.2f s");
+                    if (ImGui::IsItemHovered()) helpTip("Start, relative to the start of its MIDI clip");
+                    selected.start = std::max(0.0, selected.start);
+                    {   // the same start on the timeline
+                        double absStart = smc->start + selected.start;
+                        ImGui::SameLine(); ImGui::SetNextItemWidth(S(130));
+                        if (ImGui::InputDouble("##multi_start_abs", &absStart, 0.0, 0.0, "@%.2f s")) selected.start = std::max(0.0, absStart - smc->start);
+                        if (ImGui::IsItemHovered()) helpTip("Start on the timeline (the start before it is relative to its MIDI clip)");
+                    }
+                    ImGui::SameLine(); ImGui::SetNextItemWidth(S(120)); ImGui::InputDouble("##multi_dur", &selected.dur, 0.0, 0.0, "%.2f s");
+                    if (ImGui::IsItemHovered()) helpTip("Duration of the note");
+                    selected.dur = std::max(0.001, selected.dur);
+                    ImGui::SameLine(); ImGui::Text("Vel"); ImGui::SameLine(0, S(4)); ImGui::SetNextItemWidth(S(70)); ImGui::InputInt("##multi_velocity", &selected.velocity, 0, 0);
+                    selected.velocity = std::min(127, std::max(1, selected.velocity));
+                } else if (sel.size() > 1) {
+                    ImGui::Text("%d notes selected", (int)sel.size());
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Sync start")) {   // all selected notes start together (on the timeline), at the earliest one
+                        double first = 1e300;
+                        for (const auto& sp : sel) if (const MidiClip* sm = findMidiClip(sp.first)) first = std::min(first, sm->start + sm->notes[(size_t)sp.second].start);
+                        for (const auto& sp : sel) if (MidiClip* sm = findMidiClip(sp.first)) sm->notes[(size_t)sp.second].start = std::max(0.0, first - sm->start);
+                    }
+                    if (ImGui::IsItemHovered()) helpTip("Sync start: the selected notes all start at the same time on the timeline (the earliest of them)");
+                } else {
+                    ImGui::TextDisabled("%d clips in this roll. Click a note to select it and edit it here, drag to box-select (Ctrl adds), drag notes to move, drag a right edge to resize, Del deletes. Notes cannot be added here.", (int)g_multiMidiIds.size());
+                }
+            }
+        }
+        const int pitchHigh = pitchLow + kMidiVisiblePitches - 1;
+        const float keyboardW = S(64), rowH = S(kMidiRowH), rollH = rowH * (float)kMidiVisiblePitches;
+        ImGui::BeginChild("##multi_roll", ImVec2(0, std::max(S(360), rollH + S(26))), true, ImGuiWindowFlags_HorizontalScrollbar);
+        const ImVec2 origin = ImGui::GetCursorScreenPos();
+        const ImVec2 available = ImGui::GetContentRegionAvail();
+        const ImVec2 rollMin(origin.x, origin.y), rollMax(origin.x + available.x, origin.y + rollH + S(24));
+        const float pianoX = origin.x + keyboardW, pianoRight = rollMax.x, rulerY = origin.y, pitchY = origin.y + S(24);
+        ImGui::InvisibleButton("##multi_canvas", ImVec2(available.x, rollH + S(24)));
+        const bool hovered = ImGui::IsItemHovered();
+        if (hovered && io.KeyCtrl && io.MouseWheel != 0.f) {
+            const double tm = scrollX + (double)(io.MousePos.x - pianoX) / std::max(1.f, pps);
+            pps = std::min(800.f, std::max(30.f, pps * (1.f + 0.12f * io.MouseWheel)));
+            scrollX = (float)std::max(0.0, tm - (double)(io.MousePos.x - pianoX) / pps);
+        } else if (hovered && (io.MouseWheelH != 0.f || (io.KeyShift && io.MouseWheel != 0.f))) {
+            const float wheel = io.MouseWheelH != 0.f ? io.MouseWheelH : io.MouseWheel;
+            scrollX = std::max(0.f, scrollX - wheel * 60.f / std::max(1.f, pps));
+        }
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImGui::PushClipRect(rollMin, rollMax, true);
+        dl->AddRectFilled(rollMin, rollMax, IM_COL32(22, 23, 26, 255));
+        dl->AddRectFilled(ImVec2(origin.x, pitchY), ImVec2(pianoX, pitchY + rollH), IM_COL32(31, 32, 36, 255));
+        dl->AddRectFilled(ImVec2(pianoX, rulerY), ImVec2(pianoRight, pitchY), IM_COL32(31, 32, 36, 255));
+        const double viewStart = std::max(0.0, (double)scrollX), viewEnd = viewStart + (pianoRight - pianoX) / std::max(1.f, pps);
+        auto timeX = [&](double t) { return pianoX + (float)(t - viewStart) * pps; };
+        auto xTime = [&](float x) { return viewStart + (double)(x - pianoX) / std::max(1.f, pps); };
+        for (long long k = (long long)std::floor(viewStart / 0.25); k * 0.25 <= viewEnd; ++k) {
+            const float x = timeX(k * 0.25);
+            const bool major = (k % 4) == 0;
+            dl->AddLine(ImVec2(x, pitchY), ImVec2(x, pitchY + rollH), major ? IM_COL32(58, 59, 66, 255) : IM_COL32(38, 39, 44, 255));
+            if (major) { char label[24]; std::snprintf(label, sizeof(label), "%.1fs", k * 0.25); dl->AddText(ImVec2(x + S(3), rulerY + S(4)), IM_COL32(174, 175, 183, 255), label); }
+        }
+        for (int pitch = pitchHigh; pitch >= pitchLow; --pitch) {
+            const float y0 = pitchY + (pitchHigh - pitch) * rowH;
+            const bool black = (pitch % 12 == 1 || pitch % 12 == 3 || pitch % 12 == 6 || pitch % 12 == 8 || pitch % 12 == 10);
+            dl->AddRectFilled(ImVec2(pianoX, y0), ImVec2(pianoRight, y0 + rowH), black ? IM_COL32(27, 28, 32, 255) : IM_COL32(35, 36, 40, 255));
+            dl->AddLine(ImVec2(origin.x, y0 + rowH), ImVec2(pianoRight, y0 + rowH), IM_COL32(48, 49, 55, 255));
+            dl->AddText(ImVec2(origin.x + S(6), y0 + S(1)), pitch % 12 == 0 ? IM_COL32(210, 211, 218, 255) : IM_COL32(138, 140, 148, 255), midiPitchName(pitch));
+        }
+        // the extent of every clip: a coloured bar on the ruler (the active clip is thicker)
+        for (int id : g_multiMidiIds) {
+            int li = 0;
+            MidiClip* mc = findMidiClip(id, &li);
+            const Clip* tg = mc ? findClip(mc->clipId) : nullptr;
+            if (!mc || !tg) continue;
+            const ImU32 edge = trackColor(li, 220, clipColorValue(g_proj.tracks[(size_t)li], *tg));
+            const float a = std::max(pianoX, timeX(mc->start)), b = std::min(pianoRight, timeX(mc->start + mc->dur));
+            if (b > a) dl->AddRectFilled(ImVec2(a, rulerY + S(18)), ImVec2(b, rulerY + S(18) + (id == activeId ? S(5) : S(2.5f))), edge);
+            if (timeX(mc->start) >= pianoX && timeX(mc->start) <= pianoRight) dl->AddLine(ImVec2(timeX(mc->start), pitchY), ImVec2(timeX(mc->start), pitchY + rollH), edge, S(1));
+            if (timeX(mc->start + mc->dur) >= pianoX && timeX(mc->start + mc->dur) <= pianoRight) dl->AddLine(ImVec2(timeX(mc->start + mc->dur), pitchY), ImVec2(timeX(mc->start + mc->dur), pitchY + rollH), edge, S(1));
+        }
+        for (int id : g_multiMidiIds) {
+            int li = 0;
+            MidiClip* mc = findMidiClip(id, &li);
+            const Clip* tg = mc ? findClip(mc->clipId) : nullptr;
+            if (!mc || !tg) continue;
+            const uint32_t rgb = clipColorValue(g_proj.tracks[(size_t)li], *tg);
+            for (int ni = 0; ni < (int)mc->notes.size(); ++ni) {
+                const MidiNote& n = mc->notes[(size_t)ni];
+                if (n.pitch < pitchLow || n.pitch > pitchHigh) continue;
+                const float y0 = pitchY + (pitchHigh - n.pitch) * rowH + S(1), y1 = y0 + rowH - S(2);
+                const float x0 = timeX(mc->start + n.start), x1 = timeX(mc->start + n.start + n.dur);
+                if (x1 < pianoX || x0 > pianoRight) continue;
+                const bool selected = sel.count({id, ni}) > 0;
+                dl->AddRectFilled(ImVec2(x0, y0), ImVec2(std::max(x0 + S(5), x1), y1), trackColor(li, selected ? 255 : (id == activeId ? 230 : 170), rgb), S(2));
+                dl->AddRect(ImVec2(x0, y0), ImVec2(std::max(x0 + S(5), x1), y1), selected ? IM_COL32(255, 255, 255, 255) : IM_COL32(0, 0, 0, 150), S(2));
+                char vel[16];
+                std::snprintf(vel, sizeof(vel), "%d", n.velocity);
+                if (x1 - x0 > S(24)) dl->AddText(ImVec2(x0 + S(3), y0), IM_COL32(255, 255, 255, 230), vel);
+            }
+        }
+        {   // playhead
+            if (hovered && ImGui::IsMouseClicked(0) && mouse.x >= pianoX && mouse.y >= rulerY && mouse.y < pitchY) rulerDrag = true;
+            if (rulerDrag) {
+                if (ImGui::IsMouseDown(0)) { g_play = std::max(0.0, xTime(std::min(pianoRight, std::max(pianoX, mouse.x)))); g_resync = 2; }
+                else rulerDrag = false;
+            }
+            const float px = timeX(g_play);
+            if (px >= pianoX && px <= pianoRight) {
+                dl->AddLine(ImVec2(px, rulerY), ImVec2(px, pitchY + rollH), IM_COL32(255, 90, 80, 255), S(2));
+                dl->AddTriangleFilled(ImVec2(px - S(5), rulerY), ImVec2(px + S(5), rulerY), ImVec2(px, rulerY + S(9)), IM_COL32(255, 90, 80, 255));
+            }
+        }
+        auto pitchAt = [&](float y) { return std::min(pitchHigh, std::max(pitchLow, pitchHigh - (int)((y - pitchY) / rowH))); };
+        if (hovered && ImGui::IsMouseClicked(0) && mouse.x >= pianoX && mouse.y >= pitchY && mouse.y <= pitchY + rollH) {
+            const int pitch = pitchAt(mouse.y);
+            const double time = xTime(mouse.x);                                   // absolute
+            const bool additive = io.KeyCtrl || io.KeyShift;
+            std::pair<int, int> hit(-1, -1);
+            for (int gi = (int)g_multiMidiIds.size() - 1; gi >= 0 && hit.first < 0; --gi) {
+                const MidiClip* mc = findMidiClip(g_multiMidiIds[(size_t)gi]);
+                if (!mc) continue;
+                for (int ni = (int)mc->notes.size() - 1; ni >= 0; --ni) {
+                    const MidiNote& n = mc->notes[(size_t)ni];
+                    if (n.pitch == pitch && time >= mc->start + n.start && time <= mc->start + n.start + n.dur) { hit = {mc->id, ni}; break; }
+                }
+            }
+            if (hit.first >= 0) {
+                if (additive) { if (sel.count(hit)) sel.erase(hit); else sel.insert(hit); }
+                else if (!sel.count(hit)) { sel.clear(); sel.insert(hit); }
+                if (sel.count(hit)) {
+                    const MidiClip* mc = findMidiClip(hit.first);
+                    const MidiNote& n = mc->notes[(size_t)hit.second];
+                    dragMode = mouse.x >= timeX(mc->start + n.start + n.dur) - S(8) ? 2 : 1;
+                    if (dragMode == 2) { sel.clear(); sel.insert(hit); }
+                    origs.clear();
+                    for (const auto& s : sel) if (const MidiClip* sm = findMidiClip(s.first)) if (s.second >= 0 && s.second < (int)sm->notes.size()) origs.push_back({s.first, s.second, sm->notes[(size_t)s.second].start, sm->notes[(size_t)s.second].pitch});
+                    dragNote = hit; grabT = time; grabP = pitch;
+                    activeId = hit.first;
+                }
+            } else {
+                if (!additive) sel.clear();
+                marquee = true; marqueeMoved = false; marqueeAdd = additive; marqueeStart = mouse;
+            }
+        }
+        if (dragMode != 0 && ImGui::IsMouseDown(0)) {
+            if (dragMode == 2) {
+                MidiClip* mc = findMidiClip(dragNote.first);
+                if (mc && dragNote.second >= 0 && dragNote.second < (int)mc->notes.size()) {
+                    MidiNote& n = mc->notes[(size_t)dragNote.second];
+                    n.dur = std::max(0.001, clampTimelineTime(xTime(mouse.x) - mc->start - n.start));
+                }
+            } else if (mouse.x >= pianoX && mouse.y >= pitchY && mouse.y <= pitchY + rollH) {
+                double dt = xTime(mouse.x) - grabT;
+                int dp = pitchAt(mouse.y) - grabP;
+                for (const Orig& o : origs) { dt = std::max(dt, -o.start); dp = std::min(127 - o.pitch, std::max(-o.pitch, dp)); }
+                for (const Orig& o : origs) {
+                    MidiClip* mc = findMidiClip(o.id);
+                    if (!mc || o.idx >= (int)mc->notes.size()) continue;
+                    mc->notes[(size_t)o.idx].start = std::max(0.0, o.start + dt);
+                    mc->notes[(size_t)o.idx].pitch = o.pitch + dp;
+                }
+            }
+        }
+        if (dragMode != 0 && !ImGui::IsMouseDown(0)) { dragMode = 0; origs.clear(); }
+        if (marquee) {
+            if (std::fabs(mouse.x - marqueeStart.x) + std::fabs(mouse.y - marqueeStart.y) > S(3)) marqueeMoved = true;
+            const float qx0 = std::min(mouse.x, marqueeStart.x), qx1 = std::max(mouse.x, marqueeStart.x);
+            const float qy0 = std::min(mouse.y, marqueeStart.y), qy1 = std::max(mouse.y, marqueeStart.y);
+            if (ImGui::IsMouseDown(0)) {
+                if (marqueeMoved) {
+                    dl->AddRectFilled(ImVec2(qx0, qy0), ImVec2(qx1, qy1), IM_COL32(237, 128, 38, 40));
+                    dl->AddRect(ImVec2(qx0, qy0), ImVec2(qx1, qy1), IM_COL32(237, 128, 38, 220));
+                }
+            } else {
+                if (!marqueeMoved) {
+                    // a plain click on an empty cell only clears the selection: notes cannot be added in the multi editor
+                } else {
+                    for (int id : g_multiMidiIds) {
+                        const MidiClip* mc = findMidiClip(id);
+                        if (!mc) continue;
+                        for (int ni = 0; ni < (int)mc->notes.size(); ++ni) {
+                            const MidiNote& n = mc->notes[(size_t)ni];
+                            if (n.pitch < pitchLow || n.pitch > pitchHigh) continue;
+                            const float ny0 = pitchY + (pitchHigh - n.pitch) * rowH, ny1 = ny0 + rowH;
+                            if (timeX(mc->start + n.start + n.dur) >= qx0 && timeX(mc->start + n.start) <= qx1 && ny1 >= qy0 && ny0 <= qy1) sel.insert({id, ni});
+                        }
+                    }
+                }
+                marquee = false;
+            }
+        }
+        if (!sel.empty() && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
+            std::map<int, std::vector<int>> per;
+            for (const auto& s : sel) per[s.first].push_back(s.second);
+            for (auto& [id, list] : per) {
+                MidiClip* mc = findMidiClip(id);
+                if (!mc) continue;
+                std::sort(list.rbegin(), list.rend());
+                for (int ni : list) if (ni >= 0 && ni < (int)mc->notes.size()) mc->notes.erase(mc->notes.begin() + ni);
+            }
+            sel.clear();
+        }
+        ImGui::PopClipRect();
+        ImGui::EndChild();
+    }
+    ImGui::End();
+    if (!open) { g_multiMidiOpen = false; sel.clear(); }
 }
 
 void drawMidiEditor() {
@@ -5693,14 +6474,14 @@ void drawMidiEditor() {
                 if (inputStr("##midi_target_name", typed, 0, nameFilter) && found) mc.clipId = found;
                 if (!valid) ImGui::PopStyleColor();
                 nameEditing[mc.id] = ImGui::IsItemActive();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Name of the Csound instrument that receives these notes (p4 = pitch, p5 = velocity)");
+                if (ImGui::IsItemHovered()) helpTip("Name of the Csound instrument that receives these notes (p4 = pitch, p5 = velocity)");
                 ImGui::SameLine();
                 ImGui::TextDisabled("%s", valid ? "" : "no instrument with this name");
                 ImGui::SameLine();
             }
             ImGui::SetNextItemWidth(S(150));
             ImGui::SliderFloat("##midi_zoom", &g_midiPps, 30.f, 800.f, "%.0f px/s");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Zoom of this piano roll (independent from the project zoom). Ctrl+wheel zooms too.");
+            if (ImGui::IsItemHovered()) helpTip("Zoom of this piano roll (independent from the project zoom). Ctrl+wheel zooms too.");
             ImGui::SameLine();
             if (ImGui::SmallButton("Octave -")) g_midiPitchLow = std::max(0, g_midiPitchLow - 12);
             ImGui::SameLine();
@@ -5719,8 +6500,14 @@ void drawMidiEditor() {
                 ImGui::SameLine(); ImGui::SetNextItemWidth(S(100)); ImGui::InputInt("##midi_pitch", &selected.pitch, 0, 0);
                 selected.pitch = std::min(127, std::max(0, selected.pitch));
                 ImGui::SameLine(); ImGui::SetNextItemWidth(S(120)); ImGui::InputDouble("##midi_start", &selected.start, 0.0, 0.0, "+%.2f s");
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start, relative to the clip start");
+                if (ImGui::IsItemHovered()) helpTip("Start, relative to the clip start");
                 selected.start = std::max(0.0, selected.start);
+                {   // the same start on the timeline
+                    double absStart = mc.start + selected.start;
+                    ImGui::SameLine(); ImGui::SetNextItemWidth(S(130));
+                    if (ImGui::InputDouble("##midi_start_abs", &absStart, 0.0, 0.0, "@%.2f s")) selected.start = std::max(0.0, absStart - mc.start);
+                    if (ImGui::IsItemHovered()) helpTip("Start on the timeline (the start above is relative to the MIDI clip)");
+                }
                 ImGui::SameLine(); ImGui::SetNextItemWidth(S(120)); ImGui::InputDouble("##midi_dur", &selected.dur, 0.0, 0.0, "%.2f s");
                 selected.dur = std::max(0.001, selected.dur);
                 ImGui::SameLine(); ImGui::Text("Vel"); ImGui::SameLine(0, S(4)); ImGui::SetNextItemWidth(S(70)); ImGui::InputInt("##midi_velocity", &selected.velocity, 0, 0);
@@ -5729,8 +6516,15 @@ void drawMidiEditor() {
             } else if (selCount > 1) {
                 ImGui::Text("%d notes selected", (int)selCount);
                 ImGui::SameLine();
+                if (ImGui::SmallButton("Sync start")) {   // all selected notes start together, at the earliest one
+                    double first = 1e300;
+                    for (int idx : g_midiSel) first = std::min(first, mc.notes[(size_t)idx].start);
+                    for (int idx : g_midiSel) mc.notes[(size_t)idx].start = first;
+                }
+                if (ImGui::IsItemHovered()) helpTip("Sync start: the selected notes all start at the same time (the earliest of them)");
+                ImGui::SameLine();
             } else {
-                ImGui::TextDisabled("Click an empty cell to add a note, drag on empty space to box-select (Ctrl adds). Drag notes to move, drag the right edge to resize.");
+                ImGui::TextDisabled("Double-click an empty cell to add a note, click to select, drag on empty space to box-select (Ctrl adds). Drag notes to move, drag the right edge to resize.");
             }
             if (selCount > 0 && ImGui::SmallButton(selCount > 1 ? "Delete notes" : "Delete note")) {
                 for (auto it = g_midiSel.rbegin(); it != g_midiSel.rend(); ++it)
@@ -5909,6 +6703,13 @@ void drawMidiEditor() {
                     g_midiMarqueeStart = mouse;
                     g_midiMarqueeMoved = false;
                     g_midiMarqueeAdd = additive;
+                    {   // double-click on an empty cell adds a note; one click only selects / clears
+                        const double nowT = ImGui::GetTime();
+                        g_midiMarqueeDbl = ImGui::IsMouseDoubleClicked(0) ||
+                            (nowT - g_midiEmptyPressT < 0.5 && std::fabs(mouse.x - g_midiEmptyPressPos.x) < S(16) && std::fabs(mouse.y - g_midiEmptyPressPos.y) < S(16));
+                        g_midiEmptyPressT = g_midiMarqueeDbl ? -10.0 : nowT;
+                        g_midiEmptyPressPos = mouse;
+                    }
                 }
             }
 
@@ -5947,7 +6748,7 @@ void drawMidiEditor() {
                         dl->AddRect(ImVec2(qx0, qy0), ImVec2(qx1, qy1), IM_COL32(237, 128, 38, 220));
                     }
                 } else {
-                    if (!g_midiMarqueeMoved) {
+                    if (!g_midiMarqueeMoved && g_midiMarqueeDbl) {
                         MidiNote note;
                         note.start = clampTimelineTime(std::max(0.0, xTime(g_midiMarqueeStart.x) - mc.start));
                         note.dur = 0.5;
@@ -5955,7 +6756,7 @@ void drawMidiEditor() {
                         note.velocity = 100;
                         mc.notes.push_back(note);
                         selectOnly((int)mc.notes.size() - 1);
-                    } else {
+                    } else if (g_midiMarqueeMoved) {
                         if (g_midiSelectedTrackId != trackId) g_midiSel.clear();
                         for (int ni = 0; ni < (int)mc.notes.size(); ++ni) {
                             const MidiNote& note = mc.notes[(size_t)ni];
@@ -6039,66 +6840,30 @@ void appSetCodeFonts(ImFont* regular, ImFont* bold, ImFont* italic) {
 void appInit() {
     for (float& v : g_specSm) v = -120.f;
     refreshAudioDevices();
-
-    // One lane, many independent instruments: Lead1, Lead2 and Lead3 each have their own
-    // name, code, color and MIDI, even though they sit on the same "Lead" line.
-    const int lead = addTrack("Lead", kLead);
-    addClip(lead, 0.0, 2.0, kLead, "Lead1");
-    addClip(lead, 3.0, 2.0, kLeadWide, "Lead2");
-    addClip(lead, 6.0, 4.0, kLeadPluck, "Lead3");
-    const int bass = addTrack("Bass", kBass);
-    addClip(bass, 0.0, 4.0, kBass, "Bass1");
-    addClip(bass, 5.0, 3.0, kBassDeep, "Bass2");
-    const int pad = addTrack("Pad", kPad);
-    addClip(pad, 2.0, 6.0, kPad, "Pad1");
-    const int unison = addTrack("Unison", kRunDemo);
-    addClip(unison, 0.0, 4.0, kRunDemo, "Unison1");
-    g_proj.tracks[(size_t)unison].clips.back().runs = 3;
-    // Pure Data demo: the patch text is the clip's code (open the clip: language "Pure Data"); the <caw> block gives it an automation lane.
-    const int pdLane = addTrack("PureData", kLead);
-    addClip(pdLane, 0.0, 4.0, kPdDemo, "Pd1");
-    g_proj.tracks[(size_t)pdLane].clips.back().lang = 1;
-    // Bridge demo: Pure Data and SuperCollider send data to a Csound instrument (notes above kBridgeVoice).
-    const int bridgeCs = addTrack("Voice (Csound)", kBridgeVoice);
-    addClip(bridgeCs, 0.0, 8.0, kBridgeVoice, "Voice1");
-    const int bridgePd = addTrack("Sequencer (Pd)", kLead);
-    addClip(bridgePd, 0.0, 8.0, kBridgePd, "PdSeq");
-    g_proj.tracks[(size_t)bridgePd].clips.back().lang = 1;
-    const int bridgeSc = addTrack("Pad (SuperCollider)", kLead);
-    addClip(bridgeSc, 0.0, 8.0, kBridgeSc, "ScPad");
-    g_proj.tracks[(size_t)bridgeSc].clips.back().lang = 2;
-    g_trackCounter = 8;
-    // Demo MIDI clips: free regions (they start where the clips are now but can be moved anywhere).
-    for (size_t ti = 0; ti < g_proj.tracks.size(); ++ti) {
-        Track& tr = g_proj.tracks[ti];
-        const int base = ti == 1 ? 36 : 60;
-        const int steps[4] = {0, 4, 7, 12};
-        for (const Clip& c : tr.clips) {
-            if (!parseClip(c).midiEnabled) continue;
-            MidiClip mc;
-            mc.id = newMidiId();
-            mc.clipId = c.id;
-            mc.start = c.start;
-            mc.dur = c.dur;
-            for (int k = 0; k < 4; ++k) {
-                MidiNote n;
-                n.start = mc.dur * k / 4.0;
-                n.dur = mc.dur / 4.0 * 0.9;
-                n.pitch = base + steps[k];
-                n.velocity = 100;
-                mc.notes.push_back(n);
-            }
-            tr.midiClips.push_back(mc);
-        }
-    }
     historyReset();
-    logLine("[caw] Ready. Every clip is its own instrument: double-click a clip = its code, right-click = rename/color/MIDI/duplicate.");
-    logLine("[caw] Tools: 1 Select, 8 Pen, 3 Cut, 4 Join (one at a time). M / S mute / solo the selected track. All shortcuts are listed in the View menu.");
-    logLine("[caw] Select tool: click/Ctrl+click/box-select automation dots or MIDI regions, drag to move, Del to delete, double-click a dot to type a value.");
-    logLine("[caw] Clips: drag on empty lane space to box-select (Ctrl/Shift adds), drag to move the whole selection, Ctrl+D duplicates as the SAME instrument, Del deletes.");
-    logLine("[caw] Drag the edge of the left panel to resize it. Scrollbars sit at the right and bottom of the timeline.");
-    logLine("[caw] Undo Ctrl+Z, Redo Ctrl+Y (also in the Edit menu).");
-    logLine("[caw] Play and Render run csound.exe. If they fail, set the Csound executable path in Settings.");
+    g_savedSnap = serializeProject(g_proj);
+    logLine("[caw] Ready. File > New project starts an empty project, File > Open project loads one.");
+}
+
+// The help panel: shows the explanation of whatever the mouse is over (all the old hover pop-ups), with an on / off box.
+float helpPanelHeight() { return g_helpOn ? S(66) : S(26); }
+void drawHelpPanel() {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.11f, 0.14f, 1.f));
+    ImGui::BeginChild("##helppanel", ImVec2(0, helpPanelHeight()), false, g_helpOn ? 0 : ImGuiWindowFlags_NoScrollbar);
+    ImGui::SetCursorPos(ImVec2(S(8), S(3)));
+    ImGui::Checkbox("Help", &g_helpOn);
+    if (g_helpOn) {
+        ImGui::SameLine(0, S(14));
+        ImGui::PushTextWrapPos(0.f);
+        if (g_helpShown.empty()) ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.65f, 1.f), "Hover the mouse over a button, field or lane to see what it does.");
+        else ImGui::TextUnformatted(g_helpShown.c_str());
+        ImGui::PopTextWrapPos();
+    } else {
+        ImGui::SameLine(0, S(14));
+        ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.65f, 1.f), "(tick Help to show explanations here)");
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
 }
 
 void appFrame(float dt) {
@@ -6106,9 +6871,10 @@ void appFrame(float dt) {
     pollProcesses(dt);
     pollTestAndScan(dt);
     const bool globalKeys = !io.WantTextInput && !g_textEditorFocused;  // code editors keep their own Ctrl+Z
-    if (io.KeyCtrl && !io.KeyShift && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_Q, false)) g_quitRequested = true;
+    if (io.KeyCtrl && !io.KeyShift && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_Q, false)) appRequestClose();
     if (!io.WantTextInput && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) saveProject(false);
     if (!io.WantTextInput && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) openProject();
+    if (!io.WantTextInput && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N, false)) newProject();
     if (globalKeys && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
         if (io.KeyShift) redo(); else undo();
     }
@@ -6120,7 +6886,6 @@ void appFrame(float dt) {
         const bool withCtrl = io.KeyCtrl && !io.KeyShift && !io.KeyAlt;
         if (plain || withCtrl) toggleTimelinePlay();
     }
-    demoFeed(dt);
     updateMeters(dt);
     {   // idle layout (meters of the current project while Csound is off)
         static int tick = 0;
@@ -6139,19 +6904,49 @@ void appFrame(float dt) {
     ImGui::PopStyleVar(2);
     drawMainMenuBar();
     drawTransport();
-    drawArrange(g_showMonitor ? S(g_monitorH + kMonitorSplitterH) : 0.f);
+    g_helpShown = g_helpNext; g_helpNext.clear();
+    const float belowH = (g_showMonitor ? S(g_monitorH + kMonitorSplitterH) : 0.f) + helpPanelHeight();
+    const float autoMeterW = std::min(320.f, std::max(104.f, 40.f + masterChannels(g_proj.cs) * 28.f));
+    const float meterW = g_viewMeter ? S(g_meterW > 0.f ? g_meterW : autoMeterW) : 0.f;
+    drawArrange(belowH, meterW);
+    if (g_viewMeter) {
+        ImGui::SameLine(0, 0);
+        drawMeterPanel(dt, meterW, belowH);
+    }
     if (g_showMonitor) {
         drawMonitorSplitter();
         drawMonitor(dt);
     }
+    drawHelpPanel();
     ImGui::End();
+
+    if (g_askSaveOnClose) { ImGui::OpenPopup("Save changes?###save_on_close"); g_askSaveOnClose = false; }
+    if (ImGui::BeginPopupModal("Save changes?###save_on_close", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("The project has unsaved changes. Save them before closing?");
+        ImGui::Spacing();
+        if (ImGui::Button("Save", ImVec2(S(110), 0))) {
+            saveProject(false);
+            if (serializeProject(g_proj) == g_savedSnap) { g_quitRequested = true; ImGui::CloseCurrentPopup(); }   // not saved (dialog cancelled / error): stay open
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Don't save", ImVec2(S(110), 0))) { g_quitRequested = true; ImGui::CloseCurrentPopup(); }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(S(110), 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
 
     drawSettings();
     drawScoreEditor();
-    drawScorePreview(dt);
     drawEditor();
     drawMidiEditor();
+    drawMultiMidiEditor();
     historyTick(dt);
+}
+
+// Close button / Ctrl+Q / File > Exit: with unsaved changes the program first asks to save.
+void appRequestClose() {
+    if (serializeProject(g_proj) != g_savedSnap) g_askSaveOnClose = true;
+    else g_quitRequested = true;
 }
 
 // True after Ctrl+Q / File > Exit: stops the engine and the renderers, then the main loop ends.

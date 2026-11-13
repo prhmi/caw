@@ -5,8 +5,8 @@
 #include <string>
 #include <vector>
 
-struct AutoPoint { double t; double v; };            // time in seconds, value
-struct MidiNote  { double start; double dur; int pitch = 60; int velocity = 100; }; // MIDI p4 note and p5 velocity
+struct AutoPoint { double t; double v; bool line = false; };   // line: inside a Pen 2 stroke, no dot is shown (only the start and the end of the stroke have dots)            // time in seconds, value
+struct MidiNote  { double start; double dur; int pitch = 60; int velocity = 100; int quarter = 0; };   // quarter (score sign only, no sound change): 0 none, 1 quarter sharp, 2 quarter flat, 3 koron // MIDI p4 note and p5 velocity
 
 // One clip on a lane = one independent Csound instrument.
 // Every clip owns its instr name, its code, its color and its MIDI notes.
@@ -21,10 +21,12 @@ struct Clip {
     int id = 0;                           // stable editor-window identity
     bool muted = false;                   // this clip is skipped by the timeline
     int scoreLane = 0;                    // score: 0 = lane of the track, -1 = not in the score, >0 = id of a ScoreLaneDef
-    int scoreMidi = 0;                    // score: how its notes (MIDI input or written notes) are shown: 0 every note, 1 overall up / down contour, 2 hidden, 3 pitch range band, 4 every note with its name
     std::string scoreWritten;             // score: notes written by hand for a clip whose notes are made inside the code, e.g. "C4 E4:2 - G4" (name[:relative length], - = rest). Only for the score, no sound.
     std::string scoreDynamic;             // score: dynamic marking under the clip: "mf", "pp<ff" (crescendo), "f>p" (diminuendo); empty = from the MIDI velocity
-    int scoreStyle = 0;                   // score, sound material: 0 shape, 1 line, 2 grains, 3 block
+    int scoreRole = 0;                    // score: what the clip does: 0 generator, 1 effect, 2 both
+    int scoreDetail = 0;                  // score: 0 OVERALL = the whole shape of the sound the clip makes (amplitude shape + frequency position, measured from the rendered clip); 1 DETAILED = additionally everything the code sends to the channel "score" (numbers, signals, strings), plus text, time and parameters
+    bool scoreShowLang = false;           // score: the coding language (Csound / Pd / SC) is written next to the name
+    int scoreStyle = 0;                   // score, sound material: 0 shape, 1 line, 2 grains (scattered), 3 block, 4 sliced wave (granular), 5 FM graph, 6 dots and lines (keys, leads)
     std::string scoreLabel;               // score: text instead of the clip name (empty = name)
     double scoreFreqLo = 0.0;             // score: frequency band of this sound in Hz (0 / 0 = not set); makes the graphic lane a frequency axis
     double scoreFreqHi = 0.0;
@@ -60,7 +62,8 @@ struct ScoreLaneDef {
 };
 
 struct ScoreInfo {
-    int mode = 1;                         // 0 = electronics only (no 5-line staves at all), 1 = instruments + electronics
+    int mode = 1;                         // no longer used (kept for old project files): every track decides itself if it is an instrument (staff) or electronics (graphic)
+    bool analyze = true;                  // Render audio also measures every clip (amplitude, frequency) and records the "score" channel for the score
     int systemsPerPage = 0;               // full score: 0 = as many as fit on the page
     bool coverPage = true;                // full score: first page with lanes list, notes and key
     bool eventList = true;                // full score: last pages with a table of all clip texts
@@ -71,18 +74,42 @@ struct ScoreInfo {
     std::string title;                    // empty = project file name
     std::string subtitle;
     std::string composer;
+    std::string copyright;
     bool mergeSameName = true;            // tracks that share the same name (or score name) are ONE lane of the score
-    double tempo = 0.0;                   // beats per minute; 0 = time only (seconds), > 0 = bars: barlines, bar numbers, systems end on a barline
-    int meterNum = 4;                     // time signature (used when tempo > 0)
-    int meterDen = 4;
-    double sysSec = 45.0;                 // seconds per system (line) in the full score (rounded to whole bars when tempo is set)
+    double lineWeight = 1.0;              // general line weight of the score (0.4 fine .. 3 heavy)
+    double sysSec = 45.0;                 // seconds per system (line) in the full score 
     std::vector<ScoreMark> sections;      // rehearsal marks (boxed letters on the time ruler)
     std::vector<ScoreMark> markers;       // labelled vertical time lines through all lanes
+};
+
+// A note on a marker track: a comment / guide for the project (text on the timeline, from t for dur seconds).
+struct TrackMark {
+    double t = 0.0; double dur = 4.0; std::string text; uint32_t color = 0;
+    // marker track: type 0 comment, 1 letter box (A, B, C...), 2 cue (Q, shape = Q style), 3 code (lang = Csound / Pd / SC colors), 4 span bracket (horizontal line with 90 degree ends, shape 0 ends down + text above, 1 ends up + text below)
+    // graph track: always a graphic-score shape (shape = index in markgfx::kShapeNames: grain cloud, glissando, swell...), no text
+    // The start and the length of an item are changed on the timeline (drag it, drag its right edge).
+    int type = 0;
+    int shape = 0;
+    int lang = 0;
+    int size = 100;      // size of the box / shape in percent (40 .. 400)
+    int ratio = 100;     // swell / fade shapes: curve of the edges in percent (30 .. 300, 100 = straight)
+    int font = 0;        // font size of the text in the score and on the timeline (6 .. 40, 0 = default 9)
+    int scorePos = 0;    // in the score: 0 not shown, 1 above the lane, 2 below the lane (marker track: its lane is the lane with the same name; graph track: its own lane)
 };
 
 struct CawParam  { std::string chn; double min, max, step; double value; };  // value = start value of the channel
 
 struct Track {
+    int kind = 0;                                    // 0 = normal track (clips), 1 = marker track (comments / guidance), 2 = free automation (not linked to a clip: the Csound channel is the track NAME, read with chnget "Name")
+    int lang = 0;                                    // language of the template: new clips on this track start as 0 Csound, 1 Pure Data, 2 SuperCollider
+    double autoMin = 0.0, autoMax = 1.0;             // free automation (kind 2): value range
+    std::vector<TrackMark> marks;                    // marker track (kind 1)
+    std::map<std::string, int> scoreAutoShape;       // automation channel -> how the line looks in the score (see ScoreAutoShape names in the editor); missing = 0 curve
+    std::map<std::string, int> scoreAutoMerge;       // graph line -> 0 combine (one shape with the other lines), 1 half combine (on top at 50%), 2 separated (own strip); missing = combine
+    std::map<std::string, int> scoreAutoYSize;       // graph line -> height of its strip in the score, percent (50 .. 400, missing = 100)
+    std::set<std::string> scoreAutoMuted, scoreAutoSolo;   // graph lines: M hides the line in the score, S shows only the soloed lines
+    std::map<std::string, double> scoreAutoCurve;    // automation channel -> shape ratio 0.3 .. 3 for the mirror / wedge shapes (1 = linear)
+    std::map<std::string, double> scoreAutoStroke;   // automation channel -> stroke width of the line in the score (0.3 .. 8); missing = default. The dots, bars, dashes and break points of the other shapes scale with it (ratio to the default width)
     std::string name;                                // lane name, also the base name for new clips
     std::string code;                                // template code copied into new clips on this lane
     std::vector<MidiClip> midiClips;                 // free MIDI regions that drive the Csound clips of this lane
@@ -103,8 +130,12 @@ struct Track {
     int scoreKind = 0;                               // 0 auto (staff when the lane has MIDI notes), 1 staff, 2 graphic material, 3 hidden
     int scoreClef = 0;                               // 0 auto, 1 treble, 2 bass, 3 none
     std::string scoreLabel;                          // name printed in the score (empty = lane name)
+    std::string scoreMidiLabel;                      // lane name of the MIDI lane in the score (empty = same as the track)
+    int scoreMidiShow = 0;                           // how the notes of the MIDI lane show: 0 every note, 1 overall up / down, 2 hidden, 3 pitch range band, 4 every note with its name
+    std::map<std::string, std::string> scoreAutoNames; // automation channel -> lane name in the score (missing / empty = same as the track)
     std::string scoreSub;                            // small line under the name, e.g. the sample file
     int scoreLane = 0;                               // 0 = own lane in the score, >0 = id of a ScoreLaneDef this track belongs to
+    int scoreOverlap = 0;                            // tracks with the same score name share ONE lane: 0 overlap = their shapes are combined into one (same colour: one shape, different colours: both colours), 1 separated = drawn on top of each other at 50% opacity, not combined
     std::map<std::string, int> scoreAuto;            // automation channel -> 0 hidden, 1 own automation lane with the full curve, 2 compact contour lane; missing = 1 (every automation with points is in the score)
 };
 
