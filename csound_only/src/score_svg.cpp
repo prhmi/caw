@@ -1,6 +1,7 @@
 #include "score_svg.h"
 #include "csd_builder.h"
 #include "marks_gfx.h"
+#include "monitor_math.h"
 #include <algorithm>
 #include <cmath>
 #include <complex>
@@ -835,6 +836,7 @@ struct Renderer {
                 if (!c.scoreDynamic.empty()) l.dyn = true;
             }
             for (const MidiClip& mc : t.midiClips) {
+                if (mc.muted) continue;
                 const Clip* owner = findClip(t, mc.clipId);
                 if (owner && (owner->scoreLane < 0 || owner->muted)) continue;
                 RLane& l = laneOf(owner && owner->scoreLane > 0 ? owner->scoreLane : t.scoreLane, ti, &t.scoreMidiLabel);
@@ -1924,14 +1926,14 @@ struct Renderer {
                             }
                         }
                         // DETAILED: everything the code sent to the channel "score" (numbers, signals as a curve, strings as text)
-                        if (cl->scoreDetail) {
+                        if (cl->scoreDetail || !parseClip(*cl).scoreStreams.empty()) {
                             if (const ScoreClipProbe* pr = probeOf(*cl)) {
                                 double lo = 1e18, hi = -1e18;
-                                for (const ScoreDataSample& sd : pr->data) if (!sd.isText && sd.t >= cl->start && sd.t <= cl->start + cl->dur) { lo = std::min(lo, sd.v); hi = std::max(hi, sd.v); }
+                                for (const ScoreDataSample& sd : pr->data) if (cl->scoreDetail && sd.name.empty() && !sd.isText && sd.t >= cl->start && sd.t <= cl->start + cl->dur) { lo = std::min(lo, sd.v); hi = std::max(hi, sd.v); }
                                 if (hi >= lo) {
                                     Pts curve;
                                     for (const ScoreDataSample& sd : pr->data) {
-                                        if (sd.isText || sd.t < a || sd.t > b) continue;
+                                        if (!sd.name.empty() || sd.isText || sd.t < a || sd.t > b) continue;
                                         curve.push_back({ X(sd.t), hi > lo ? cy + hh - (sd.v - lo) / (hi - lo) * 2 * hh : cy });
                                     }
                                     s.polyline(curve, "#222222", detailed ? 1.3 : 1.0);
@@ -1946,12 +1948,115 @@ struct Renderer {
                                 double lastEndX = -1e9;
                                 int tr = 0;
                                 for (const ScoreDataSample& sd : pr->data) {
-                                    if (!sd.isText || sd.t < a || sd.t > b || sd.text == prev) continue;
+                                    if (!cl->scoreDetail || !sd.name.empty() || !sd.isText || sd.t < a || sd.t > b || sd.text == prev) continue;
                                     prev = sd.text;
                                     const double tx = X(sd.t);
                                     if (tx < lastEndX) continue;
                                     s.text(tx, cy - hh - 3 - (tr++ % 2) * 8, fit(sd.text, 120, 7.5), 7.5, "#222222", false, "start", true);
                                     lastEndX = tx + std::min(120.0, textWidth(sd.text, 7.5)) + 3;
+                                }
+                                const auto streams = parseClip(*cl).scoreStreams;
+                                int streamIndex = 0;
+                                for (const auto& entry : streams) {
+                                    const auto st = cl->scoreDataStyle.find(entry.first);
+                                    const int style = st == cl->scoreDataStyle.end() ? 0 : st->second;
+                                    if (style == 3) continue;
+                                    static const char* colors[] = {"#126E7A", "#A14221", "#6A499A", "#56804B"};
+                                    const std::string color = colors[(size_t)streamIndex++ % 4];
+                                    if (entry.second == 2 && style == 4) {
+                                        std::vector<double> power(kScoreSpectrumBins, 0.0);
+                                        int frames = 0;
+                                        for (const ScoreSpectralFrame& frame : pr->spectra) {
+                                            if (frame.name != entry.first || frame.t < cl->start || frame.t > cl->start + cl->dur ||
+                                                (int)frame.bands.size() != kScoreSpectrumBins) continue;
+                                            for (int j = 0; j < kScoreSpectrumBins; ++j)
+                                                power[(size_t)j] += (double)frame.bands[(size_t)j] * frame.bands[(size_t)j];
+                                            ++frames;
+                                        }
+                                        const double maxPower = *std::max_element(power.begin(), power.end());
+                                        if (frames > 0 && maxPower > 1e-30) {
+                                            std::vector<float> db(kScoreSpectrumBins);
+                                            for (int j = 0; j < kScoreSpectrumBins; ++j)
+                                                db[(size_t)j] = (float)std::max(-60.0, 10.0 * std::log10(std::max(power[(size_t)j] / maxPower, 1e-6)));
+                                            Pts outline;
+                                            constexpr int points = 144;
+                                            for (int j = 0; j <= points; ++j) {
+                                                const float u = (float)j / points;
+                                                const float value = monitor_math::sample(db.data(), kScoreSpectrumBins, u * (kScoreSpectrumBins - 1), true);
+                                                outline.push_back({xa + (xb - xa) * u, cy + hh - (value + 60.0) / 60.0 * 2.0 * hh});
+                                            }
+                                            Pts fill = outline;
+                                            fill.push_back({xb, cy + hh});
+                                            fill.push_back({xa, cy + hh});
+                                            s.fillPoly(fill, color, 0.30);
+                                            s.polyline(outline, color, 1.1);
+                                            if (firstSeg) {
+                                                char label[160];
+                                                const double hiHz = std::min(18000.0, p.cs.sr * 0.5);
+                                                std::snprintf(label, sizeof label, "%s spectrum 50-%.0fHz (relative)", entry.first.c_str(), hiHz);
+                                                s.text(xa + 2, cy - hh - 3, fit(label, xb - xa, 7.0), 7.0, color);
+                                            }
+                                        } else if (firstSeg) {
+                                            s.text(xa + 2, cy, fit(frames ? entry.first + ": silent spectrum" :
+                                                entry.first + ": render audio for spectrum", xb - xa, 7.0), 7.0, color);
+                                        }
+                                        continue;
+                                    }
+                                    double mn = 1e300, mx = -1e300;
+                                    for (const ScoreDataSample& sd : pr->data)
+                                        if (sd.name == entry.first && !sd.isText && sd.t >= cl->start && sd.t <= cl->start + cl->dur && std::isfinite(sd.v)) {
+                                            mn = std::min(mn, sd.v);
+                                            mx = std::max(mx, sd.rate == 2 ? sd.v2 : sd.v);
+                                        }
+                                    Pts pts;
+                                    std::string lastText;
+                                    double lastInit = 0.0, lastInitX = -1e9;
+                                    bool haveInit = false;
+                                    for (const ScoreDataSample& sd : pr->data) {
+                                        if (sd.name != entry.first || sd.t < a || sd.t > b) continue;
+                                        if (sd.isText) {
+                                            if (sd.text != lastText && !sd.text.empty()) {
+                                                s.text(X(sd.t), cy - hh - 10, fit(entry.first + ": " + sd.text, 120, 7.5), 7.5, color);
+                                                lastText = sd.text;
+                                            }
+                                            continue;
+                                        }
+                                        if (!std::isfinite(sd.v) || mx < mn) continue;
+                                        if (entry.second == 4) {
+                                            if (sd.rate != 4) continue; // old probe data: re-render
+                                            if (!haveInit || sd.v != lastInit) {
+                                                char text[160];
+                                                std::snprintf(text, sizeof text, "%s = %.5g", entry.first.c_str(), sd.v);
+                                                const double xpos = X(sd.t);
+                                                if (xpos >= lastInitX) {
+                                                    s.text(xpos, cy - hh - 10 - (streamIndex % 2) * 9, fit(text, 120, 7.5), 7.5, color);
+                                                    lastInitX = xpos + std::min(120.0, textWidth(text, 7.5)) + 4;
+                                                }
+                                                lastInit = sd.v;
+                                                haveInit = true;
+                                            }
+                                            continue;
+                                        }
+                                        if (entry.second == 2) {
+                                            if (sd.rate != 2) continue; // never draw a decimated sample as a waveform
+                                            const double vHi = sd.v2;
+                                            const double ylo = mx > mn ? cy + hh - (sd.v - mn) / (mx - mn) * 2 * hh : cy;
+                                            const double yhi = mx > mn ? cy + hh - (vHi - mn) / (mx - mn) * 2 * hh : cy;
+                                            s.line(X(sd.t), yhi, X(sd.t), ylo, color, 1.2);
+                                            continue;
+                                        }
+                                        const double x = X(sd.t), y = mx > mn ? cy + hh - (sd.v - mn) / (mx - mn) * 2 * hh : cy;
+                                        if (style == 2) s.circle(x, y, 1.2, color);
+                                        else {
+                                            if (style == 1 && !pts.empty()) pts.push_back({x, pts.back().second});
+                                            pts.push_back({x, y});
+                                        }
+                                    }
+                                    if (!pts.empty()) s.polyline(pts, color, 1.1);
+                                    if (firstSeg && mx >= mn && entry.second != 4) {
+                                        char range[96]; std::snprintf(range, sizeof range, "%s [%.4g..%.4g]", entry.first.c_str(), mn, mx);
+                                        s.text(xa + 2, cy - hh + 8 * streamIndex, fit(range, xb - xa, 7.0), 7.0, color);
+                                    }
                                 }
                             }
                         }
@@ -2411,13 +2516,13 @@ bool buildScorePages(const Project& p, const std::string& fallbackTitle, const S
 }
 
 bool writeScoreDocument(const Project& p, const std::string& fallbackTitle, const ScoreRenderOptions& opt, const std::string& basePath,
-                        std::vector<std::string>& files, std::string& error) {
+                        std::vector<std::string>& files, std::string& error, bool exactPath) {
     files.clear();
     std::vector<ScorePage> pages;
     if (!buildScorePages(p, fallbackTitle, opt, pages, error)) return false;
     const std::string suffix = opt.blackWhite ? "_bw" : "";
     if (!opt.detailed) {
-        const std::string path = basePath + "_score_overview" + suffix + ".svg";
+        const std::string path = exactPath ? basePath : basePath + "_score_overview" + suffix + ".svg";
         if (!saveFile(path, primsToSvg(pages[0]), error)) return false;
         files.push_back(path);
         return true;
@@ -2432,15 +2537,17 @@ bool writeScoreDocument(const Project& p, const std::string& fallbackTitle, cons
          << "<div class=\"bar\"><b>" << esc(ttl) << "</b> &nbsp; full score, " << pages.size() << " pages. Print this page (Ctrl+P, A4 landscape, margins none) to get a PDF.</div>\n";
     for (size_t i = 0; i < pages.size(); ++i) {
         char buf[16]; std::snprintf(buf, sizeof buf, "_p%02d", (int)i + 1);
-        const std::string path = basePath + "_score_full" + suffix + buf + ".svg";
         const std::string svg = primsToSvg(pages[i]);
-        if (!saveFile(path, svg, error)) return false;
-        paths.push_back(path);
+        if (!exactPath) {
+            const std::string path = basePath + "_score_full" + suffix + buf + ".svg";
+            if (!saveFile(path, svg, error)) return false;
+            paths.push_back(path);
+        }
         const size_t tag = svg.find("<svg");
         html << "<div class=\"page\">" << (tag == std::string::npos ? svg : svg.substr(tag)) << "</div>\n";
     }
     html << "</body></html>\n";
-    const std::string htmlPath = basePath + "_score_full" + suffix + ".html";
+    const std::string htmlPath = exactPath ? basePath : basePath + "_score_full" + suffix + ".html";
     if (!saveFile(htmlPath, html.str(), error)) return false;
     files.push_back(htmlPath);
     for (const std::string& pa : paths) files.push_back(pa);
@@ -2451,6 +2558,7 @@ bool loadScoreProbe(const std::string& path, ScoreProbeData& out) {
     out.clear();
     std::ifstream in(path);
     if (!in) return false;
+    std::map<std::pair<std::string, std::string>, ScoreSpectralFrame> pendingSpectra;
     std::string line;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -2459,22 +2567,70 @@ bool loadScoreProbe(const std::string& path, ScoreProbeData& out) {
         const size_t n1 = line.find(' ', 2);
         if (n1 == std::string::npos) continue;
         const std::string name = line.substr(2, n1 - 2);
-        const size_t n2 = line.find(' ', n1 + 1);
-        const std::string tt = line.substr(n1 + 1, n2 == std::string::npos ? std::string::npos : n2 - n1 - 1);
+        size_t timeStart = n1 + 1;
+        std::string streamName;
+        if (type == 'N' || type == 'T' || type == 'I' || type == 'W' || type == 'F') {
+            const size_t end = line.find(' ', timeStart);
+            if (end == std::string::npos || (end - timeStart) % 2) continue;
+            bool valid = true;
+            auto digit = [](char c) -> int { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'a' && c <= 'f') return c - 'a' + 10; return -1; };
+            for (size_t j = timeStart; j < end; j += 2) {
+                int a = digit(line[j]), b = digit(line[j + 1]);
+                if (a < 0 || b < 0) { valid = false; break; }
+                streamName += (char)(16 * a + b);
+            }
+            if (!valid || streamName.empty()) continue;
+            timeStart = end + 1;
+        }
+        const size_t n2 = line.find(' ', timeStart);
+        const std::string tt = line.substr(timeStart, n2 == std::string::npos ? std::string::npos : n2 - timeStart);
         const std::string rest = n2 == std::string::npos ? std::string() : line.substr(n2 + 1);
         double t = 0;
         try { t = std::stod(tt); } catch (...) { continue; }
+        if (!std::isfinite(t)) continue;
         ScoreClipProbe& pr = out[name];
         if (type == 'A') {
             double r = 0, c = 0;
             if (std::sscanf(rest.c_str(), "%lf %lf", &r, &c) != 2) continue;
             pr.t.push_back(t); pr.rms.push_back(r); pr.cent.push_back(c);
-        } else if (type == 'D') {
-            ScoreDataSample sd; sd.t = t;
+        } else if (type == 'D' || type == 'N' || type == 'I') {
+            ScoreDataSample sd; sd.t = t; sd.name = streamName; sd.rate = type == 'I' ? 4 : 1;
             if (std::sscanf(rest.c_str(), "%lf", &sd.v) != 1) continue;
+            if (!std::isfinite(sd.v)) continue;
             pr.data.push_back(sd);
-        } else if (type == 'S') {
-            ScoreDataSample sd; sd.t = t; sd.isText = true; sd.text = rest;
+        } else if (type == 'W') {
+            ScoreDataSample sd; sd.t = t; sd.name = streamName; sd.rate = 2;
+            if (std::sscanf(rest.c_str(), "%lf %lf", &sd.v, &sd.v2) != 2 ||
+                !std::isfinite(sd.v) || !std::isfinite(sd.v2) || sd.v > sd.v2) continue;
+            pr.data.push_back(sd);
+        } else if (type == 'F') {
+            std::istringstream values(rest);
+            int start = -1;
+            if (!(values >> start) || start < 0 || start >= kScoreSpectrumBins || start % 16 != 0) continue;
+            std::vector<float> chunk;
+            bool valid = true;
+            for (int j = 0; j < 16; ++j) {
+                float value = 0;
+                if (!(values >> value) || !std::isfinite(value) || value < 0.f) { valid = false; break; }
+                chunk.push_back(value);
+            }
+            const auto key = std::make_pair(name, streamName);
+            if (!valid) { pendingSpectra.erase(key); continue; }
+            if (start == 0) {
+                ScoreSpectralFrame frame; frame.name = streamName; frame.t = t;
+                pendingSpectra[key] = std::move(frame);
+            }
+            auto it = pendingSpectra.find(key);
+            if (it == pendingSpectra.end() || it->second.t != t || (int)it->second.bands.size() != start) {
+                pendingSpectra.erase(key); continue;
+            }
+            it->second.bands.insert(it->second.bands.end(), chunk.begin(), chunk.end());
+            if ((int)it->second.bands.size() == kScoreSpectrumBins) {
+                pr.spectra.push_back(std::move(it->second));
+                pendingSpectra.erase(it);
+            }
+        } else if (type == 'S' || type == 'T') {
+            ScoreDataSample sd; sd.t = t; sd.name = streamName; sd.isText = true; sd.text = rest; sd.rate = 3;
             pr.data.push_back(sd);
         }
     }

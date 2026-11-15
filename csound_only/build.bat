@@ -1,6 +1,7 @@
 @echo off
 setlocal
 
+rem CAW build script for WINDOWS.  macOS / Linux: use build.sh
 rem Go to the folder where this bat file lives
 cd /d "%~dp0"
 
@@ -37,14 +38,19 @@ if errorlevel 1 (
 )
 
 echo.
-echo === Configuring (first time downloads Dear ImGui) ===
-cmake -B build
-if errorlevel 1 goto :fail
+echo === Configuring (downloads are cached in %USERPROFILE%\.caw_deps, only the very first build downloads) ===
+echo This can take several minutes. Writing caw_configure.log...
+cmake -B build -DCMAKE_POLICY_VERSION_MINIMUM=3.5 > caw_configure.log 2>&1
+set "CAW_CONFIG_RESULT=%ERRORLEVEL%"
+type caw_configure.log
+if not "%CAW_CONFIG_RESULT%"=="0" goto :fail_config
 
 echo.
-echo === Building ===
-cmake --build build --config Release
-if errorlevel 1 goto :fail
+echo === Building (writing caw_build.log) ===
+cmake --build build --config Release > caw_build.log 2>&1
+set "CAW_BUILD_RESULT=%ERRORLEVEL%"
+type caw_build.log
+if not "%CAW_BUILD_RESULT%"=="0" goto :fail_build
 
 echo.
 if /i "%~1"=="nostart" goto :done
@@ -58,8 +64,14 @@ echo.
 echo Done.
 exit /b 0
 
-:fail
+:fail_config
 echo.
-echo [FAILED] See the messages above.
+echo [FAILED] Configuration failed. Share caw_configure.log, including the first error above.
+pause
+exit /b 1
+
+:fail_build
+echo.
+echo [FAILED] Build failed. Share caw_build.log, including the first error above.
 pause
 exit /b 1

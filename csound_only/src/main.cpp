@@ -9,6 +9,7 @@
 #include <d3d11.h>
 #include <shellapi.h>
 #include <string>
+#include <chrono>
 
 static ID3D11Device* g_dev = nullptr;
 static ID3D11DeviceContext* g_ctx = nullptr;
@@ -112,15 +113,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int) {
         return 1;
     }
     DragAcceptFiles(hwnd, TRUE);
-    ShowWindow(hwnd, SW_SHOWDEFAULT);
+    ShowWindow(hwnd, SW_SHOWMAXIMIZED);
     UpdateWindow(hwnd);
 
-        {   // CAW itself must not be throttled either (its UDP events drive the engine): no power throttling, 1 ms timer
-        struct PowerThrottle { ULONG Version; ULONG ControlMask; ULONG StateMask; } pt = {1, 0x1 | 0x4, 0};
-        typedef BOOL(WINAPI * SetProcInfoFn)(HANDLE, int, LPVOID, DWORD);
-        if (HMODULE k32 = GetModuleHandleA("kernel32.dll"))
-            if (SetProcInfoFn fn = (SetProcInfoFn)GetProcAddress(k32, "SetProcessInformation")) fn(GetCurrentProcess(), 4, &pt, sizeof(pt));
-    }
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -135,9 +130,23 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int) {
     ImFont* codeBold = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consolab.ttf", 17.0f * dpi);
     ImFont* codeItalic = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consolai.ttf", 17.0f * dpi);
     appSetCodeFonts(codeRegular ? codeRegular : uiFont, codeBold, codeItalic);
+    ImFont* markUi = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 76.0f * dpi);
+    ImFont* markCode = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consola.ttf", 76.0f * dpi);
+    appSetMarkFonts(markUi ? markUi : uiFont, markCode ? markCode : codeRegular);
+    appPrepareLogo();
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_dev, g_ctx);
+    ImGui_ImplDX11_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+    appDrawStartupSplash();
+    ImGui::Render();
+    const float splashClear[4] = {0.06f, 0.06f, 0.07f, 1.f};
+    g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
+    g_ctx->ClearRenderTargetView(g_rtv, splashClear);
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    g_sc->Present(1, 0);
     appInit();
     if (commandLine && *commandLine) {
         std::string initialPath = commandLine;
@@ -147,14 +156,39 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int) {
     }
 
     bool done = false;
+    auto nextFrame = std::chrono::steady_clock::now();
+    auto lastFrame = nextFrame - std::chrono::milliseconds(16);
+    auto activeUntil = nextFrame + std::chrono::seconds(2);
     while (!done) {
         MSG msg;
+        bool inputWake = false;
         while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
+            if ((msg.message >= WM_KEYFIRST && msg.message <= WM_KEYLAST) ||
+                (msg.message >= WM_MOUSEFIRST && msg.message <= WM_MOUSELAST) ||
+                msg.message == WM_SIZE || msg.message == WM_SETFOCUS || msg.message == WM_PAINT)
+                inputWake = true;
             TranslateMessage(&msg);
             DispatchMessage(&msg);
             if (msg.message == WM_QUIT) done = true;
         }
         if (done) break;
+        const auto now = std::chrono::steady_clock::now();
+        if (inputWake) {
+            activeUntil = now + std::chrono::seconds(2);
+            // Wake promptly for input, but never exceed the 60 fps cap.
+            const auto earliest = lastFrame + std::chrono::milliseconds(16);
+            const auto requested = now > earliest ? now : earliest;
+            if (requested < nextFrame) nextFrame = requested;
+        }
+        if (now < nextFrame) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(nextFrame - now).count();
+            MsgWaitForMultipleObjectsEx(0, nullptr, (DWORD)(remaining + 1), QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            continue;
+        }
+        // A still, engine-off window idles at 10 fps. Input wakes it promptly
+        // and keeps it responsive; playback/timeline/export stay at 60 fps.
+        lastFrame = now;
+        nextFrame = now + std::chrono::milliseconds((appNeedsResponsiveFrames() || now < activeUntil) ? 16 : 100);
 
         if (g_resizeW != 0 && g_resizeH != 0) {
             releaseRTV();
@@ -166,8 +200,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int) {
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
-        appFrame(io.DeltaTime);
+        const bool visible = !IsIconic(hwnd);
+        appFrame(io.DeltaTime, visible);
         if (appQuitRequested()) { ImGui::EndFrame(); break; }
+        if (!visible) { ImGui::EndFrame(); continue; }  // service engine/timeline, skip hidden UI and GPU work
         ImGui::Render();
 
         const float clear[4] = {0.06f, 0.06f, 0.07f, 1.f};

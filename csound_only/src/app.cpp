@@ -3,24 +3,57 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifdef _WIN32
+#include <winsock2.h>
 #include <windows.h>
-#include <objbase.h>
-#include <propidl.h>
-#include <propsys.h>
-#include <mmdeviceapi.h>
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "propsys.lib")
+#pragma comment(lib, "ws2_32.lib")
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+// the few Winsock names used below, mapped to the BSD socket API
+using SOCKET = int;
+#define INVALID_SOCKET (-1)
+#define SOCKET_ERROR (-1)
+#define closesocket close
+#endif
+#include "platform.h"
 #include "audio_devices.h"
+#include "audio_device_match.h"
+#include "audio_codec.h"
+#include "branding.h"
+#include "startup_logo.h"
+#include "arrow_widgets.h"
 #include "csd_builder.h"
 #include "clip_automation_move.h"
+#include "clip_timing.h"
+#include "code_export.h"
+#include "midi_clip_ops.h"
 #include "imgui.h"
-#include "process.h"
+#include "process_runner.h"
+#include "process_quote.h"
+#include "csound_api_runner.h"
+#include "selected_test_sound.h"
 #include "project_io.h"
 #include "score_svg.h"
 #include "TextEditor.h"
 #include "csound_opcodes.h"
 #include "marks_gfx.h"
+#include "vst_ui.h"
+#include "vst_lang.h"
 #include "monitor_math.h"
+#include "monitor_fft.h"
+#include "monitor_bands.h"
+#include "monitor_peaks.h"
+#include "monitor_frame.h"
+#include "monitor_parse.h"
+#include "monitor_osc.h"
+#include "monitor_work.h"
+#include "timeline_zoom.h"
+#include "timeline_loop.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -47,9 +80,6 @@
 #include <utility>
 #include <unordered_map>
 #include <memory>
-#include <windows.h>
-#include <commdlg.h>
-#include <shellapi.h>
 
 namespace {
 
@@ -72,9 +102,15 @@ int g_selTrack = -1, g_selClip = -1;
 int g_nextTrackId = 1;
 std::string g_projectPath;
 std::string g_savedSnap;               // the project as it was when it was last saved / opened (to know if there are unsaved changes)
+std::string g_autoSavedSnap, g_unsavedAutosavePath;
+float g_autoSaveElapsed = 0.f;
 bool g_askSaveOnClose = false;
 bool g_confirmDeleteSelected = false;
 ImFont* g_codeFonts[3] = {nullptr, nullptr, nullptr};
+ImFont* g_markUiFont = nullptr;
+ImFont* g_markCodeFont = nullptr;
+ImVec2 g_logoUv0, g_logoUv1;
+bool g_logoReady = false;
 std::unordered_map<int, std::unique_ptr<TextEditor>> g_codeEditors;
 int g_autoDragTrackId = -1;
 int g_autoDragPoint = -1;
@@ -96,6 +132,8 @@ ImVec2 g_clipMarqueeStart;
 bool g_clipMarqueeMoved = false, g_clipMarqueeAdd = false;
 float g_headerW = 370.f;                          // width of the left lane panel (unscaled px), drag its edge to resize
 bool g_timelineRun = false;                       // Play: the timeline moves and triggers the instruments of the running Csound
+bool g_loopSelecting = false;
+double g_loopAnchor = 0.0;
 double g_hold = 0.0;                               // after Csound has started, the playhead waits one sound-card buffer so it meets the sound
 int g_resync = 0;                                 // not 0 = the timeline has to be (re)started from the playhead (Play pressed, playhead moved)
 std::string g_runName;                            // clip started with "Run clip" in the running engine
@@ -122,6 +160,7 @@ double g_midiDragTimeOffset = 0.0;
 int g_trackCounter = 0;
 std::vector<int> g_multiMidiIds;       // MIDI clips shown together in ONE piano roll (select them, press Enter)
 bool g_multiMidiOpen = false;
+inline bool hasClips(const Track& t) { return t.kind == 0 || t.kind == 3 || t.kind == 4; }   // normal tracks and VSTi / VSTe tracks hold clips
 int g_ctxTrack = -1;                   // track of the right-click menu in the left panel (-1 = empty panel space)
 int g_markTrack = -1, g_markIdx = -1;  // marker being edited
 int g_markDrag = -1, g_markDragTrack = -1, g_markDragMode = 0;   // marker being dragged (1 move, 2 resize)
@@ -189,6 +228,7 @@ const float kMidiRowH = 16.f;
 bool g_showMonitor = true;
 bool g_settingsOpen = false;
 bool g_aboutOpen = false;   // Help > About
+bool g_welcomeOpen = true; // separate startup welcome
 int g_settingsGoto = -1;   // menu: which Settings tab to show next (0 Audio, 1 Programs, 2 Render, 3 Editor, 4 Advanced, 5 Files); -1 = none
 bool g_audioPoolOpen = false;
 bool g_udoPoolOpen = false;
@@ -214,8 +254,8 @@ float g_meterW = 0.f;   // width of the meter panel (unscaled px), 0 = from the 
 int g_specDetail = 1;    // spectrum drawing: 0 coarse, 1 normal, 2 fine (right-click the spectrum)
 int g_specFall = 1;      // spectrum fall speed: 0 fast, 1 medium, 2 slow
 int g_scopeSmooth = 1;   // scope interpolation: 0 linear, 1 cubic, 2 high-resolution cubic
-int g_scopeDisplay = 0;  // 0 free-running sweep, 1 rising-zero-crossing triggered frame
-int g_scopeMs = 200;     // scope time window (x range) in milliseconds, right-click the scope
+int g_scopeDisplay = 1;  // 0 free-running sweep, 1 rising-zero-crossing triggered frame
+int g_scopeMs = 6;       // scope time window, in milliseconds
 int g_scopeChannels = 0; // 0 stereo, 1 left, 2 right, 3 mid
 int g_scopeSample = 0;   // 0 point sample, 1 signed peak over each display bucket
 bool g_scopeFreeze = false;
@@ -225,10 +265,10 @@ int g_specDisplay = 0;   // 0 live response, 1 discrete updates
 float g_specFrameClock = 0.f;
 int g_specScale = 0;     // 0 logarithmic, 1 linear
 int g_specInterpolation = 1; // 0 linear, 1 cubic
-int g_specStyle = 0;     // 0 fill + curve, 1 curve only
+int g_specStyle = 0;     // 0 estimated tonal peaks, 1 combined shape, 2 FFT line, 3 measured 1/6-octave energy
 bool g_specGrid = true;
 float g_specMinHz = 25.f, g_specMaxHz = 18000.f;
-float g_specDbFloor = -90.f;
+float g_specDbFloor = -60.f;
 // Control periods per scope point for the chosen time window, and the window that really results (whole control periods only).
 int scopeDiv() {
     const double period = (double)std::max(1, g_proj.cs.ksmps) / (double)std::max(1, g_proj.cs.sr);
@@ -243,12 +283,20 @@ int scopeWindowMs() {
 bool g_viewMeter = true, g_viewSpectrum = true, g_viewScope = true, g_viewConsole = true;
 
 ProcessRunner g_playProc, g_renderProc;
+CsoundApiRunner g_apiProc;
+CsoundApiRunner g_offlineProc;
+CawCodecRunner g_codecProc;
+TestSound g_testSound;
+bool g_useCsoundApi = false;
+uint64_t g_apiSnapshotSeq = 0;
 ProcessRunner g_testProc;                          // 'Test' button of the code editor: one clip alone, no audio
 struct TestRun { std::string name; bool sawError = false; } g_test;
 std::string clipLineMessage(const std::string& l);
 void logCsoundLine(const std::string& raw);
 void startEngine();
 void startRender();
+void cancelRender();
+bool replaceOutputFile(const std::string& temporary, const std::string& final, std::string& error);
 std::vector<OrcSpan> g_orcSpans;                   // where each clip sits in the .csd that is running (for error lines)
 ProcessRunner g_opcodeProc;                        // 'csound -z' at startup: the opcode list for the editor colors
 bool g_opcodeScanStarted = false;
@@ -257,6 +305,13 @@ bool g_playWaiting = false, g_sectionSeen = false;
 float g_playWaitT = 0.f;
 bool g_renderActive = false;
 std::string g_renderPath;
+std::string g_renderTemp, g_renderEncodedTemp;
+bool g_renderConverting = false, g_confirmRenderOverwrite = false;
+bool g_renderWillOverwrite = false, g_renderWarnVst = false;
+bool g_audioExportOpen = false;
+int g_activeFlacBits = 24, g_activeMp3Kbps = 192;
+std::string g_exportError;
+int g_activeRenderFormat = 0;
 // Console: every line knows its importance, its language and (when the message names one) its clip.
 enum LogLevel { kLogDetail = 0, kLogMessage = 1, kLogImportant = 2, kLogError = 3 };
 struct LogLine {
@@ -279,10 +334,10 @@ int g_focusClipWin = -1;                   // clip editor window that gets the f
 struct ErrCtx { int left = 0; std::string text; int row = -1; std::string rowText; };   // row: index of the error row in g_log that waits for its line
 ErrCtx g_errCtx;                           // an error line was just printed: the "line N" lines right after it belong to it
 
-std::vector<AudioDevice> g_outDevs, g_inDevs;
+std::vector<AudioDevice> g_outDevs, g_inDevs;                 // CAW's PortAudio: every driver
+std::vector<AudioDevice> g_csoundOutDevs, g_csoundInDevs;     // Csound's own numbering (old process engine only)
 
 std::vector<float> g_dispDb, g_holdDb, g_holdT;      // master meter state, one entry per output channel (nchnls)
-std::vector<char> g_clip;
 int g_engineMaster = 2;                              // master channels the running engine was started with
 float g_specSm[1024];
 // ---- data printed by the running Csound engine (CawMon instrument): master + lane meters, scope, spectrum bands
@@ -290,8 +345,21 @@ std::vector<LaneMeterInfo> g_engineMeters;         // meter layout the engine wa
 std::vector<LaneMeterInfo> g_idleMeters;           // layout of the current project while Csound is off
 std::vector<float> g_peakIn(2, 0.f);               // newest peak per meter index (0dbfs-normalized, linear)
 std::vector<float> g_meterDb;                      // smoothed display value per meter index (dB)
-std::set<int> g_laneClipped;                       // meter indices (one per track channel) whose red LED is lit
+std::vector<float> g_meterClipHold;                // per-channel 1.5 second red clip light
 float g_bandAmp[kMeterBands] = {};
+float g_rawLeft[monitor_fft::size] = {}, g_rawRight[monitor_fft::size] = {};
+MonitorFrameAssembler g_rawAssembler;
+float g_rawFrozenLeft[monitor_fft::size] = {}, g_rawFrozenRight[monitor_fft::size] = {};
+float g_analyzerFrozenLeft[monitor_fft::size] = {}, g_analyzerFrozenRight[monitor_fft::size] = {};
+bool g_haveRaw = false;
+float g_rawAge = 10.f;
+int g_rawSampleRate = 44100, g_analyzerMode = 0, g_fftChannel = 0;
+float g_rawFullScale = 1.f;
+std::vector<float> g_fftDb;
+std::vector<monitor_bands::Band> g_spectrumBands;
+std::vector<monitor_bands::Band> g_columnBands;
+std::vector<monitor_peaks::Peak> g_tonePeaks;
+std::deque<std::vector<float>> g_fftHistory;
 float g_scopeL[kScopePoints] = {}, g_scopeR[kScopePoints] = {};
 float g_scopeStagingL[kScopePoints] = {}, g_scopeStagingR[kScopePoints] = {};
 float g_scopeFrozenL[kScopePoints] = {}, g_scopeFrozenR[kScopePoints] = {};
@@ -413,8 +481,9 @@ int newFolderFor(int idx) {
 
 std::set<int> g_collapsedAuto;   // track ids whose automation sub-tracks are folded away with the arrow (UI only, the data stays)
 bool autoShown(const Track& track, const std::string& channel) { return g_collapsedAuto.count(track.id) == 0 && track.hiddenAutomation.count(channel) == 0 && !trackHiddenByFolder(track); }
-// The MIDI lane only exists when at least one Csound clip of the lane has  midi: "on"  in its <caw> block.
+// Keep lanes visible while they contain MIDI clips, even if the instrument toggle was switched off.
 bool trackHasMidi(const Track& track) {
+    if (!track.midiClips.empty()) return true;
     for (const Clip& c : track.clips) if (parseClip(c).midiEnabled) return true;
     return false;
 }
@@ -463,7 +532,7 @@ void ensureUniqueInstrumentName(int trackIndex) {
 }
 
 double clampTimelineTime(double t) {
-    return std::max(0.0, t); // free timing, no hidden quantize
+    return std::max(0.0, t); // free timing, no hidden snapping
 }
 
 uint32_t storedRgb(uint32_t rgb) { return 0x01000000u | (rgb & 0x00FFFFFFu); }
@@ -618,6 +687,13 @@ void openMidiEditorFor(int laneIndex, const Clip& clip) {
     lane.midiClips.push_back(mc);
 }
 
+// Enabling MIDI creates one region for this clip if it does not already have one.
+void ensureMidiClipFor(int laneIndex, const Clip& clip) {
+    if (laneIndex < 0 || laneIndex >= (int)g_proj.tracks.size()) return;
+    if (midi_clip_ops::ensureForClip(g_proj, (size_t)laneIndex, clip.id))
+        g_collapsedAuto.erase(g_proj.tracks[(size_t)laneIndex].id);
+}
+
 Clip* selectedClip(int* laneIndex = nullptr) {
     if (g_selTrack < 0 || g_selTrack >= (int)g_proj.tracks.size()) return nullptr;
     Track& t = g_proj.tracks[(size_t)g_selTrack];
@@ -726,6 +802,13 @@ int addLangTrack(int /*lang*/) {
     return addTrack("Csound" + std::to_string(++g_trackCounter), kLead);
 }
 
+// Reserved track types only: no Csound clips or pretend integration.
+int addPlaceholderTrack(bool superCollider) {
+    const int idx = addTrack(std::string(superCollider ? "SuperCollider" : "PureData") + std::to_string(++g_trackCounter), "");
+    g_proj.tracks[(size_t)idx].kind = superCollider ? 5 : 6;
+    return idx;
+}
+
 // A graph track: one lane in the printed score that holds up to 8 automation lines. It is only drawn in the score, it never makes sound.
 int addFreeAutomationTrack() {
     const int idx = addTrack("Graph" + std::to_string(++g_trackCounter), "");
@@ -744,9 +827,19 @@ int addMarkerTrack() {
     return idx;
 }
 
+int addVstTrack(bool instrument) {
+    const int idx = addTrack(std::string(instrument ? "VSTi" : "VSTe") + std::to_string(++g_trackCounter), "");
+    g_proj.tracks[(size_t)idx].kind = instrument ? 3 : 4;
+    g_proj.tracks[(size_t)idx].code = instrument   // the code every new clip of this track starts with (CAW code)
+        ? "# plays a note every half second, P1 follows a slow lfo\nevery 0.5 {\n  note 48 + int(rnd(12)), 100, 0.4\n}\nP1 = uni(lfo(0.2))\n"
+        : "# P1 follows the loudness of the sound that comes in\nP1 = clip(level(in) * 4, 0, 1)\n";
+    vstui::openWindow(g_proj.tracks[(size_t)idx].id);
+    return idx;
+}
+
 void addClip(int laneIndex, double start, double dur, const std::string& code, const std::string& name = std::string()) {
     Track& lane = g_proj.tracks[(size_t)laneIndex];
-    if (lane.kind != 0) return;   // graph and marker tracks take no clips
+    if (!hasClips(lane)) return;   // graph and marker tracks take no clips
     Clip c = makeClip(lane, start, dur, code);
     if (!name.empty()) { c.name = name; ensureUniqueClipName(c); }
     lane.clips.push_back(c);
@@ -821,7 +914,7 @@ void laneValueRange(const Track& track, const std::string& channel, double& lo, 
 }
 
 double laneQuantizeValue(const Track& track, const std::string& channel, double value) {
-    if (track.kind != 0) return value; // free graph tracks have no declared clip step
+    if (!hasClips(track)) return value; // free graph tracks have no declared clip step
     const ParsedTrack parsed = parseTrack(track);
     for (const CawParam& param : parsed.params)
         if (param.chn == channel) return quantizeAutomation(value, param);
@@ -1005,11 +1098,11 @@ void drawWaveHandles(ImDrawList* dl, const WaveHandles& h, int active) {
         dl->AddCircle(c, S(7), line, 0, S(1.2f));
         const float a = S(3);
         if (kind == 1) {        // up and down
-            dl->AddTriangleFilled(ImVec2(c.x, c.y - a - S(1)), ImVec2(c.x - a, c.y - S(1)), ImVec2(c.x + a, c.y - S(1)), ink);
-            dl->AddTriangleFilled(ImVec2(c.x, c.y + a + S(1)), ImVec2(c.x - a, c.y + S(1)), ImVec2(c.x + a, c.y + S(1)), ink);
+            caw_ui::arrow(dl, c, ImGuiDir_Up, a, ink);
+            caw_ui::arrow(dl, c, ImGuiDir_Down, a, ink);
         } else if (kind == 2) { // left and right
-            dl->AddTriangleFilled(ImVec2(c.x - a - S(1), c.y), ImVec2(c.x - S(1), c.y - a), ImVec2(c.x - S(1), c.y + a), ink);
-            dl->AddTriangleFilled(ImVec2(c.x + a + S(1), c.y), ImVec2(c.x + S(1), c.y - a), ImVec2(c.x + S(1), c.y + a), ink);
+            caw_ui::arrow(dl, c, ImGuiDir_Left, a, ink);
+            caw_ui::arrow(dl, c, ImGuiDir_Right, a, ink);
         } else {                // a small wave
             ImVec2 w[5] = {ImVec2(c.x - a * 1.4f, c.y), ImVec2(c.x - a * 0.7f, c.y - a), ImVec2(c.x, c.y), ImVec2(c.x + a * 0.7f, c.y + a), ImVec2(c.x + a * 1.4f, c.y)};
             dl->AddPolyline(w, 5, ink, 0, S(1.4f));
@@ -1083,6 +1176,12 @@ bool inputStr(const char* label, std::string& s, ImGuiInputTextFlags flags, ImGu
     if (chain) flags |= ImGuiInputTextFlags_CallbackCharFilter;
     StrCtx c{&s, chain};
     return ImGui::InputText(label, s.data(), s.capacity() + 1, flags, strCb, &c);
+}
+
+bool inputStrHint(const char* label, const char* hint, std::string& s) {
+    StrCtx c{&s, nullptr};
+    return ImGui::InputTextWithHint(label, hint, s.data(), s.capacity() + 1,
+                                    ImGuiInputTextFlags_CallbackResize, strCb, &c);
 }
 
 bool inputMulti(const char* label, std::string& s, ImVec2 size, ImGuiInputTextFlags flags) {
@@ -1177,58 +1276,30 @@ bool writeTextFile(const std::string& path, const std::string& text) {
 }
 
 std::string chooseProjectPath(bool saveAs) {
-    char path[MAX_PATH * 4] = {};
-    if (!g_projectPath.empty())
-        std::snprintf(path, sizeof(path), "%s", g_projectPath.c_str());
-    else
-        std::snprintf(path, sizeof(path), "Untitled.caw");
-
-    OPENFILENAMEA dialog = {};
-    dialog.lStructSize = sizeof(dialog);
-    dialog.hwndOwner = GetActiveWindow();
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = sizeof(path);
-    dialog.lpstrFilter = "CAW project (*.caw)\0*.caw\0All files (*.*)\0*.*\0\0";
-    dialog.lpstrDefExt = "caw";
-    dialog.Flags = OFN_PATHMUSTEXIST | (saveAs ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
-    const BOOL ok = saveAs ? GetSaveFileNameA(&dialog) : GetOpenFileNameA(&dialog);
-    return ok ? std::string(path) : std::string();
+    return plat::chooseFile(saveAs, saveAs ? "Save CAW project" : "Open CAW project", "CAW project", {"caw"},
+                            !g_projectPath.empty() ? g_projectPath : std::string("Untitled.caw"));
 }
 
 std::string chooseAudioPath() {
-    char path[MAX_PATH * 4] = {};
-    OPENFILENAMEA dialog = {};
-    dialog.lStructSize = sizeof(dialog);
-    dialog.hwndOwner = GetActiveWindow();
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = sizeof(path);
-    dialog.lpstrFilter = "All files (*.*)\0*.*\0\0";
-    dialog.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
-    return GetOpenFileNameA(&dialog) ? std::string(path) : std::string();
+    return plat::chooseFile(false, "Choose an audio file", "", {}, std::string());
 }
 
 std::string chooseIncludePath() {
-    char path[MAX_PATH * 4] = {};
-    OPENFILENAMEA dialog = {};
-    dialog.lStructSize = sizeof(dialog);
-    dialog.hwndOwner = GetActiveWindow();
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = sizeof(path);
-    dialog.lpstrFilter = "Csound includes (*.udo;*.sco;*.txt)\0*.udo;*.sco;*.txt\0All files (*.*)\0*.*\0\0";
-    dialog.lpstrDefExt = "udo";
-    dialog.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
-    return GetOpenFileNameA(&dialog) ? std::string(path) : std::string();
+    return plat::chooseFile(false, "Choose a Csound include file", "Csound includes", {"udo", "sco", "txt"}, std::string());
 }
 
 void saveProject(bool saveAs) {
     std::string path = saveAs || g_projectPath.empty() ? chooseProjectPath(true) : g_projectPath;
     if (path.empty()) return;
+    vstui::captureParameters(g_proj);
     if (std::filesystem::path(path).extension().empty()) path += ".caw";
     std::string error;
     if (saveProjectFile(g_proj, path, error)) {
         g_projectPath = std::filesystem::absolute(path).string();
         logLine("[caw] Saved project: " + g_projectPath);
         g_savedSnap = serializeProject(g_proj);
+        g_autoSavedSnap = g_savedSnap;
+        g_autoSaveElapsed = 0.f;
     } else logLine("[caw] Save failed: " + error);
 }
 
@@ -1241,6 +1312,7 @@ void historyReset();
 // Makes `project` the current one and resets every editor state that belongs to the old project.
 void adoptProject(Project&& project, const std::string& path) {
     if (g_playing) stopPlayback();
+    vstui::slots().clear();
     g_proj = std::move(project);
     g_audioPoolSelected = -1;
     g_includeSelected = -1;
@@ -1252,6 +1324,9 @@ void adoptProject(Project&& project, const std::string& path) {
     g_midiDragTrackId = g_midiDragNote = -1;
     g_midiSelectedTrackId = g_midiSelectedNote = -1;
     g_projectPath = path;
+    g_autoSavedSnap.clear();
+    g_unsavedAutosavePath.clear();
+    g_autoSaveElapsed = 0.f;
     g_nextTrackId = 1;
     std::set<int> usedIds;
     for (Track& t : g_proj.tracks) {
@@ -1268,6 +1343,7 @@ void adoptProject(Project&& project, const std::string& path) {
     g_trackCounter = (int)g_proj.tracks.size();
     g_selTrack = g_selClip = -1;
     g_play = 0.0;
+    g_loopSelecting = false;
     historyReset();
     refreshAudioDevices();
     g_savedSnap = serializeProject(g_proj);
@@ -1297,41 +1373,16 @@ void openProject() {
 
 bool nameHasTag(const std::string& name, const std::string& tag);   // defined next to devCombo
 
-// Name of the Windows default playback / recording device (the one chosen in the Windows sound control panel).
-std::string windowsDefaultEndpointName(bool capture) {
-    std::string result;
-    const HRESULT initHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    IMMDeviceEnumerator* en = nullptr;
-    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en)) && en) {
-        IMMDevice* dev = nullptr;
-        if (SUCCEEDED(en->GetDefaultAudioEndpoint(capture ? eCapture : eRender, eConsole, &dev)) && dev) {
-            IPropertyStore* ps = nullptr;
-            if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps)) && ps) {
-                const PROPERTYKEY friendlyName = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};   // PKEY_Device_FriendlyName
-                PROPVARIANT pv;
-                PropVariantInit(&pv);
-                if (SUCCEEDED(ps->GetValue(friendlyName, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) {
-                    const int n = WideCharToMultiByte(CP_UTF8, 0, pv.pwszVal, -1, nullptr, 0, nullptr, nullptr);
-                    if (n > 1) { result.assign((size_t)n - 1, '\0'); WideCharToMultiByte(CP_UTF8, 0, pv.pwszVal, -1, &result[0], n, nullptr, nullptr); }
-                }
-                PropVariantClear(&pv);
-                ps->Release();
-            }
-            dev->Release();
-        }
-        en->Release();
-    }
-    if (SUCCEEDED(initHr)) CoUninitialize();
-    return result;
-}
+// Name of the system default playback / recording device (Windows: the one chosen in the Windows sound control panel; elsewhere empty).
+std::string windowsDefaultEndpointName(bool capture) { return plat::defaultAudioEndpointName(capture); }
 
 // The device of this host API type (ASIO / WASAPI / ...) that is the Windows default; otherwise the first one of that type. -1 = none found.
 int pickDefaultDevice(const std::vector<AudioDevice>& list, const std::string& tag, bool capture) {
-    const std::string wanted = tag == "ASIO" ? std::string() : windowsDefaultEndpointName(capture);
+    const std::string wanted = tag == "ASIO" ? std::string() : windowsDefaultEndpointName(capture);   // empty on macOS / Linux: first device of that type
     if (!wanted.empty())
         for (const AudioDevice& d : list)
-            if (nameHasTag(d.name, tag) && nameHasTag(d.name, wanted)) return d.id;
-    for (const AudioDevice& d : list) if (nameHasTag(d.name, tag)) return d.id;
+            if (cawDeviceHasHostApi(d.name, tag) && nameHasTag(d.name, wanted)) return d.id;
+    for (const AudioDevice& d : list) if (cawDeviceHasHostApi(d.name, tag)) return d.id;
     return -1;
 }
 
@@ -1341,10 +1392,17 @@ void refreshAudioDevices() {
     if (backend == "winmm") backend = "winmme";
     g_proj.cs.rtaudio = backend;
     std::string outError, inError;
-    g_outDevs = listCsoundDevices(csoundExePath(), backend, true, outError);
-    g_inDevs = listCsoundDevices(csoundExePath(), backend, false, inError);
+    // The list shown in Settings comes from CAW's own PortAudio (it has every driver: ASIO, WASAPI, DirectSound, MME, WDM-KS ...).
+    // Csound's own list is only kept to translate a choice when the old (process) engine is used; it can lack some driver types.
+    g_csoundOutDevs = listCsoundDevices(csoundExePath(), backend, true, outError);
+    g_csoundInDevs = listCsoundDevices(csoundExePath(), backend, false, inError);
+    std::string paOutError, paInError;
+    g_outDevs = listPortAudioDevices(true, paOutError);
+    g_inDevs = listPortAudioDevices(false, paInError);
+    if (g_outDevs.empty()) { g_outDevs = g_csoundOutDevs; } else outError.clear();   // PortAudio list is the main one
+    if (g_inDevs.empty()) { g_inDevs = g_csoundInDevs; } else inError.clear();
     if (!outError.empty()) logLine("[caw] Audio output devices: " + outError);
-    else logLine("[caw] Found " + std::to_string(g_outDevs.size()) + " Csound output device(s).");
+    else logLine("[caw] Found " + std::to_string(g_outDevs.size()) + " output device(s) in all drivers (Csound itself lists " + std::to_string(g_csoundOutDevs.size()) + ").");
     if (!inError.empty()) logLine("[caw] Audio input devices: " + inError);
     // A device number saved in a project belongs to the PC it was made on. If it is not in this PC's list, use the system default,
     // otherwise Csound opens the wrong device (or none) and there is no sound.
@@ -1357,7 +1415,8 @@ void refreshAudioDevices() {
         logLine("[caw] Audio input device " + std::to_string(g_proj.cs.inDev) + " of this project does not exist on this computer - using the system default.");
         g_proj.cs.inDev = -1;
     }
-    g_cawDefaultDevice = [](bool capture) { return capture ? -1 : pickDefaultDevice(g_outDevs, "WASAPI", false); };   // "System default" = Windows default card (WASAPI)
+    // "System default" = Windows default card (WASAPI). On macOS / Linux PortAudio's own default device is used (-odac without a number).
+    g_cawDefaultDevice = [](bool capture) { return (capture || !plat::isWindows) ? -1 : pickDefaultDevice(g_outDevs, "WASAPI", false); };
     if (!g_proj.cs.options.empty()) syncOptionsFromSettings(g_proj.cs);   // the typed options line must not keep the old -odacN
 }
 
@@ -1386,10 +1445,18 @@ void historyCommit(std::string now) {
 
 // Called once per frame: a finished edit (mouse released, field left, typing paused) becomes one undo step.
 void historyTick(float dt) {
-    if (!cawEnv("CAW_HIST_EVERY_FRAME")) {   // serialize the whole project 4 times a second instead of every frame
+    if (!cawEnv("CAW_HIST_EVERY_FRAME")) {
         static float acc = 0.f;
+        static float interactionGrace = 0.f;
+        const ImGuiIO& io = ImGui::GetIO();
+        const bool interaction = ImGui::IsAnyItemActive() || ImGui::IsMouseDown(0) || ImGui::IsMouseDown(1) ||
+            io.MouseDelta.x != 0.f || io.MouseDelta.y != 0.f || io.MouseWheel != 0.f ||
+            io.InputQueueCharacters.Size > 0;
+        interactionGrace = interaction ? 1.f : std::max(0.f, interactionGrace - dt);
         acc += dt;
-        if (acc < 0.25f) return;
+        // Continue the existing editing cadence while active; once idle,
+        // serialize at most once a second. Undo/close still flush immediately.
+        if (acc < (interactionGrace > 0.f ? 0.25f : 1.f)) return;
         dt = acc;
         acc = 0.f;
     }
@@ -1489,6 +1556,10 @@ void runJoinTool();
 
 // ---------------------------------------------------------------- score (SVG) : export, editor, 3-minute example
 bool g_scoreOpen = false;
+bool g_scoreMapOpen = false;
+bool g_scoreExportOpen = false;
+bool g_codeExportOpen = false;
+int g_scoreExportType = 0, g_scoreExportColor = 0;
 
 // ---- spectrogram of the rendered audio file (shown in the score when "Spectrum" is on)
 ScoreSpectrum g_scoreSpec;
@@ -1496,8 +1567,12 @@ std::string g_scoreSpecPath, g_scoreSpecMsg;
 std::filesystem::file_time_type g_scoreSpecTime;
 
 // The render file: a relative name lives next to the saved project (or in the work folder while the project is unsaved).
+const char* renderExtension(int format) {
+    return format == 3 ? ".flac" : format == 4 ? ".mp3" : ".wav";
+}
 std::filesystem::path renderFilePath() {
-    const std::filesystem::path file = g_proj.cs.renderFile.empty() ? "render.wav" : g_proj.cs.renderFile;
+    std::filesystem::path file = g_proj.cs.renderFile.empty() ? "render.wav" : g_proj.cs.renderFile;
+    file.replace_extension(renderExtension(g_proj.cs.renderFormat));
     if (file.is_absolute()) return file;
     return (g_projectPath.empty() ? workDir() : std::filesystem::path(g_projectPath).parent_path()) / file;
 }
@@ -1529,8 +1604,25 @@ bool refreshScoreSpectrum(bool force) {
 }
 
 void generateScore(bool detailed, bool blackWhite) {
-    const std::string base = renderFilePath().replace_extension("").string();
     const std::string fallback = g_projectPath.empty() ? std::string("Untitled") : std::filesystem::path(g_projectPath).stem().string();
+    const std::string ext = detailed ? "html" : "svg";
+    const std::filesystem::path parent = g_projectPath.empty() ? workDir() : std::filesystem::path(g_projectPath).parent_path();
+    const std::string suggested = (parent / (fallback + (detailed ? "_score_full" : "_score_overview") +
+                                   (blackWhite ? "_bw." : ".") + ext)).string();
+    std::string chosen = plat::chooseFile(true, "Save score", detailed ? "HTML score" : "SVG score", {ext}, suggested);
+    if (chosen.empty()) return;
+    std::filesystem::path selected(chosen);
+    std::string current = selected.extension().string();
+    std::transform(current.begin(), current.end(), current.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    if (current != "." + ext) {
+        selected += "." + ext;
+        chosen = plat::chooseFile(true, "Confirm score filename", detailed ? "HTML score" : "SVG score", {ext}, selected.string());
+        if (chosen.empty()) return;
+        selected = chosen;
+        current = selected.extension().string();
+        std::transform(current.begin(), current.end(), current.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        if (current != "." + ext) { logLine("[caw] Score export cancelled: use the " + ext + " extension."); return; }
+    }
     ScoreRenderOptions opt;
     opt.detailed = detailed;
     opt.blackWhite = blackWhite;
@@ -1554,13 +1646,30 @@ void generateScore(bool detailed, bool blackWhite) {
     }
     std::vector<std::string> files;
     std::string err;
-    if (writeScoreDocument(g_proj, fallback, opt, base, files, err) && !files.empty()) {
-        logLine("[caw] Score saved (" + std::to_string(files.size()) + " file(s)): " + files.front());
-        if (detailed) logLine("[caw] The .html file shows all pages; print it from the browser to get a PDF. Pages are the _pNN.svg files.");
-        ShellExecuteA(nullptr, "open", files.front().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::string temporary = selected.string() + ".tmp-" + std::to_string(stamp);
+    if (writeScoreDocument(g_proj, fallback, opt, temporary, files, err, true) && !files.empty() &&
+        replaceOutputFile(temporary, selected.string(), err)) {
+        logLine("[caw] Score saved: " + selected.string());
+        if (detailed) logLine("[caw] The HTML contains all score pages; print it from the browser to make a PDF.");
+        plat::openWithDefaultProgram(selected.string());
     } else {
+        std::error_code ec;
+        std::filesystem::remove(temporary, ec);
         logLine("[caw] ERROR: score: " + err);
     }
+}
+
+void exportCodeClips(code_export::Mode mode, code_export::Filter filter) {
+    const std::string parent = plat::chooseFolder("Choose a folder for code export");
+    if (parent.empty()) return;
+    std::filesystem::path directory;
+    int written = 0;
+    std::string error;
+    if (code_export::write(g_proj, parent, directory, written, error, mode, filter))
+        logLine("[caw] Exported " + std::to_string(written) + " code file(s) to " + directory.string());
+    else
+        logLine("[caw] Code export stopped after " + std::to_string(written) + " file(s): " + error);
 }
 
 // ---- small score widgets (shared by the score editor, the track panel, the clip editor and the clip menu)
@@ -1581,13 +1690,13 @@ bool comboFit(float minW, const char* id, int* cur, const char* items) {   // it
     float w = 0.f;
     for (const char* q = items; *q; q += std::strlen(q) + 1) w = std::max(w, ImGui::CalcTextSize(q).x);
     ImGui::SetNextItemWidth(std::max(minW, w + ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 2.f + S(6)));
-    return ImGui::Combo(id, cur, items);
+    return caw_ui::combo(id, cur, items);
 }
 bool comboFit(float minW, const char* id, int* cur, const char* const items[], int count) {
     float w = 0.f;
     for (int k = 0; k < count; ++k) w = std::max(w, ImGui::CalcTextSize(items[k]).x);
     ImGui::SetNextItemWidth(std::max(minW, w + ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 2.f + S(6)));
-    return ImGui::Combo(id, cur, items, count);
+    return caw_ui::combo(id, cur, items, count);
 }
 
 void drawTrackScoreMenu(Track& t) {
@@ -1668,11 +1777,42 @@ void drawAutoScoreMenu(Track& t, const std::string& channel) {
 // What a clip is in the score. Lanes, notes and automation are settings of the lanes, not of the clip.
 void drawClipScoreMenu(Clip& c, Track* lane = nullptr) {
     ImGui::TextDisabled("This clip in the score");
-    comboFit(S(240), "Looks like##cl_style", &c.scoreStyle, "Shape (amplitude + frequency)\0Line\0Grains (scattered)\0Block\0Sliced wave (granular)\0FM graph\0Dots and lines (keys, leads)\0");
+    comboFit(S(240), "Looks like##cl_style", &c.scoreStyle, "amp+frq\0Line\0scattered\0Block\0granular\0FM\0Dots-lines\0");
     if (ImGui::IsItemHovered()) helpTip("The score shows what is INSIDE the audio, so pick the picture of the technique: sliced wave for granular sound, FM graph for FM, dots and lines for played keys / leads.");
-    comboFit(S(240), "Shown as##cl_detail", &c.scoreDetail, "Overall (the whole shape of the sound)\0Detailed (+ data sent to channel \"score\")\0");
+    comboFit(S(240), "Shown as##cl_detail", &c.scoreDetail, "Overall\0Detailed\0");
     if (ImGui::IsItemHovered()) helpTip("Overall: the shape the instrument generates (amplitude shape and where its spectrum sits), measured when you press Render audio. It is not the MIDI notes.\n\nDetailed: also everything the code sends to the channel \"score\", of any type (numbers, signals, strings):\n  chnset kFreq, \"score\"   (aSig for a signal, Sname for text)\nRender audio records it, the score draws it.");
-    comboFit(S(200), "Role##cl_role", &c.scoreRole, "Generator\0Effect\0Generator and effect\0");
+    const ParsedTrack streams = parseClip(c);
+    if (ImGui::BeginMenu("Edit cawscore")) {
+        ImGui::TextDisabled("cawscore \"frq\", kFrq");
+        if (streams.scoreStreams.empty()) ImGui::TextDisabled("Add a cawscore line to this clip's code.");
+        for (const auto& stream : streams.scoreStreams) {
+            ImGui::PushID(stream.first.c_str());
+            const char* kind = stream.second == 4 ? "i-rate" : stream.second == 2 ? "a-rate" : stream.second == 3 ? "S-rate" : "k-rate";
+            ImGui::Text("%s  (%s)", stream.first.c_str(), kind);
+            if (stream.second == 2) {
+                const auto it = c.scoreDataStyle.find(stream.first);
+                const int style = it == c.scoreDataStyle.end() ? 0 : it->second;
+                int choice = style == 4 ? 1 : style == 3 ? 2 : 0;
+                if (comboFit(S(220), "Display", &choice, "Waveform envelope\0Combined spectrum\0Hidden\0"))
+                    c.scoreDataStyle[stream.first] = choice == 1 ? 4 : choice == 2 ? 3 : 0;
+                ImGui::TextDisabled("Spectrum is a relative average over the rendered clip.");
+            } else if (stream.second != 1) {
+                ImGui::TextDisabled("%s", stream.second == 4 ? "Value labels" :
+                    stream.second == 2 ? "Audio min/max envelope (50 ms buckets)" : "Text labels");
+                int style = c.scoreDataStyle.count(stream.first) ? c.scoreDataStyle[stream.first] : 0;
+                bool show = style != 3;
+                if (ImGui::Checkbox("Show", &show)) c.scoreDataStyle[stream.first] = show ? 0 : 3;
+            } else {
+                int style = c.scoreDataStyle.count(stream.first) ? c.scoreDataStyle[stream.first] : 0;
+                if (comboFit(S(200), "Display", &style, "Line chart\0Steps\0Dots\0Hidden\0"))
+                    c.scoreDataStyle[stream.first] = style;
+            }
+            ImGui::PopID();
+        }
+        ImGui::TextDisabled("Render audio again after editing code.");
+        ImGui::EndMenu();
+    }
+    comboFit(S(200), "Role##cl_role", &c.scoreRole, "Generator\0Effect\0both\0");
     ImGui::Checkbox("Write the coding language", &c.scoreShowLang);
     if (lane) {   // automation of this clip: how it appears in the score (set here, next to the code)
         const ParsedTrack pc = parseClip(c);
@@ -1712,6 +1852,135 @@ void drawScoreMarkList(const char* idPrefix, std::vector<ScoreMark>& list, bool 
     (void)idPrefix;
 }
 
+// Read-only patch-board overview. Static code matches show potential routes,
+// not proof that a conditional statement actually executes.
+void drawScoreRoutingMap() {
+    struct Route { std::string from, to; bool toMaster; };
+    std::vector<Route> routes;
+    std::set<std::pair<std::string, std::string>> codeRoutes;
+    const std::regex sendRe(R"re(\bcawsa\s+"([^"]+)")re");
+    const std::regex receiveRe(R"re(\bcawra\s+"([^"]+)")re");
+    auto destination = [&](const std::string& bus) {
+        for (const Track& other : g_proj.tracks)
+            if (other.kind == 4 && vstlang::busName(other) == bus) return std::string("VSTe: ") + other.name;
+        return std::string("BUS: ") + bus;
+    };
+    for (const Track& t : g_proj.tracks) {
+        if (t.kind == 0) {
+            for (const Clip& clip : t.clips) {
+                std::istringstream lines(clip.code);
+                std::string line;
+                while (std::getline(lines, line)) {
+                    const size_t semicolon = line.find(';');
+                    if (semicolon != std::string::npos) line.erase(semicolon);
+                    std::smatch match;
+                    const std::string clipName = "Csound: " + clip.name;
+                    if (std::regex_search(line, match, sendRe))
+                        codeRoutes.insert({clipName, destination(match[1].str())});
+                    if (std::regex_search(line, match, receiveRe))
+                        codeRoutes.insert({"BUS: " + match[1].str(), clipName});
+                }
+            }
+        }
+        if (t.kind != 3 && t.kind != 4) continue;
+        const std::string bus = vstlang::cleanBus(t.vstOut);
+        if (bus.empty() || t.vstOutMaster) routes.push_back({t.name, "MASTER", true});
+        if (!bus.empty()) {
+            routes.push_back({t.name, destination(bus), false});
+        }
+    }
+    for (const auto& route : codeRoutes) routes.push_back({route.first, route.second, false});
+    ImGui::TextUnformatted("SCORE PATCH BOARD");
+    ImGui::TextDisabled("VST outputs and literal cawsa/cawra in Csound clips. Dynamic code and other routes are not shown.");
+    if (routes.empty()) { ImGui::TextDisabled("No recognized routes yet."); return; }
+    ImGui::BeginChild("##score_patchboard", ImVec2(0, S(400)), true, ImGuiWindowFlags_HorizontalScrollbar);
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const float width = std::max(S(570), ImGui::GetContentRegionAvail().x);
+    const float rowH = S(64), left = origin.x + S(20), right = origin.x + width - S(210);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGui::Dummy(ImVec2(width, rowH * routes.size() + S(20)));
+    for (size_t i = 0; i < routes.size(); ++i) {
+        const float y = origin.y + S(12) + i * rowH;
+        const ImU32 wire = routes[i].toMaster ? IM_COL32(246, 151, 58, 255) : IM_COL32(67, 193, 200, 255);
+        dl->AddRectFilled(ImVec2(left, y), ImVec2(left + S(180), y + S(45)), IM_COL32(39, 42, 46, 255), S(4));
+        dl->AddRect(ImVec2(left, y), ImVec2(left + S(180), y + S(45)), IM_COL32(111, 105, 91, 255), S(4));
+        dl->PushClipRect(ImVec2(left + S(8), y), ImVec2(left + S(174), y + S(45)), true);
+        dl->AddText(ImVec2(left + S(10), y + S(13)), IM_COL32(235, 232, 219, 255), routes[i].from.c_str());
+        dl->PopClipRect();
+        dl->AddBezierCubic(ImVec2(left + S(180), y + S(22)), ImVec2(left + S(230), y + S(22)),
+                           ImVec2(right - S(45), y + S(22)), ImVec2(right, y + S(22)), wire, S(3));
+        dl->AddCircleFilled(ImVec2(left + S(180), y + S(22)), S(5), wire);
+        dl->AddRectFilled(ImVec2(right, y), ImVec2(right + S(180), y + S(45)), IM_COL32(40, 43, 45, 255), S(4));
+        dl->AddRect(ImVec2(right, y), ImVec2(right + S(180), y + S(45)), IM_COL32(111, 105, 91, 255), S(4));
+        dl->AddCircleFilled(ImVec2(right, y + S(22)), S(5), wire);
+        dl->PushClipRect(ImVec2(right + S(10), y), ImVec2(right + S(178), y + S(45)), true);
+        dl->AddText(ImVec2(right + S(12), y + S(13)), IM_COL32(235, 232, 219, 255), routes[i].to.c_str());
+        dl->PopClipRect();
+    }
+    ImGui::EndChild();
+}
+
+void drawScoreMapWindow() {
+    if (!g_scoreMapOpen) return;
+    ImGui::SetNextWindowSize(ImVec2(S(700), S(500)), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Map score", &g_scoreMapOpen))
+        drawScoreRoutingMap();
+    ImGui::End();
+}
+
+void drawScoreExportControls() {
+    ImGui::TextUnformatted("Score");
+    ImGui::SetNextItemWidth(S(260));
+    caw_ui::combo("##score_export_type", &g_scoreExportType, "Overview (SVG)\0Full score (HTML)\0");
+    ImGui::TextUnformatted("Color");
+    ImGui::SetNextItemWidth(S(260));
+    caw_ui::combo("##score_export_color", &g_scoreExportColor, "Colour\0Black and white\0");
+    if (ImGui::Button("Export score")) generateScore(g_scoreExportType == 1, g_scoreExportColor == 1);
+}
+
+void drawScoreExportWindow() {
+    if (!g_scoreExportOpen) return;
+    ImGui::SetNextWindowSize(ImVec2(S(360), S(210)), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Export score", &g_scoreExportOpen)) {
+        drawScoreExportControls();
+    }
+    ImGui::End();
+}
+
+void drawCodeExportWindow() {
+    if (!g_codeExportOpen) return;
+    static int mode = 0, filter = 0;
+    ImGui::SetNextWindowSize(ImVec2(S(570), S(330)), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Export code", &g_codeExportOpen)) {
+        ImGui::TextUnformatted("Format");
+        ImGui::SetNextItemWidth(-1);
+        caw_ui::combo("##code_export_format", &mode,
+            "Separate raw clip files\0All raw clip code in one TXT\0Csound clip code in one ORC\0Csound instruments in one ORC\0Whole project as CSD\0");
+        if (mode <= 1) {
+            ImGui::TextUnformatted("Include");
+            ImGui::SetNextItemWidth(-1);
+            caw_ui::combo("##code_export_filter", &filter, "All clip code\0Csound clips only\0VST CAW clips only\0");
+        }
+        if (mode == 0) ImGui::TextWrapped("Writes one original source file per clip. VST CAW code stays separate from Csound.");
+        else if (mode == 1) ImGui::TextWrapped("Combines the original clip text into one labelled TXT file.");
+        else if (mode == 2) ImGui::TextWrapped("Combines raw Csound clip bodies. The file is not a standalone orchestra.");
+        else if (mode == 3) ImGui::TextWrapped("Wraps Csound clips as instruments. Some code may still depend on project opcodes, files or CAW helpers.");
+        else ImGui::TextWrapped("Generates a Csound project and score. SC/PD placeholders are omitted. External files may be needed; CAW-hosted VST plugins do not run standalone in Csound.");
+        ImGui::Spacing();
+        ImGui::TextDisabled("SuperCollider and Pure Data are placeholders, not working export formats yet.");
+        ImGui::TextDisabled("A new folder is created, so existing exports are not overwritten.");
+        if (ImGui::Button("Export code")) {
+            exportCodeClips(static_cast<code_export::Mode>(mode), static_cast<code_export::Filter>(filter));
+        }
+    }
+    ImGui::End();
+}
+
+void drawLogo(ImDrawList* dl, ImVec2 origin, float size) {
+    if (g_logoReady)
+        dl->AddImage(ImGui::GetIO().Fonts->TexID, origin, ImVec2(origin.x + size, origin.y + size), g_logoUv0, g_logoUv1);
+}
+
 struct MultiCtx { std::string* s; };
 int multiCb(ImGuiInputTextCallbackData* d) {
     if (d->EventFlag == ImGuiInputTextFlags_CallbackResize) {
@@ -1730,7 +1999,7 @@ void drawScoreEditor() {
     if (!g_scoreOpen) return;
     ImGui::SetNextWindowSize(ImVec2(S(680), S(720)), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(S(200), S(70)), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Score editor", &g_scoreOpen)) {
+    if (ImGui::Begin("Score", &g_scoreOpen)) {
         ScoreInfo& sc = g_proj.score;
         const float labelW = S(120);
         auto row = [&](const char* name) { ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(name); ImGui::SameLine(labelW); ImGui::SetNextItemWidth(S(400)); };
@@ -1813,7 +2082,7 @@ void drawScoreEditor() {
                 for (size_t ti = 0; ti < g_proj.tracks.size(); ++ti) {
                     Track& t = g_proj.tracks[ti];
                     ImGui::PushID((int)ti + 1000);
-                    if (ImGui::TreeNode(t.name.c_str())) {
+                    if (caw_ui::treeNode(t.name.c_str())) {
                         drawTrackScoreMenu(t);
                         if (trackHasMidi(t)) { ImGui::Separator(); drawMidiScoreMenu(t); }
                         for (const auto& lane : t.automation) {
@@ -1839,13 +2108,10 @@ void drawScoreEditor() {
             ImGui::EndTabBar();
         }
         ImGui::Separator();
-        if (ImGui::Button("Overview (colour)")) generateScore(false, false);
-        ImGui::SameLine();
-        if (ImGui::Button("Overview (black)")) generateScore(false, true);
-        ImGui::SameLine();
-        if (ImGui::Button("Full score (colour)")) generateScore(true, false);
-        ImGui::SameLine();
-        if (ImGui::Button("Full score (black)")) generateScore(true, true);
+        ImGui::TextUnformatted("Export score");
+        ImGui::PushID("score_edit_export");
+        drawScoreExportControls();
+        ImGui::PopID();
     }
     ImGui::End();
 }
@@ -1857,6 +2123,24 @@ void drawMainMenuBar() {
         if (ImGui::MenuItem("Open project...", "Ctrl+O")) openProject();
         if (ImGui::MenuItem("Save", "Ctrl+S")) saveProject(false);
         if (ImGui::MenuItem("Save As...")) saveProject(true);
+        // A regular selectable opens the side popup on click, not hover.
+        // Unlike BeginMenu, it never draws ImGui's arrow underneath the plus.
+        const bool exportClicked = ImGui::Selectable("Export", false, ImGuiSelectableFlags_DontClosePopups);
+        const ImVec2 exportA = ImGui::GetItemRectMin(), exportB = ImGui::GetItemRectMax();
+        caw_ui::disclosure(ImGui::GetWindowDrawList(),
+                           ImVec2(exportB.x - S(12), (exportA.y + exportB.y) * .5f),
+                           ImGui::GetFontSize() * .19f, ImGui::GetColorU32(ImGuiCol_Text), false);
+        if (exportClicked && !ImGui::IsPopupOpen("##export_flyout")) ImGui::OpenPopup("##export_flyout");
+        ImGui::SetNextWindowPos(ImVec2(exportB.x, exportA.y), ImGuiCond_Appearing);
+        bool exportAction = false;
+        if (ImGui::BeginPopup("##export_flyout")) {
+            if (ImGui::MenuItem("Audio export...")) { g_audioExportOpen = true; exportAction = true; }
+            if (g_renderActive && ImGui::MenuItem("Cancel audio export")) { cancelRender(); exportAction = true; }
+            if (ImGui::MenuItem("Code clips...")) { g_codeExportOpen = true; exportAction = true; }
+            if (ImGui::MenuItem("Score...")) { g_scoreExportOpen = true; exportAction = true; }
+            ImGui::EndPopup();
+        }
+        if (exportAction) ImGui::CloseCurrentPopup();
         ImGui::Separator();
         if (ImGui::MenuItem("Exit", "Ctrl+Q")) appRequestClose();
         ImGui::EndMenu();
@@ -1892,7 +2176,7 @@ void drawMainMenuBar() {
         ImGui::MenuItem("Monitor panel", nullptr, &g_showMonitor);
         ImGui::MenuItem("Help panel (bottom)", nullptr, &g_helpOn);
         ImGui::Separator();
-        ImGui::MenuItem("Master meter (right panel)", nullptr, &g_viewMeter);
+        ImGui::MenuItem("Master meter and gain (right panel)", nullptr, &g_viewMeter);
         ImGui::MenuItem("Spectrum", nullptr, &g_viewSpectrum);
         ImGui::MenuItem("Signal scope", nullptr, &g_viewScope);
         ImGui::MenuItem("Console", nullptr, &g_viewConsole);
@@ -1913,18 +2197,15 @@ void drawMainMenuBar() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Score")) {
-        if (ImGui::MenuItem("Score editor...")) g_scoreOpen = true;
-        ImGui::Separator();
-        if (ImGui::MenuItem("Overview, one page (colour)")) generateScore(false, false);
-        if (ImGui::MenuItem("Overview, one page (black)")) generateScore(false, true);
-        if (ImGui::MenuItem("Full score (colour)")) generateScore(true, false);
-        if (ImGui::MenuItem("Full score (black)")) generateScore(true, true);
+        if (ImGui::MenuItem("Edit score")) g_scoreOpen = true;
+        if (ImGui::MenuItem("Map score")) g_scoreMapOpen = true;
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Settings")) {
-        static const char* tabs[] = {"Audio", "Programs", "Render", "Editor", "Advanced"};   // same order as the tabs of the Settings window
-        for (int i = 0; i < 5; ++i)
-            if (ImGui::MenuItem(tabs[i])) { g_settingsOpen = true; g_settingsGoto = i; }
+        static const char* tabs[] = {"General", "Audio", "Programs", "Editor", "Advanced", "Files"};
+        static const int ids[] = {6, 0, 1, 3, 4, 5};
+        for (int i = 0; i < 6; ++i)
+            if (ImGui::MenuItem(tabs[i])) { g_settingsOpen = true; g_settingsGoto = ids[i]; }
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Help")) {
@@ -1932,10 +2213,26 @@ void drawMainMenuBar() {
         ImGui::EndMenu();
     }
     ImGui::EndMenuBar();
+    if (g_welcomeOpen) { ImGui::OpenPopup("Welcome to CAW###welcome_caw"); g_welcomeOpen = false; }
+    if (ImGui::BeginPopupModal("Welcome to CAW###welcome_caw", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const float logoSize = S(220), bodyWidth = S(300);
+        const ImVec2 start = ImGui::GetCursorScreenPos();
+        drawLogo(ImGui::GetWindowDrawList(), ImVec2(start.x + (bodyWidth - logoSize) * .5f, start.y), logoSize);
+        ImGui::Dummy(ImVec2(bodyWidth, logoSize));
+        const char* title = "CAW - Code Audio Workstation";
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.f, (bodyWidth - ImGui::CalcTextSize(title).x) * .5f));
+        ImGui::TextUnformatted(title);
+        const char* version = "0.0.34 beta";
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.f, (bodyWidth - ImGui::CalcTextSize(version).x) * .5f));
+        ImGui::TextUnformatted(version);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (bodyWidth - S(100)) * .5f);
+        if (ImGui::Button("Close##welcome", ImVec2(S(100), 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
     if (g_aboutOpen) { ImGui::OpenPopup("About CAW###about_caw"); g_aboutOpen = false; }
     if (ImGui::BeginPopupModal("About CAW###about_caw", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextColored(ImVec4(0.93f, 0.50f, 0.15f, 1.f), "CAW - Code Audio Workstation");
-        ImGui::TextDisabled("Version 0.1");
+        ImGui::TextDisabled("Version 0.0.34 beta");
         ImGui::Spacing();
         ImGui::TextUnformatted("A simple DAW where every clip is code: Csound, SuperCollider or Pure Data.");
         ImGui::TextUnformatted("Timeline, automation, MIDI piano roll, score (SVG) and a console that");
@@ -1989,15 +2286,7 @@ bool looksLikeFilePath(const std::string& t) { return t.find('/') != std::string
 std::string findInstalledExe(const char* folderPrefix, const std::vector<std::string>& relPaths, const char* exeName) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    std::vector<std::string> roots;
-    for (const char* var : {"ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "LOCALAPPDATA", "APPDATA"}) {
-        char buf[MAX_PATH * 2] = {};
-        if (GetEnvironmentVariableA(var, buf, (DWORD)sizeof(buf)) == 0) continue;
-        std::string r = buf;
-        if (std::string(var) == "LOCALAPPDATA") r += "\\Programs";
-        roots.push_back(r);
-    }
-    roots.push_back("C:\\Program Files"); roots.push_back("C:\\Program Files (x86)"); roots.push_back("C:\\");
+    const std::vector<std::string> roots = plat::csoundInstallRoots();
     auto lower = [](std::string t) { for (char& c : t) c = (char)std::tolower((unsigned char)c); return t; };
     const std::string prefix = lower(folderPrefix);
     std::vector<std::pair<std::string, fs::path>> hits;   // folder name, exe path
@@ -2006,8 +2295,8 @@ std::string findInstalledExe(const char* folderPrefix, const std::vector<std::st
         if (!fs::is_directory(root, ec)) continue;
         for (const auto& entry : fs::directory_iterator(root, ec)) {
             if (!entry.is_directory(ec)) continue;
-            const std::string folder = entry.path().filename().string();
-            if (lower(folder).rfind(prefix, 0) != 0) continue;
+            std::string folder = entry.path().filename().string();
+            if (lower(folder).rfind(prefix, 0) != 0) continue;   // "Csound7", "Csound6", "Csound.app" ...
             for (const std::string& rel : relPaths) {
                 const fs::path exe = entry.path() / rel;
                 if (fs::exists(exe, ec) && seen.insert(lower(exe.string())).second) { hits.push_back({folder, exe}); break; }
@@ -2018,9 +2307,7 @@ std::string findInstalledExe(const char* folderPrefix, const std::vector<std::st
         std::sort(hits.begin(), hits.end(), [&](const auto& a, const auto& b) { return lower(a.first) > lower(b.first); });   // Csound7 before Csound6
         return hits.front().second.string();
     }
-    char found[MAX_PATH * 2] = {};
-    if (SearchPathA(nullptr, exeName, nullptr, (DWORD)sizeof(found), found, nullptr) > 0) return found;
-    return std::string();
+    return plat::findOnPath(exeName);   // PATH (and the usual folders on macOS / Linux)
 }
 
 // The program to start: typed path (if the file exists here), else the search above, else the bare name.
@@ -2034,8 +2321,7 @@ std::string resolveProgram(const std::string& typed, const char* bareName, const
 }
 
 std::string csoundExePath() {
-    static const std::vector<std::string> rel = {"bin\\csound.exe", "csound.exe", "bin\\csound7.exe"};
-    return resolveProgram(g_proj.cs.csoundExe, "csound", "Csound", rel, "csound.exe");
+    return resolveProgram(g_proj.cs.csoundExe, "csound", "Csound", plat::csoundRelativeExePaths(), plat::csoundProgramName());
 }
 
 // Meter / scope / spectrum frames: the CawMon instrument prints text lines (CAWM / CAWS / CAWL / CAWR / CAWC <first index> <values>)
@@ -2045,9 +2331,106 @@ float g_monRunT = 0.f;
 double engineOutputLatency();
 struct MonFrame { char tag = 'M'; int start = 0; std::vector<float> values; };
 std::deque<std::pair<std::chrono::steady_clock::time_point, MonFrame>> g_monHeld;
+SOCKET g_monitorSocket = INVALID_SOCKET;
+#ifdef _WIN32
+bool g_monitorWsa = false;
+using SockLen = int;
+#else
+using SockLen = socklen_t;
+#endif
+bool g_haveOscRawSeq = false, g_haveOscMeterSeq = false;
+uint32_t g_oscRawSeq = 0, g_oscMeterSeq = 0;
+
+void closeMonitorSocket() {
+    if (g_monitorSocket != INVALID_SOCKET) { closesocket(g_monitorSocket); g_monitorSocket = INVALID_SOCKET; }
+#ifdef _WIN32
+    if (g_monitorWsa) { WSACleanup(); g_monitorWsa = false; }
+#endif
+    g_cawMonitorPort = 0;
+    g_haveOscRawSeq = g_haveOscMeterSeq = false;
+}
+bool openMonitorSocket() {
+    closeMonitorSocket();
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
+    g_monitorWsa = true;
+#endif
+    g_monitorSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (g_monitorSocket == INVALID_SOCKET) { closeMonitorSocket(); return false; }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    int receiveSize = 2 * 1024 * 1024;
+    setsockopt(g_monitorSocket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&receiveSize), sizeof(receiveSize));
+#ifdef _WIN32
+    u_long nonblocking = 1;
+    const bool nonblockOk = ioctlsocket(g_monitorSocket, FIONBIO, &nonblocking) == 0;
+#else
+    const int flags = fcntl(g_monitorSocket, F_GETFL, 0);
+    const bool nonblockOk = flags >= 0 && fcntl(g_monitorSocket, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+    if (bind(g_monitorSocket, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || !nonblockOk) {
+        closeMonitorSocket(); return false;
+    }
+    SockLen addrLen = sizeof(addr);
+    if (getsockname(g_monitorSocket, reinterpret_cast<sockaddr*>(&addr), &addrLen) != 0) {
+        closeMonitorSocket(); return false;
+    }
+    g_cawMonitorPort = ntohs(addr.sin_port);
+    return g_cawMonitorPort > 0;
+}
+
+void updateSpectrumDerived() {
+    if (g_fftDb.size() != (size_t)monitor_fft::bins) return;
+    if (g_specStyle == 1)
+        g_spectrumBands = monitor_bands::analyze(g_fftDb, g_rawSampleRate);
+    if (g_specStyle == 3)
+        g_columnBands = monitor_bands::analyze(g_fftDb, g_rawSampleRate, monitor_bands::kColumnBandsPerOctave);
+    if (g_specStyle == 0) {
+        g_tonePeaks = monitor_peaks::find(g_fftDb, g_rawSampleRate);
+    }
+}
+
+void analyzeCurrentRaw() {
+    float input[monitor_fft::size];
+    for (int i = 0; i < monitor_fft::size; ++i)
+        input[i] = g_fftChannel == 1 ? g_rawRight[i] : g_fftChannel == 2 ? (g_rawLeft[i] + g_rawRight[i]) * 0.5f : g_rawLeft[i];
+    g_fftDb = monitor_fft::spectrum(input);
+}
+
+void applyRawSamples(const float* left, const float* right) {
+    const float inv = 1.f / g_rawFullScale;
+    for (int i = 0; i < monitor_fft::size; ++i) {
+        g_rawLeft[i] = left[i] * inv;
+        g_rawRight[i] = right[i] * inv;
+    }
+    g_haveRaw = true;
+    g_rawAge = 0.f;
+    const auto work = monitor_work::select(g_showMonitor && g_viewSpectrum, g_specFreeze, g_analyzerMode, g_specStyle);
+    if (work.fft) {
+        analyzeCurrentRaw();
+        if (work.thirdBands || work.columnBands || work.tonalPeaks) updateSpectrumDerived();
+        if (work.history) {
+            g_fftHistory.push_back(g_fftDb);
+            if (g_fftHistory.size() > 120) g_fftHistory.pop_front();
+        }
+    }
+}
 
 void applyMonitor(char tag, int start, const std::vector<float>& values) {
     if (start < 0) return;
+    if (tag == 'B') {
+        if (values.size() == (size_t)monitor_fft::size * 2)
+            applyRawSamples(values.data(), values.data() + monitor_fft::size);
+        return;
+    }
+    if (tag == 'U' || tag == 'V') {
+        if (g_rawAssembler.push(tag, start, values, 1.f))
+            applyRawSamples(g_rawAssembler.left, g_rawAssembler.right);
+        return;
+    }
     const float inv = 1.f / (float)std::max(0.0001, g_proj.cs.zdbfs);
     for (size_t i = 0; i < values.size(); ++i) {
         float v = values[i];
@@ -2058,10 +2441,8 @@ void applyMonitor(char tag, int start, const std::vector<float>& values) {
         if (tag == 'M') {
             if ((size_t)idx >= g_peakIn.size()) continue;
             g_peakIn[(size_t)idx] = v;
-            if (v >= 0.999f) {
-                if (idx < g_engineMaster) { if ((size_t)idx < g_clip.size()) g_clip[(size_t)idx] = 1; }
-                else g_laneClipped.insert(idx);   // every track channel has its own clip LED
-            }
+            if (v >= 0.99426f && (size_t)idx < g_meterClipHold.size())
+                g_meterClipHold[(size_t)idx] = 1.5f;
         } else if (tag == 'S' && idx < kMeterBands) { g_bandAmp[idx] = v; g_haveBands = true; }
         else if (tag == 'L' && idx < kScopePoints) g_scopeStagingL[idx] = std::min(1.f, std::max(-1.f, v));
         else if (tag == 'R' && idx < kScopePoints) g_scopeStagingR[idx] = std::min(1.f, std::max(-1.f, v));
@@ -2078,33 +2459,71 @@ void applyMonitor(char tag, int start, const std::vector<float>& values) {
 // A monitor line of Csound's output; the tag may sit anywhere in the line. Returns false for every other line.
 bool handleMonitorLine(const std::string& l) {
     size_t at = std::string::npos;
-    for (const char* tagText : {"CAWM ", "CAWS ", "CAWL ", "CAWR ", "CAWC "}) {
+    for (const char* tagText : {"CAWM ", "CAWS ", "CAWL ", "CAWR ", "CAWC ", "CAWU ", "CAWV "}) {
         const size_t f = l.find(tagText);
         if (f != std::string::npos) { at = f; break; }
     }
     if (at == std::string::npos) return false;
-    std::istringstream in(l.substr(at + 5));
     MonFrame fr;
     fr.tag = l[at + 3];
-    if (!(in >> fr.start)) return true;
-    float v = 0.f;
-    while (in >> v) fr.values.push_back(v);
+    if (fr.tag == 'U' || fr.tag == 'V') {
+        if (!parseRawMonitorValues(l.data() + at + 5, l.data() + l.size(), fr.start, fr.values)) {
+            // Queue an invalid chunk so the assembler discards the incomplete frame.
+            fr.start = 0;
+            fr.values.clear();
+        }
+    } else {
+        std::istringstream in(l.substr(at + 5));
+        if (!(in >> fr.start)) return true;
+        float v = 0.f;
+        while (in >> v) fr.values.push_back(v);
+    }
     const auto due = std::chrono::steady_clock::now() + std::chrono::microseconds((long long)(engineOutputLatency() * 1e6));
     g_monHeld.emplace_back(due, std::move(fr));
-    if (g_monHeld.size() > 4000) g_monHeld.clear();
+    if (g_monHeld.size() > 100000) g_monHeld.clear();
     return true;
 }
 
 void pollMonitor() {
+    if (g_monitorSocket != INVALID_SOCKET) {
+        unsigned char data[65536];
+        for (int n = 0; n < 256; ++n) {
+            sockaddr_in from{};
+            SockLen fromLen = sizeof(from);
+            const int got = (int)recvfrom(g_monitorSocket, reinterpret_cast<char*>(data), sizeof(data), 0,
+                                          reinterpret_cast<sockaddr*>(&from), &fromLen);
+            if (got == SOCKET_ERROR) break;
+            if (from.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) continue;
+            monitor_osc::Packet packet;
+            if (!monitor_osc::decode(data, (size_t)got, packet)) continue;
+            g_sectionSeen = true;
+            bool& have = packet.kind == 'B' ? g_haveOscRawSeq : g_haveOscMeterSeq;
+            uint32_t& last = packet.kind == 'B' ? g_oscRawSeq : g_oscMeterSeq;
+            if (have && packet.sequence != last && !monitor_osc::newer(packet.sequence, last)) continue;
+            if (have && packet.kind == 'B' && packet.sequence == last) continue;
+            have = true; last = packet.sequence;
+            MonFrame fr;
+            fr.tag = packet.kind; fr.start = packet.start; fr.values = std::move(packet.values);
+            const auto due = std::chrono::steady_clock::now() + std::chrono::microseconds((long long)(engineOutputLatency() * 1e6));
+            g_monHeld.emplace_back(due, std::move(fr));
+        }
+    }
     const auto now = std::chrono::steady_clock::now();
+    MonFrame newestRaw;
+    bool haveNewestRaw = false;
     while (!g_monHeld.empty() && g_monHeld.front().first <= now) {
-        applyMonitor(g_monHeld.front().second.tag, g_monHeld.front().second.start, g_monHeld.front().second.values);
+        MonFrame& frame = g_monHeld.front().second;
+        if (frame.tag == 'B') { newestRaw = std::move(frame); haveNewestRaw = true; }
+        else applyMonitor(frame.tag, frame.start, frame.values);
         g_monHeld.pop_front();
     }
+    // If the UI paused, don't calculate FFTs for stale snapshots.
+    if (haveNewestRaw) applyMonitor(newestRaw.tag, newestRaw.start, newestRaw.values);
 }
 
 void drainPlayOutput() {
-    for (const std::string& l : g_playProc.takeOutput()) {
+    const auto lines = g_useCsoundApi ? g_apiProc.takeOutput() : g_playProc.takeOutput();
+    for (const std::string& l : lines) {
         if (handleMonitorLine(l)) continue;
         logCsoundLine(l);
     }
@@ -2121,7 +2540,7 @@ void updateRecording() {
         double lo, hi, initial;
         laneValueRange(*t, b.channel, lo, hi, initial);
         const ParsedTrack parsed = parseTrack(*t);
-        const CawParam* param = t->kind == 0 ? laneParameter(parsed, b.channel) : nullptr;
+        const CawParam* param = hasClips(*t) ? laneParameter(parsed, b.channel) : nullptr;
         for (AutoPoint& p : b.s) {
             p.v = std::min(hi, std::max(lo, p.v));
             if (param) p.v = quantizeAutomation(p.v, *param);
@@ -2137,7 +2556,7 @@ void updateRecording() {
 }
 
 bool trackHasRec(const Track& t) {
-    if (t.kind != 0) return false;
+    if (!hasClips(t)) return false;
     for (const Clip& c : t.clips) if (parseClip(c).hasRec) return true;
     return false;
 }
@@ -2155,7 +2574,7 @@ void drawWavePopup(Track& lane, Clip& clip) {
         for (const CawParam& q : pc.params) laneW = std::max(laneW, ImGui::CalcTextSize(q.chn.c_str()).x);
         ImGui::SetNextItemWidth(std::max(S(190), laneW + ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 2.f + S(6)));
     }
-    if (ImGui::BeginCombo("Lane##wave_ch", pc.params[(size_t)w.ch].chn.c_str())) {
+    if (caw_ui::beginCombo("Lane##wave_ch", pc.params[(size_t)w.ch].chn.c_str())) {
         for (int k = 0; k < (int)pc.params.size(); ++k)
             if (ImGui::Selectable(pc.params[(size_t)k].chn.c_str(), k == w.ch)) w.ch = k;
         ImGui::EndCombo();
@@ -2196,18 +2615,21 @@ void drawWavePopup(Track& lane, Clip& clip) {
 // Display smoothing of every meter (called once per frame).
 void updateMeters(float dt) {
     g_monAge += dt;
+    g_rawAge += dt;
     if (g_monAge > 0.5f) std::fill(g_peakIn.begin(), g_peakIn.end(), 0.f);
     if (g_meterDb.size() != g_peakIn.size()) g_meterDb.assign(g_peakIn.size(), -90.f);
+    if (g_meterClipHold.size() != g_peakIn.size()) g_meterClipHold.assign(g_peakIn.size(), 0.f);
     for (size_t i = 0; i < g_peakIn.size(); ++i) {
         const float d = 20.f * std::log10(std::max(g_peakIn[i], 1e-5f));
-        g_meterDb[i] = std::max(d, g_meterDb[i] - 45.f * dt);
+        g_meterDb[i] = std::max(d, g_meterDb[i] - 36.f * dt);
+        g_meterClipHold[i] = std::max(0.f, g_meterClipHold[i] - dt);
     }
 }
 
 // ---- Run: the project is the Csound engine (one CSD, every clip is an instrument). It stays alive until Stop, like CsoundQt's Run.
 // ---- Play: every clip has a start time on the timeline = p2 of its score line. Play sends those lines (from the playhead on) to the running Csound.
 
-bool engineIsUp() { return g_liveCsound && !g_playWaiting && g_playProc.running(); }
+bool engineIsUp() { return g_liveCsound && !g_playWaiting && (g_useCsoundApi ? g_apiProc.running() : g_playProc.running()); }
 
 // ---- App -> running Csound: numbered command files (no ports, no stdin, no tables).
 // A command = "mode rows" (mode 1 = replaces the running timeline, 0 = plays next to it) and one row of numbers per event (delay in seconds from now).
@@ -2219,6 +2641,12 @@ bool g_engineSentShown = false;
 
 void writeSerial() {
     if (g_cmdShown == g_cmdSerial) return;
+    if (g_useCsoundApi) {
+        // The command file is closed before publishing its serial number.
+        g_apiProc.setCommandSerial(g_cmdSerial);
+        g_cmdShown = g_cmdSerial;
+        return;
+    }
     // The serial file is changed IN PLACE (8 digits, never deleted or replaced): Csound reads it 100 times a second and can always open it.
     const std::string path = engineFilePrefix() + "serial.txt";
     char text[16];
@@ -2259,6 +2687,20 @@ void warnAddedAfterRun() {
     if (!warned) { warned = true; logLine("[caw] A clip or channel was added after Run: press Run Csound again to hear it."); }
 }
 
+std::vector<VstJob> collectVstJobs(const Project& project, const std::vector<LaneMeterInfo>& meters) {
+    std::vector<VstJob> jobs;
+    for (const Track& t : project.tracks) {
+        if ((t.kind != 3 && t.kind != 4) || t.vstPath.empty() || t.muted) continue;
+        VstJob j; j.id = t.id; j.name = vstBusName(t); j.path = t.vstPath;
+        j.parameterState = t.vstParameterState;
+        j.instrument = t.kind == 3; j.pick = t.vstPick; j.init = t.vstInit;
+        j.out = vstlang::cleanBus(t.vstOut); j.outMaster = t.vstOutMaster;
+        for (const LaneMeterInfo& lm : meters) if (lm.trackId == t.id) { j.meterFirst = lm.first; break; }
+        jobs.push_back(j);
+    }
+    return jobs;
+}
+
 std::string num(double v) {
     std::ostringstream o;
     o.imbue(std::locale::classic());
@@ -2279,11 +2721,18 @@ void commandPlayFrom(double t, bool stopFirst) {
     std::string rows;
     int count = 0, sent = 0;
     if (stopFirst) { rows += row(12, 0, 0, 0, 0, 0); ++count; }
-    for (const TimelineEvent& ev : timelineEvents(g_proj, t, stopFirst)) {
+    const bool looping = timeline_loop::valid(g_proj);
+    const double remaining = looping ? std::max(0.0, g_proj.loopEnd - t) : 0.0;
+    for (TimelineEvent ev : timelineEvents(g_proj, t, stopFirst)) {
+        if (looping && !timeline_loop::trim(ev, remaining)) continue;
         const int ix = ev.automation ? numberOf(g_engChans, ev.name) : numberOf(g_engClips, ev.name);
         if (!ix) { warnAddedAfterRun(); continue; }
         rows += row(ev.automation ? 11 : 10, ix, ev.start, ev.dur, ev.a, ev.b);
         ++count; ++sent;
+    }
+    if (looping) {
+        rows += row(12, 0, remaining, 0, 0, 0);
+        ++count;
     }
     sendCommand(true, rows, count);
     if (!g_engineSentShown && sent) { g_engineSentShown = true; logLine("[caw] timeline -> Csound: " + std::to_string(sent) + " clip / note / ramp starts from " + num(t) + " s"); }
@@ -2302,8 +2751,12 @@ void commandStopClip(const Clip& clip) {
 }
 
 void stopPlayback() {
-    g_playProc.stop();
+    if (g_useCsoundApi) g_apiProc.stop();
+    else g_playProc.stop();
     drainPlayOutput();
+    closeMonitorSocket();
+    g_useCsoundApi = false;
+    g_cawMonitorApi = false;
     g_monHeld.clear();
     g_playing = false;
     g_liveCsound = false;
@@ -2312,42 +2765,130 @@ void stopPlayback() {
 }
 
 void startEngine() {
+    if (g_testSound.running()) { logLine("[caw] Wait for the test sound to finish before starting Csound."); return; }
     if (g_renderActive) { logLine("[caw] A render is running - wait for it or cancel it first."); return; }
     if (g_playing) stopPlayback();
+    vstui::captureParameters(g_proj);
     diagClearAll();
     g_cawScopeDiv = scopeDiv();
     g_cawScopePeak = g_scopeSample;
     g_scopeActiveMs = scopeWindowMs();
     g_scopeHasFrame = false;
+    const std::string exe = csoundExePath();
+    std::string apiError;
+    g_useCsoundApi = !cawEnv("CAW_MON_TEXT") && !cawEnv("CAW_MON_OSC") && g_apiProc.prepare(exe, apiError);
+    if (!g_useCsoundApi && std::fabs(g_proj.cs.masterGain - 1.f) > 0.0001f) {
+        logLine("[caw] The master gain requires CAW host audio. Restore Master to 100% or enable the Csound API.");
+        return;
+    }
+    g_cawMonitorApi = g_useCsoundApi;
+    if (g_useCsoundApi) logLine("[caw] Using the Csound API and in-memory monitor.");
+    else if (g_proj.cs.monitorFeed && !cawEnv("CAW_MON_TEXT")) {
+        if (!apiError.empty()) logLine("[caw] " + apiError + " Trying the OSC monitor instead.");
+        if (!openMonitorSocket()) logLine("[caw] OSC monitor unavailable, using the text monitor.");
+        else logLine("[caw] Binary OSC monitor active (local only).");
+    }
     const std::string csdPath = (workDir() / "caw_play.csd").string();
-    if (!writeTextFile(csdPath, buildCsd(g_proj, "engine", 0.0, &g_orcSpans))) {
+    Project engineProject = g_proj;
+    if (!g_useCsoundApi) {
+        // The old process engine opens the card by CSOUND's device number, which differs from the PortAudio list shown in Settings:
+        // translate by device label (a device Csound's PortAudio cannot see falls back to the default).
+        auto translate = [](int id, const std::vector<AudioDevice>& shown, const std::vector<AudioDevice>& csound, const char* what) {
+            if (id < 0) return id;
+            for (const AudioDevice& d : shown) if (d.id == id)
+                for (const AudioDevice& c : csound)
+                    if (normalizeCawDeviceLabel(c.name) == normalizeCawDeviceLabel(d.name)) return c.id;
+            logLine(std::string("[caw] The selected ") + what + " device is not available in Csound's own audio system - using the default.");
+            return -1;
+        };
+        engineProject.cs.outDev = translate(g_proj.cs.outDev, g_outDevs, g_csoundOutDevs, "output");
+        engineProject.cs.inDev = translate(g_proj.cs.inDev, g_inDevs, g_csoundInDevs, "input");
+        if (!engineProject.cs.options.empty()) syncOptionsFromSettings(engineProject.cs);
+    }
+    if (!writeTextFile(csdPath, buildCsd(engineProject, "engine", 0.0, &g_orcSpans))) {
         logLine("[caw] ERROR: could not write " + csdPath);
+        closeMonitorSocket();
+        g_cawMonitorApi = false;
+        g_useCsoundApi = false;
         return;
     }
-    const std::string cmd = "\"" + csoundExePath() + "\" \"" + csdPath + "\"";
-    logLine("[caw] Run (Csound runs like CsoundQt until Stop; Play sends the clips at their start times): " + cmd);
+    const std::string cmd = "\"" + exe + "\" \"" + csdPath + "\"";
+    if (!g_useCsoundApi) logLine("[caw] Run (Csound runs until Stop; Play sends the clips at their start times): " + cmd);
     resetCommands();   // the command files exist before Csound reads them
-    g_playProc.setHighPriority(true);   // the engine must not be starved by the UI or other programs
-    if (!g_playProc.start(cmd, true)) {
-        logLine("[caw] ERROR: " + g_playProc.lastError());
-        return;
-    }
     g_engineMeters = meterLayout(g_proj);
     g_recNames = cawWriteTargets(g_proj);
+    int top = masterChannels(g_proj.cs);
+    for (const LaneMeterInfo& lm : g_engineMeters) top = std::max(top, lm.first + lm.channels);
     {
         g_engineMaster = masterChannels(g_proj.cs);
-        int top = g_engineMaster;
-        for (const LaneMeterInfo& lm : g_engineMeters) top = std::max(top, lm.first + lm.channels);
         g_peakIn.assign((size_t)top, 0.f);
         g_meterDb.assign((size_t)top, -90.f);
+        g_meterClipHold.assign((size_t)top, 0.f);
     }
-    g_laneClipped.clear();
     g_haveBands = false;
+    g_haveRaw = false;
+    g_scopeFreeze = false;
+    g_scopeFrozenHasFrame = false;
+    g_specFreeze = false;
+    g_rawAge = 10.f;
+    g_rawAssembler.reset();
+    g_fftDb.clear();
+    g_spectrumBands.clear();
+    g_columnBands.clear();
+    g_tonePeaks.clear();
+    g_fftHistory.clear();
+    g_rawSampleRate = std::max(1, g_proj.cs.sr);
+    g_rawFullScale = (float)std::max(0.0001, g_proj.cs.zdbfs);
     g_monHeld.clear();
     g_monSeen = false;
     g_monWarned = false;
     g_monRunT = 0.f;
     g_engineSentShown = false;
+    g_apiSnapshotSeq = 0;
+    if (g_useCsoundApi) {
+        // First host-output version is output-only. Never silently drop a
+        // configured recording input; the legacy OSC engine supports it.
+        if (g_proj.cs.inDev >= 0 || g_proj.cs.options.find("-iadc") != std::string::npos) {
+            logLine("[caw] CAW-owned audio input is not available yet. Use run_osc_monitor.bat for audio input.");
+            g_cawMonitorApi = false; g_useCsoundApi = false;
+            return;
+        }
+        if (g_proj.cs.outDev == -2) {
+            logLine("[caw] No output selected. Choose a soundcard in Settings or use the OSC launcher for silent output.");
+            g_cawMonitorApi = false; g_useCsoundApi = false;
+            return;
+        }
+        CawAudioSettings audio;
+        audio.sampleRate = g_proj.cs.sr;
+        audio.channels = g_proj.cs.nchnls;
+        audio.softwareBuffer = g_proj.cs.bufSW;
+        audio.hardwareBuffer = g_proj.cs.bufHW;
+        audio.fullScale = g_rawFullScale;
+        int selected = g_proj.cs.outDev;
+        if (selected == -1 && plat::isWindows) selected = pickDefaultDevice(g_outDevs, "WASAPI", false);
+        if (selected >= 0) {
+            audio.deviceLabel = "<selected device missing>";
+            for (const auto& device : g_outDevs)
+                if (device.id == selected) { audio.deviceLabel = device.name; break; }
+        }
+        {   // VSTi / VSTe tracks run inside the engine next to Csound
+            g_apiProc.setVstJobs(collectVstJobs(g_proj, g_engineMeters));
+            g_apiProc.setMasterGain(g_proj.cs.masterGain);
+        }
+        if (!g_apiProc.start(csdPath, g_rawSampleRate, top,
+                             g_proj.cs.monitorFeed && !cawEnv("CAW_NO_MON"), apiError, &audio)) {
+            logLine("[caw] ERROR: " + apiError);
+            g_cawMonitorApi = false; g_useCsoundApi = false;
+            return;
+        }
+    } else {
+        g_playProc.setHighPriority(true);
+        if (!g_playProc.start(cmd, true)) {
+            logLine("[caw] ERROR: " + g_playProc.lastError());
+            closeMonitorSocket();
+            return;
+        }
+    }
     g_playing = true;
     g_liveCsound = true;
     g_playWaiting = true;
@@ -2356,33 +2897,280 @@ void startEngine() {
     g_resync = 1;   // if the timeline is already playing, bring the new engine in sync with the playhead
 }
 
+bool replaceOutputFile(const std::string& temporary, const std::string& final, std::string& error) {
+#ifdef _WIN32
+    if (MoveFileExA(temporary.c_str(), final.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+    error = "Could not replace output file (Windows error " + std::to_string(GetLastError()) + ")";
+    return false;
+#else
+    std::error_code ec;
+    std::filesystem::rename(temporary, final, ec);
+    if (!ec) return true;
+    error = "Could not replace output file: " + ec.message();
+    return false;
+#endif
+}
+
+void cleanupRenderTemps() {
+    std::error_code ec;
+    if (!g_renderTemp.empty()) std::filesystem::remove(g_renderTemp, ec);
+    if (!g_renderEncodedTemp.empty()) std::filesystem::remove(g_renderEncodedTemp, ec);
+    g_renderTemp.clear(); g_renderEncodedTemp.clear();
+}
+
 void startRenderNow() {
     if (g_renderActive) return;
+    vstui::captureParameters(g_proj);
+    g_exportError.clear();
+    const int format = std::min(4, std::max(0, g_proj.cs.renderFormat));
+    const int channels = g_proj.cs.exportChannels;
+    if ((format == 4 && channels > 2) || (format == 3 && channels > 8)) {
+        g_exportError = format == 4 ? "MP3 supports mono or stereo only." : "FLAC supports up to 8 channels.";
+        logLine("[caw] " + g_exportError);
+        return;
+    }
+    if (format == 4 && !cawMp3BitrateSupported(g_proj.cs.sr, g_proj.cs.exportMp3Kbps)) {
+        g_exportError = "MP3 needs a supported sample rate (8 to 48 kHz) and bitrate. Check project audio settings.";
+        logLine("[caw] " + g_exportError);
+        return;
+    }
+    for (const Track& track : g_proj.tracks)
+        if (!track.muted && (track.kind == 5 || track.kind == 6)) {
+            logLine("[caw] SuperCollider and Pure Data tracks are placeholders and do not produce audio.");
+        }
+    for (const Track& track : g_proj.tracks)
+        if (!track.muted && (track.kind == 3 || track.kind == 4) && !track.clips.empty() && track.vstPath.empty()) {
+            g_exportError = "VST track " + track.name + " has clips but no plugin selected.";
+            logLine("[caw] " + g_exportError);
+            return;
+        }
     diagClearAll();
     if (g_playing) stopPlayback();
     const std::string csdPath = (workDir() / "caw_render.csd").string();
     g_renderPath = renderFilePath().string();
+    g_activeRenderFormat = format;
+    g_activeFlacBits = g_proj.cs.exportFlacBits;
+    g_activeMp3Kbps = g_proj.cs.exportMp3Kbps;
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::filesystem::path dir = std::filesystem::path(g_renderPath).parent_path();
+    const std::string stem = ".caw_render_" + std::to_string(stamp);
+    g_renderTemp = (dir / (stem + ".wav")).string();
+    g_renderEncodedTemp = format >= 3 ? (dir / (stem + renderExtension(format))).string() : std::string();
+    g_renderConverting = false;
     { std::error_code rec; std::filesystem::remove(scoreProbePath(), rec); }   // the score probe writes a fresh file
     if (!writeTextFile(csdPath, buildCsd(g_proj, "render", 0.0, &g_orcSpans))) {
+        g_exportError = "Could not write the temporary render.";
         logLine("[caw] ERROR: could not write " + csdPath);
+        cleanupRenderTemps();
         return;
     }
-    const std::string cmd = "\"" + csoundExePath() + "\" -o \"" + g_renderPath + "\" \"" + csdPath + "\"";
-    logLine("[caw] Render: " + cmd);
-    if (!g_renderProc.start(cmd)) {
-        logLine("[caw] ERROR: " + g_renderProc.lastError());
+    std::string error;
+    if (!g_offlineProc.prepare(csoundExePath(), error)) {
+        g_exportError = "Audio engine unavailable: " + error;
+        logLine("[caw] " + g_exportError);
+        cleanupRenderTemps();
         return;
     }
+    g_offlineProc.setVstJobs(collectVstJobs(g_proj, {}));
+    const int wavFormat = format >= 3 ? 2 : format;
+    if (!g_offlineProc.startOffline(csdPath, g_proj.cs.sr, masterChannels(g_proj.cs),
+                                    (float)g_proj.cs.zdbfs, g_proj.cs.masterGain,
+                                    wavFormat, g_renderTemp, error, channels)) {
+        g_exportError = "Audio export failed: " + error;
+        logLine("[caw] " + g_exportError);
+        cleanupRenderTemps();
+        return;
+    }
+    logLine("[caw] Rendering through CAW's C++ audio and VST host.");
     g_renderActive = true;
 }
 
-void startRender() { startRenderNow(); }
+void startRender() {
+    if (g_renderActive) return;
+    std::error_code ec;
+    g_renderWillOverwrite = std::filesystem::exists(renderFilePath(), ec);
+    if (ec) { g_exportError = "Could not check output: " + ec.message(); logLine("[caw] " + g_exportError); return; }
+    g_renderWarnVst = false;
+    for (const Track& track : g_proj.tracks)
+        if ((track.kind == 3 || track.kind == 4) && !track.muted && !track.vstPath.empty())
+            g_renderWarnVst = true;
+    if (g_renderWillOverwrite || g_renderWarnVst) g_confirmRenderOverwrite = true;
+    else startRenderNow();
+}
+
+void drawExportOptions(CsoundSettings& s) {
+    s.renderFormat = std::min(4, std::max(0, s.renderFormat));
+    const int kind = s.renderFormat < 3 ? 0 : s.renderFormat == 3 ? 1 : 2;
+    const char* formats[] = {"WAV", "FLAC", "MP3"};
+    ImGui::SetNextItemWidth(S(180));
+    if (caw_ui::beginCombo("Format", formats[kind])) {
+        for (int i = 0; i < 3; ++i) if (ImGui::Selectable(formats[i], i == kind)) {
+            s.renderFormat = i == 0 ? 1 : i == 1 ? 3 : 4;
+            std::filesystem::path p = s.renderFile.empty() ? "render.wav" : s.renderFile;
+            p.replace_extension(renderExtension(s.renderFormat));
+            s.renderFile = p.string();
+        }
+        ImGui::EndCombo();
+    }
+    if (s.renderFormat < 3) {
+        const char* bits[] = {"16-bit PCM", "24-bit PCM", "32-bit float"};
+        ImGui::SetNextItemWidth(S(180));
+        if (caw_ui::beginCombo("Bit depth", bits[s.renderFormat])) {
+            for (int i = 0; i < 3; ++i) if (ImGui::Selectable(bits[i], i == s.renderFormat)) s.renderFormat = i;
+            ImGui::EndCombo();
+        }
+    } else if (s.renderFormat == 3) {
+        ImGui::SetNextItemWidth(S(180));
+        if (caw_ui::beginCombo("Bit depth", s.exportFlacBits == 16 ? "16-bit lossless" : "24-bit lossless")) {
+            if (ImGui::Selectable("16-bit lossless", s.exportFlacBits == 16)) s.exportFlacBits = 16;
+            if (ImGui::Selectable("24-bit lossless", s.exportFlacBits == 24)) s.exportFlacBits = 24;
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) helpTip("FLAC is lossless: its bitrate varies with the audio. Bit depth sets its precision.");
+    } else {
+        static const int rates[] = {8,16,24,32,40,48,56,64,80,96,112,128,144,160,192,224,256,320};
+        if (cawMp3RateSupported(s.sr) && !cawMp3BitrateSupported(s.sr, s.exportMp3Kbps)) {
+            int best = 0, delta = 100000;
+            for (int rate : rates) if (cawMp3BitrateSupported(s.sr, rate) && std::abs(rate - s.exportMp3Kbps) < delta) {
+                best = rate; delta = std::abs(rate - s.exportMp3Kbps);
+            }
+            if (best) s.exportMp3Kbps = best;
+        }
+        const std::string current = std::to_string(s.exportMp3Kbps) + " kbps";
+        ImGui::SetNextItemWidth(S(180));
+        if (caw_ui::beginCombo("Bitrate", current.c_str())) {
+            for (int rate : rates) if (cawMp3BitrateSupported(s.sr, rate)) {
+                const std::string label = std::to_string(rate) + " kbps";
+                if (ImGui::Selectable(label.c_str(), s.exportMp3Kbps == rate)) s.exportMp3Kbps = rate;
+            }
+            ImGui::EndCombo();
+        }
+    }
+    const int channelChoice = s.exportChannels == 1 ? 0 : s.exportChannels == 2 ? 1 : s.exportChannels == 4 ? 2 : 3;
+    const char* channels[] = {"Mono", "Stereo", "Quadro", "Other"};
+    ImGui::SetNextItemWidth(S(180));
+    if (caw_ui::beginCombo("Channels", channels[channelChoice])) {
+        for (int i = 0; i < 4; ++i) if (ImGui::Selectable(channels[i], i == channelChoice))
+            s.exportChannels = i == 0 ? 1 : i == 1 ? 2 : i == 2 ? 4 : 6;
+        ImGui::EndCombo();
+    }
+    if (channelChoice == 3) {
+        ImGui::SetNextItemWidth(S(100));
+        if (ImGui::InputInt("Channel count", &s.exportChannels, 0, 0))
+            s.exportChannels = std::min(64, std::max(1, s.exportChannels));
+    }
+    if (ImGui::IsItemHovered()) helpTip("Mono/stereo downmix the project; higher counts preserve channel order and add silence for missing channels.");
+    if (s.renderFormat == 4 && s.exportChannels > 2) ImGui::TextDisabled("MP3 supports mono or stereo.");
+    if (s.renderFormat == 3 && s.exportChannels > 8) ImGui::TextDisabled("FLAC supports up to 8 channels.");
+}
+
+void drawAudioExport() {
+    if (!g_audioExportOpen) return;
+    ImGui::SetNextWindowSize(ImVec2(S(560), S(410)), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Audio export", &g_audioExportOpen)) {
+        CsoundSettings& s = g_proj.cs;
+        ImGui::TextUnformatted("Output file");
+        ImGui::SetNextItemWidth(-S(105));
+        inputStr("##export_file", s.renderFile, 0);
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...")) {
+            const std::string ext = renderExtension(s.renderFormat) + 1;
+            const std::string chosen = plat::chooseFile(true, "Choose audio export file", "Audio file", {ext}, renderFilePath().string());
+            if (!chosen.empty()) {
+                std::filesystem::path path(chosen);
+                path.replace_extension(renderExtension(s.renderFormat));
+                s.renderFile = path.string();
+            }
+        }
+        ImGui::PushID("audio_export_options");
+        drawExportOptions(s);
+        ImGui::PopID();
+        ImGui::SetNextItemWidth(S(120));
+        if (ImGui::InputDouble("Tail (seconds)", &s.tail, .5, 2, "%.1f"))
+            s.tail = std::min(60.0, std::max(0.0, s.tail));
+        ImGui::TextDisabled("Destination: %s", renderFilePath().string().c_str());
+        if (!g_exportError.empty()) ImGui::TextColored(ImVec4(.98f, .43f, .34f, 1.f), "%s", g_exportError.c_str());
+        if (g_renderActive) {
+            if (ImGui::Button("Cancel export")) cancelRender();
+        } else if (ImGui::Button("Export audio")) startRender();
+    }
+    ImGui::End();
+}
 
 void cancelRender() {
+    g_offlineProc.stop();
+    g_codecProc.stop();
     g_renderProc.stop();
+    for (const std::string& l : g_offlineProc.takeOutput()) logLine(l);
     for (const std::string& l : g_renderProc.takeOutput()) logLine(l);
     g_renderActive = false;
+    cleanupRenderTemps();
     logLine("[caw] Render cancelled.");
+}
+
+bool startFallbackEncoder() {
+    std::error_code ec;
+    std::filesystem::remove(g_renderEncodedTemp, ec);
+    std::string ffmpeg = plat::bundledFfmpeg();
+    if (ffmpeg.empty() && !g_proj.cs.ffmpegExe.empty()) {
+        std::error_code pathError;
+        if (std::filesystem::is_regular_file(g_proj.cs.ffmpegExe, pathError))
+            ffmpeg = g_proj.cs.ffmpegExe;
+        else
+            logLine("[caw] Configured FFmpeg was not found: " + g_proj.cs.ffmpegExe);
+    }
+    if (ffmpeg.empty()) ffmpeg = plat::findOnPath("ffmpeg");
+    if (ffmpeg.empty()) return false;
+    const std::string codec = g_activeRenderFormat == 3
+        ? " -codec:a flac -sample_fmt " + std::string(g_activeFlacBits == 16 ? "s16" : "s32") +
+          " -bits_per_raw_sample " + std::to_string(g_activeFlacBits) + " "
+        : " -codec:a libmp3lame -b:a " + std::to_string(g_activeMp3Kbps) + "k ";
+    const std::string cmd = processArg(ffmpeg) + " -nostdin -n -i " + processArg(g_renderTemp)
+        + codec + processArg(g_renderEncodedTemp);
+    return g_renderProc.start(cmd);
+}
+
+void tickAutosave(float dt) {
+    if (!g_proj.cs.autosaveEnabled) { g_autoSaveElapsed = 0.f; return; }
+    g_autoSaveElapsed += std::max(0.f, dt);
+    const int minutes = std::min(120, std::max(1, g_proj.cs.autosaveMinutes));
+    if (g_autoSaveElapsed < minutes * 60.f || historyBusy()) return;
+    g_autoSaveElapsed = 0.f;
+    vstui::captureParameters(g_proj);
+    const std::string snapshot = serializeProject(g_proj);
+    if (snapshot == g_savedSnap || snapshot == g_autoSavedSnap) return;
+    std::filesystem::path target;
+    if (!g_projectPath.empty()) {
+        target = std::filesystem::path(g_projectPath);
+        target += ".autosave.caw";
+    } else {
+        if (g_unsavedAutosavePath.empty()) {
+            std::string home = plat::getEnv(plat::isWindows ? "USERPROFILE" : "HOME");
+            if (home.empty()) home = workDir().string();
+            const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
+            g_unsavedAutosavePath = (std::filesystem::path(home) / "CAW Autosaves" /
+                ("Untitled-" + std::to_string(stamp) + ".autosave.caw")).string();
+        }
+        target = g_unsavedAutosavePath;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(target.parent_path(), ec);
+    if (ec) { logLine("[caw] Autosave folder failed: " + ec.message()); return; }
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::string tmp = target.string() + "." + std::to_string(stamp) + ".tmp";
+    std::string error;
+    if (!saveProjectFile(g_proj, tmp, error)) {
+        logLine("[caw] Autosave failed: " + error);
+        std::filesystem::remove(tmp, ec);
+        return;
+    }
+    if (!replaceOutputFile(tmp, target.string(), error)) {
+        logLine("[caw] Autosave failed: " + error);
+        std::filesystem::remove(tmp, ec);
+        return;
+    }
+    g_autoSavedSnap = snapshot;
+    logLine("[caw] Recovery autosave: " + target.string());
 }
 
 // How long a sound needs from the moment the engine starts it until it comes out of the speakers (hardware buffer -B plus the sync offset from Settings).
@@ -2399,8 +3187,12 @@ unsigned long long g_sig = 0;      // what the running command was made from (ti
 
 void tickTimeline(float dt) {
     if (g_drag == Drag::Playhead) { g_resync = 1; return; }  // wait until the playhead is released
+    if (timeline_loop::valid(g_proj) && (g_play < g_proj.loopStart || g_play >= g_proj.loopEnd)) {
+        g_play = timeline_loop::wrap(g_proj, g_play);
+        g_resync = 1;
+    }
     if (!engineIsUp()) {
-        g_play += dt;            // silent playhead move; the engine gets the timeline as soon as it is up
+        g_play = timeline_loop::wrap(g_proj, g_play + dt);  // silent playhead move
         g_resync = 1;
         return;
     }
@@ -2414,6 +3206,15 @@ void tickTimeline(float dt) {
     }
     if (g_hold > 0.0) { g_hold -= dt; return; }   // the playhead meets the sound (one sound-card buffer)
     g_play += dt;
+    if (timeline_loop::valid(g_proj) && g_play >= g_proj.loopEnd) {
+        g_play = timeline_loop::wrap(g_proj, g_play);
+        // This host reissues transport commands at the boundary. It is not a
+        // sample-accurate or gapless loop, but nothing beyond the end is queued.
+        commandPlayFrom(g_play, true);
+        g_sig = timelineSignature(g_proj);
+        g_sigT = 0.0;
+        return;
+    }
     // The timeline stays live: when the project changed (clip moved, mute / solo, notes, automation) the events still to come are replaced.
     // What sounds right now keeps sounding. Changes of the code are heard after the next Run.
     g_sigT += dt;
@@ -2554,15 +3355,16 @@ void pollTestAndScan(float dt) {
             if (std::regex_search(l, m, word)) addExtraOpcode(m[1].str());
         }
         if (g_opcodeProc.finished() || g_opcodeScanT > 10.f) g_opcodeProc.stop();
-    } else if (!g_opcodeScanStarted) {
+    } else if (!g_opcodeScanStarted && (g_textEditorFocused || g_playing)) {
         g_opcodeScanStarted = true;
-        g_opcodeProc.start("\"" + csoundExePath() + "\" -z", false);   // silently ignored if csound is not installed
+        g_opcodeProc.start("\"" + csoundExePath() + "\" -z", false);   // only when code/engine needs it
     }
 }
 
 void pollProcesses(float dt) {
     // ---- Play (Csound runs the whole project in real time)
-    if (g_playProc.active()) {
+    const bool usingApi = g_useCsoundApi && g_apiProc.active();
+    if (usingApi || g_playProc.active()) {
         if (g_playing && g_proj.cs.monitorFeed && !g_monSeen && !g_monWarned) {
             g_monRunT += dt;
             if (g_monRunT > 5.f) {
@@ -2570,10 +3372,15 @@ void pollProcesses(float dt) {
                 logLine("[caw] No monitor data from Csound after 5 s. Look for a Csound error above (CawMon); you can untick 'Send meter data' in Settings.");
             }
         }
-        for (const std::string& l : g_playProc.takeOutput()) {
+        const auto playLines = usingApi ? g_apiProc.takeOutput() : g_playProc.takeOutput();
+        for (const std::string& l : playLines) {
             if (handleMonitorLine(l)) { g_sectionSeen = true; continue; }
             logCsoundLine(l);
-            if (l.find("SECTION 1") != std::string::npos) g_sectionSeen = true;
+            // "Live" = Csound is really performing. API engine: its first audio block reached the soundcard ("SECTION 1" is printed
+            // earlier, before CAW opened the soundcard, so it must not count there). Process engine: Csound's own "SECTION 1" line,
+            // which it prints after it has opened the soundcard.
+            if (usingApi) { if (l.find("first audio block delivered") != std::string::npos) g_sectionSeen = true; }
+            else if (l.find("SECTION 1") != std::string::npos) g_sectionSeen = true;
             {   // the sound card could not be opened: Csound never starts playing
                 std::string low = l;
                 std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)std::tolower(c); });
@@ -2582,40 +3389,122 @@ void pollProcesses(float dt) {
                 if (!hinted && (low.find("unable to open") != std::string::npos || low.find("error opening") != std::string::npos || low.find("portaudio error") != std::string::npos ||
                                 low.find("failed to initialise") != std::string::npos || low.find("failed to initialize") != std::string::npos || low.find("audio device") != std::string::npos)) {
                     hinted = true;
-                    logLine("[caw] Csound could not open the sound card at " + std::to_string(g_proj.cs.sr) + " Hz. Set the sample rate in Settings to the rate of your Windows output device (usually 48000) and the right output device, then press Run again.");
+                    logLine("[caw] Csound could not open the sound card at " + std::to_string(g_proj.cs.sr) + " Hz. Set the sample rate in Settings to the rate of your output device (usually 48000 or 44100) and the right output device, then press Run again.");
                 }
+            }
+        }
+        if (usingApi) {
+            MonitorCapture::Snapshot snapshot;
+            if (g_apiProc.takeSnapshot(snapshot, g_apiSnapshotSeq)) {
+                g_apiSnapshotSeq = snapshot.sequence;
+                const auto produced = std::chrono::steady_clock::time_point(
+                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::nanoseconds(snapshot.timestampNs)));
+                const auto due = produced + std::chrono::microseconds((long long)(engineOutputLatency() * 1e6));
+                MonFrame raw;
+                raw.tag = 'B';
+                raw.values.reserve(monitor_fft::size * 2);
+                raw.values.insert(raw.values.end(), snapshot.left.begin(), snapshot.left.end());
+                raw.values.insert(raw.values.end(), snapshot.right.begin(), snapshot.right.end());
+                g_monHeld.emplace_back(due, std::move(raw));
+                MonFrame meters;
+                meters.tag = 'M';
+                meters.values = std::move(snapshot.meters);
+                g_monHeld.emplace_back(due, std::move(meters));
             }
         }
         pollMonitor();
         writeSerial();
         if (g_playWaiting) {
             g_playWaitT += dt;
-            if (g_sectionSeen || g_playWaitT > 3.f) g_playWaiting = false;  // csound has started producing audio
+            // Live only when Csound really started performing (its "SECTION 1" line, the API start message or the first meter data).
+            // Opening the sound card (ASIO / WDM-KS ...) can take several seconds, so there is no short timer any more.
+            // Fallback after 15 s for a Csound with silenced messages (-m0): go live, but only while the process is still running.
+            if (g_sectionSeen) g_playWaiting = false;
+            else if (g_playWaitT > 15.f && (usingApi ? g_apiProc.running() : g_playProc.running())) {
+                g_playWaiting = false;
+                logLine("[caw] Csound did not report that it started (messages off?). Assuming it is running.");
+            }
         }
-        if (g_playProc.finished()) {
-            int code = g_playProc.exitCode();
-            g_playProc.stop();
+        const bool finished = usingApi ? g_apiProc.finished() : g_playProc.finished();
+        if (finished) {
+            const int code = usingApi ? g_apiProc.exitCode() : g_playProc.exitCode();
+            if (usingApi) g_apiProc.stop(); else g_playProc.stop();
             drainPlayOutput();
+            closeMonitorSocket();
+            g_cawMonitorApi = false;
+            g_useCsoundApi = false;
             g_playing = false;
             g_liveCsound = false;
             g_playWaiting = false;
             logLine(code == 0 ? "[caw] Csound stopped." : "[caw] Csound stopped with exit code " + std::to_string(code) + " - see messages above.");
+            if (usingApi && code != 0)
+                logLine("[caw] If the API engine is incompatible with your Csound installation, use run_osc_monitor.bat to try the previous engine.");
         }
     }
 
     // ---- timeline (independent of the Csound engine)
     if (g_timelineRun) tickTimeline(dt);
 
-    // ---- render
+    // ---- CAW offline renderer, followed by a codec only for FLAC/MP3
+    auto finishExport = [&](const std::string& file) {
+        std::string error;
+        std::error_code ec;
+        const bool appeared = !g_renderWillOverwrite && std::filesystem::exists(g_renderPath, ec);
+        if (ec) error = "Could not check the destination: " + ec.message();
+        else if (appeared) error = "The destination appeared during rendering; it was not replaced.";
+        else if (replaceOutputFile(file, g_renderPath, error)) logLine("[caw] Audio export finished: " + g_renderPath);
+        if (!error.empty()) { g_exportError = error; logLine("[caw] Audio export failed: " + error); }
+        g_renderActive = false;
+        cleanupRenderTemps();
+    };
+    if (g_offlineProc.active()) {
+        for (const std::string& l : g_offlineProc.takeOutput()) logCsoundLine(l);
+        if (g_offlineProc.finished()) {
+            const int code = g_offlineProc.exitCode();
+            g_offlineProc.stop();
+            for (const std::string& l : g_offlineProc.takeOutput()) logLine(l);
+            if (code != 0) {
+                g_exportError = "Audio render failed. Check the console for details.";
+                logLine("[caw] Offline audio export failed (code " + std::to_string(code) + ").");
+                g_renderActive = false; cleanupRenderTemps();
+            } else if (g_activeRenderFormat >= 3) {
+                g_renderConverting = true;
+                logLine(g_activeRenderFormat == 3 ? "[caw] Encoding FLAC..." : "[caw] Encoding MP3...");
+                if (!g_codecProc.start(g_renderTemp, g_renderEncodedTemp, csoundExePath(),
+                                       g_activeRenderFormat, g_activeFlacBits, g_activeMp3Kbps) &&
+                    !startFallbackEncoder()) {
+                    g_exportError = "Audio encoder could not start.";
+                    logLine("[caw] " + g_exportError);
+                    g_renderActive = false; cleanupRenderTemps();
+                }
+            } else finishExport(g_renderTemp);
+        }
+    }
+    if (g_codecProc.active() && g_codecProc.finished()) {
+        const bool success = g_codecProc.success();
+        const std::string error = g_codecProc.error();
+        g_codecProc.stop();
+        if (success) finishExport(g_renderEncodedTemp);
+        else {
+            logLine("[caw] Native encoder: " + error);
+            if (!startFallbackEncoder()) {
+                g_exportError = "MP3/FLAC encoder unavailable. On Windows, keep the bundled ffmpeg.exe beside CAW; otherwise install FFmpeg on PATH. Native encoder: " + error;
+                logLine("[caw] " + g_exportError);
+                g_renderActive = false; cleanupRenderTemps();
+            }
+        }
+    }
     if (g_renderProc.active()) {
-        for (const std::string& l : g_renderProc.takeOutput()) logCsoundLine(l);
+        for (const std::string& l : g_renderProc.takeOutput()) logLine(l);
         if (g_renderProc.finished()) {
-            int code = g_renderProc.exitCode();
+            const int code = g_renderProc.exitCode();
             g_renderProc.stop();
             for (const std::string& l : g_renderProc.takeOutput()) logLine(l);
-            g_renderActive = false;
-            logLine(code == 0 ? "[caw] Render finished: " + g_renderPath
-                              : "[caw] Render FAILED (exit code " + std::to_string(code) + ") - see messages above.");
+            if (code != 0) {
+                g_exportError = "Audio encoding failed. Check the console for details.";
+                logLine("[caw] Audio encoding failed (code " + std::to_string(code) + ").");
+                g_renderActive = false; cleanupRenderTemps();
+            } else finishExport(g_renderEncodedTemp);
         }
     }
 }
@@ -2684,6 +3573,7 @@ void joinSelectedClips() {
         for (size_t k = 1; k < ids.size(); ++k) {
             const MidiClip& other = *findMidiClip(ids[k]);
             if (other.clipId != targetClip) { logLine("[caw] Join: skipped " + std::string("a MIDI clip that belongs to another instrument.")); continue; }
+            if (other.muted != merged.muted) { logLine("[caw] Join: skipped a MIDI clip with a different mute state."); continue; }
             end = std::max(end, other.start + other.dur);
             used.push_back(ids[k]);
         }
@@ -2727,6 +3617,8 @@ void toggleTimelinePlay() {
         g_timelineRun = false;
         if (engineIsUp()) commandStopAll();
     } else {
+        if (timeline_loop::valid(g_proj) && (g_play < g_proj.loopStart || g_play >= g_proj.loopEnd))
+            g_play = g_proj.loopStart;
         g_timelineRun = true;
         g_resync = 1;
         if (!engineIsUp()) logLine("[caw] Play sends the clips to a running Csound: press Run Csound first, otherwise there is no sound.");
@@ -2794,10 +3686,7 @@ void showAllMidi() {
 }
 
 // ---------------------------------------------------------------- transport
-// One row. Left: the controls you always need (go to start, Play, Run, time). Middle: tabs (Edit / Project / Score) that
-// swap the group of buttons next to them. Right: a status pill that is always visible (Csound state, rendering, sample rate).
-int g_transportTab = 0;   // 0 Edit, 1 Project, 2 Score
-
+// One row: transport, editing tools and Score, with engine status at right.
 void drawTransport() {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.07f, 0.08f, 1.f));
     ImGui::BeginChild("transport", ImVec2(0, S(52)), false, ImGuiWindowFlags_NoScrollbar);
@@ -2821,9 +3710,9 @@ void drawTransport() {
     const float dotW = S(14);
     const float statusW = dotW + ImGui::CalcTextSize(statusText).x + S(12);
     const float engineW = ImGui::CalcTextSize(engineText).x + S(16);
-    const bool showEngine = totalW > S(1250);
+    const bool showEngine = totalW > S(1550);
     const float rightW = statusW + (showEngine ? engineW : 0.f) + S(12);
-    {
+    if (totalW > S(1050)) {
         const ImVec2 base = ImGui::GetWindowPos();
         ImDrawList* dl = ImGui::GetWindowDrawList();
         float x = base.x + totalW - rightW + S(4);
@@ -2849,6 +3738,18 @@ void drawTransport() {
     if (ImGui::IsItemHovered())
         helpTip("Play the timeline: moves the playhead and sends the clips to the running Csound, each at its start time. It never starts Csound, press Run for that.");
     ImGui::SameLine();
+    const bool hasLoop = g_proj.loopEnd - g_proj.loopStart >= 0.01;
+    const bool loopOn = g_proj.loopEnabled && hasLoop;
+    if (!hasLoop) ImGui::BeginDisabled();
+    if (loopOn) pushBtnOn(ImVec4(0.20f, 0.42f, 0.24f, 1.f));
+    if (ImGui::Button("Loop")) {
+        g_proj.loopEnabled = !g_proj.loopEnabled;
+        if (g_timelineRun) g_resync = 2;
+    }
+    if (loopOn) ImGui::PopStyleColor(3);
+    if (!hasLoop) ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        helpTip("Right-click the timeline ruler twice to set loop start and end. Toggle Loop here.");
     ImGui::SameLine();
     {   // Run = the Csound engine (like CsoundQt's Run). It stays alive until Stop.
         const bool on = g_liveCsound;
@@ -2866,91 +3767,34 @@ void drawTransport() {
     ImGui::TextColored(ImVec4(0.95f, 0.60f, 0.20f, 1.f), "%02d:%02d.%03d", ms / 60000, (ms / 1000) % 60, ms % 1000);
     ImGui::SameLine(0, S(18));
 
-    // ---- tabs
-    {
-        const char* names[] = { "Edit", "Project", "Score" };
-        for (int i = 0; i < 3; ++i) {
-            const bool on = g_transportTab == i;
-            pushBtnOn(on ? ImVec4(0.93f, 0.50f, 0.15f, 0.90f) : ImVec4(0.16f, 0.17f, 0.20f, 1.f));
-            ImGui::PushStyleColor(ImGuiCol_Text, on ? ImVec4(0.05f, 0.05f, 0.05f, 1.f) : ImVec4(0.75f, 0.75f, 0.80f, 1.f));
-            if (ImGui::Button(names[i], ImVec2(S(62), 0))) g_transportTab = i;
-            ImGui::PopStyleColor(4);
-            ImGui::SameLine(0, S(3));
-        }
-        ImGui::SameLine(0, S(14));
+    auto toolButton = [&](const char* label, Tool tool, const char* tip, bool join = false) {
+        const bool active = g_tool == tool;
+        if (active) pushBtnOn(ImVec4(0.93f, 0.50f, 0.15f, 0.85f));
+        if (ImGui::Button(label)) { if (join) runJoinTool(); else g_tool = tool; }
+        if (active) ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered()) helpTip("%s", tip);
+    };
+    toolButton("Select", Tool::Select, "Select tool (1): select, box-select, move and resize clips.");
+    ImGui::SameLine(0, S(3));
+    const bool penActive = g_tool == Tool::Pen || g_tool == Tool::Pen2;
+    if (penActive) pushBtnOn(ImVec4(0.93f, 0.50f, 0.15f, 0.85f));
+    if (ImGui::Button(g_tool == Tool::Pen2 ? "Pen 2" : "Pen 1")) ImGui::OpenPopup("##pen_menu");
+    if (penActive) ImGui::PopStyleColor(3);
+    ImGui::SameLine(0, S(1));
+    if (caw_ui::arrowButton("##pen_arrow", ImGuiDir_Down)) ImGui::OpenPopup("##pen_menu");
+    if (ImGui::BeginPopup("##pen_menu")) {
+        if (ImGui::MenuItem("Pen 1: simplified", "8", g_tool == Tool::Pen)) g_tool = Tool::Pen;
+        if (ImGui::MenuItem("Pen 2: detailed", "9", g_tool == Tool::Pen2)) g_tool = Tool::Pen2;
+        ImGui::EndPopup();
     }
-
-    // ---- the group of the selected tab (must stay left of the status pill)
-    const bool showZoom = totalW > S(900);
-    const float zoomW = S(34) + S(96) + S(10);   // "Zoom" label + a narrow slider
-    const float groupMaxX = totalW - rightW - S(8) - (showZoom ? zoomW : 0.f);
-    auto fits = [&](float w) { return ImGui::GetCursorPosX() + w < groupMaxX; };
-    if (g_transportTab == 0) {
-        auto toolButton = [&](const char* label, Tool tool, const char* tip, bool join = false) {
-            const bool active = g_tool == tool;
-            if (active) pushBtnOn(ImVec4(0.93f, 0.50f, 0.15f, 0.85f));
-            if (ImGui::Button(label)) {
-                if (join) runJoinTool();
-                else g_tool = tool;
-            }
-            if (active) ImGui::PopStyleColor(3);
-            if (ImGui::IsItemHovered()) helpTip("%s", tip);
-        };
-        toolButton("Select [1]", Tool::Select, "Select tool (1): click to select, Ctrl+click adds, drag an empty area to box-select clips, MIDI regions or automation dots, drag to move, Del deletes, double-click a dot to type its value");
-        ImGui::SameLine(0, S(3));
-        toolButton("Pen1 [8]", Tool::Pen, "Pen 1 (8): press and drag across an automation lane; the stroke becomes a few dots joined by straight lines (a sine wave becomes a triangle wave)");
-        ImGui::SameLine(0, S(3));
-        toolButton("Pen2 [9]", Tool::Pen2, "Pen 2 (9): press and drag across an automation lane; every point of the stroke is kept, only the start and the end show a dot");
-        ImGui::SameLine(0, S(3));
-        toolButton("Cut [3]", Tool::Cut, "Cut tool (3): click a MIDI region (in the MIDI lane) to split it at the mouse. Csound clips are never cut. Drag a clip's left or right edge to change its length.");
-        ImGui::SameLine(0, S(3));
-        toolButton("Join [4]", Tool::Join, "Join tool (4): joins the selected MIDI regions right away. With nothing selected, click a MIDI region to join it with the next one. Csound clips are never joined.", true);
-    } else if (g_transportTab == 1) {
-        if (g_renderActive) {
-            if (ImGui::Button("Cancel render")) cancelRender();
-        } else {
-            if (ImGui::Button("Render audio")) startRender();
-            if (ImGui::IsItemHovered()) helpTip("Render the whole project to an audio file (see Settings for file name and format)");
-        }
-        if (fits(S(200))) {
-            ImGui::SameLine(0, S(14));
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextDisabled("%s", cs.renderFile.c_str());
-        }
-        if (!showEngine && fits(S(260))) {
-            ImGui::SameLine(0, S(14));
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextDisabled("%s", engineText);
-        }
-    } else {
-        if (ImGui::Button("Overview")) ImGui::OpenPopup("##genscore_ov");
-        if (ImGui::BeginPopup("##genscore_ov")) {
-            if (ImGui::MenuItem("One page (colour)")) generateScore(false, false);
-            if (ImGui::MenuItem("One page (black)")) generateScore(false, true);
-            ImGui::EndPopup();
-        }
-        if (ImGui::IsItemHovered()) helpTip("The whole piece on one page");
-        ImGui::SameLine(0, S(3));
-        if (ImGui::Button("Full score")) ImGui::OpenPopup("##genscore_full");
-        if (ImGui::BeginPopup("##genscore_full")) {
-            if (ImGui::MenuItem("Full score (colour)")) generateScore(true, false);
-            if (ImGui::MenuItem("Full score (black)")) generateScore(true, true);
-            ImGui::EndPopup();
-        }
-        if (ImGui::IsItemHovered()) helpTip("Several pages, systems from left to right, like a printed score (open the .html and print it to PDF)");
-        ImGui::SameLine(0, S(14));
-        if (ImGui::Button("Score editor")) g_scoreOpen = true;
-    }
-
-    if (showZoom) {   // zoom: always visible, a narrow logarithmic slider just left of the status pill
-        ImGui::SetCursorPos(ImVec2(totalW - rightW - zoomW - S(4), S(10)));
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextDisabled("Zoom");
-        ImGui::SameLine(0, S(6));
-        ImGui::SetNextItemWidth(S(96));
-        ImGui::SliderFloat("##zoom", &g_pps, kPpsMin, kPpsMax, "%.0f px/s", ImGuiSliderFlags_Logarithmic);
-        if (ImGui::IsItemHovered()) helpTip("Timeline zoom in pixels per second (logarithmic: left = the whole piece, right = milliseconds). Ctrl+wheel on the timeline zooms too. Ctrl+click to type a value.");
-    }
+    if (ImGui::IsItemHovered()) helpTip("Choose a pen for drawing automation.");
+    ImGui::SameLine(0, S(3));
+    toolButton("Cut", Tool::Cut, "Cut MIDI clips (3).");
+    ImGui::SameLine(0, S(3));
+    toolButton("Join", Tool::Join, "Join MIDI clips (4).", true);
+    ImGui::SameLine(0, S(10));
+    if (ImGui::Button("Score")) g_scoreOpen = true;
+    if (ImGui::IsItemHovered()) helpTip("Edit and export the score.");
     endChildTight();
     ImGui::PopStyleColor();
 }
@@ -2991,7 +3835,7 @@ void drawMarkItem(ImDrawList* dl, int trackIdx, const Track& track, const TrackM
     // on the timeline a shape or box is at most as big as its row; the score shows the full size
     const float h = std::min(rowH, rowH * scale);
     const float sTop = top + (rowH - h) * 0.5f, sBot = sTop + h;
-    ImFont* font = ImGui::GetFont();
+    ImFont* font = g_markUiFont ? g_markUiFont : ImGui::GetFont();
     const float fs = ImGui::GetFontSize() * (mk.font > 0 ? (float)mk.font / 9.f : 1.f);
     auto centered = [&](float cx, float cy, const char* t) {
         const ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0.f, t);
@@ -3042,7 +3886,7 @@ void drawMarkItem(ImDrawList* dl, int trackIdx, const Track& track, const TrackM
     } else if (mk.type == 3) {   // code, coding-style font, colors of the chosen language
         dl->AddRectFilled(ImVec2(x0, top), ImVec2(x1, bot), IM_COL32(24, 25, 30, 255), S(3));
         dl->AddRect(ImVec2(x0, top), ImVec2(x1, bot), line, S(3), 0, S(1.2f));
-        ImFont* mono = g_codeFonts[0] ? g_codeFonts[0] : font;
+        ImFont* mono = g_markCodeFont ? g_markCodeFont : (g_codeFonts[0] ? g_codeFonts[0] : font);
         const float cfs = fs * 0.85f;
         dl->PushClipRect(ImVec2(x0 + S(3), top), ImVec2(x1 - S(2), bot), true);
         float y = top + S(2);
@@ -3065,6 +3909,44 @@ void drawMarkItem(ImDrawList* dl, int trackIdx, const Track& track, const TrackM
         dl->AddText(font, fs, ImVec2(x0 + S(8), top + S(3)), IM_COL32(235, 236, 240, 255), label.c_str(), nullptr, std::max(S(20), x1 - x0 - S(12)));
         dl->PopClipRect();
     }
+}
+
+// Tracks use the original 6 px LEDs; only the master uses taller LEDs.
+void drawLedMeter(ImDrawList* dl, float x0, float x1, float top, float bottom, float db, bool clip, bool gray = false, bool master = false) {
+    if (x1 <= x0 || bottom <= top) return;
+    const float pitch = S(master ? 12.f : 7.8f), ledH = S(master ? 10.f : 6.f), pad = (pitch - ledH) * 0.5f;
+    const int n = std::max(2, (int)std::floor((bottom - top) / pitch));
+    const float fraction = std::min(1.f, std::max(0.f, (db + 60.f) / 60.f));
+    const int lit = (int)std::lround(std::pow(fraction, 1.8f) * (n - 1));
+    dl->PushClipRect(ImVec2(x0, top), ImVec2(x1, bottom), true);
+    for (int i = 0; i < n; ++i) {
+        const bool isTop = i == n - 1;
+        const bool on = isTop ? clip : i < lit;
+        const float y = bottom - (i + 1) * pitch + pad;
+        const ImU32 color = gray ? (on ? IM_COL32(175, 180, 186, 255) : IM_COL32(38, 41, 45, 255))
+                                 : isTop ? (on ? IM_COL32(255, 45, 45, 255) : IM_COL32(33, 6, 6, 255))
+                                         : (on ? IM_COL32(50, 212, 255, 255) : IM_COL32(7, 28, 33, 255));
+        dl->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + ledH), color, S(0.06f));
+    }
+    dl->PopClipRect();
+}
+
+// Q aligns selected starts, without a grid or changes to clip durations.
+void qSelectedClips() {
+    if (g_selClips.size() + g_selMidiClips.size() < 2) return;
+    historyFlush();
+    clip_timing::sync(g_proj, g_selClips, g_selMidiClips);
+    historyFlush();
+}
+
+void drawClipQMenu() {
+    if (ImGui::MenuItem("Q", "Q", false, g_selClips.size() + g_selMidiClips.size() >= 2))
+        qSelectedClips();
+    if (ImGui::IsItemHovered()) helpTip("Align selected clip starts to the earliest selected clip.");
+}
+
+void drawChevron(ImDrawList* dl, float x, float y, float radius, bool right, ImU32 color) {
+    caw_ui::disclosure(dl, ImVec2(x, y), radius, color, !right);
 }
 
 void drawArrange(float belowH, float rightW) {
@@ -3093,8 +3975,8 @@ void drawArrange(float belowH, float rightW) {
         for (auto it = g_selClips.begin(); it != g_selClips.end();)
             it = existing.count(*it) ? std::next(it) : g_selClips.erase(it);
         const Clip* primary = selectedClip();
-        if (!primary) g_selClips.clear();
-        else if (!g_selClips.count(primary->id)) { g_selClips.clear(); g_selClips.insert(primary->id); }
+        if (g_selClips.empty() && primary) g_selClips.insert(primary->id);
+        else if (!primary || !g_selClips.count(primary->id)) setPrimaryFromSet();
     }
 
     auto th = [&](int i) {
@@ -3153,9 +4035,8 @@ void drawArrange(float belowH, float rightW) {
         if (inHdr) {
             g_scrollY -= io.MouseWheel * S(kDefaultTrackH) * 0.6f;
         } else if (io.KeyCtrl) {
-            double tm = xt(m.x);
             g_pps = std::min(kPpsMax, std::max(kPpsMin, g_pps * (1.f + 0.12f * io.MouseWheel)));
-            g_scrollX = (float)(tm - (m.x - bodyMin.x) / g_pps);
+            g_scrollX = zoomAroundPlayhead(g_pps, g_play, std::max(1.f, bodyMax.x - bodyMin.x));
         } else if (io.KeyShift) {
             g_scrollX -= io.MouseWheel * 60.f / g_pps;
         } else {
@@ -3163,7 +4044,9 @@ void drawArrange(float belowH, float rightW) {
         }
     }
     if (io.MouseWheelH != 0.f && (inBody || inRuler)) g_scrollX -= io.MouseWheelH * 60.f / g_pps;
-    g_scrollX = std::max(0.f, g_scrollX);
+    const double viewSec = std::max(0.001, (double)(bodyMax.x - bodyMin.x) / g_pps);
+    const double minX = 0.0;
+    g_scrollX = (float)std::max(minX, (double)g_scrollX);
     float contentH = S(kDefaultTrackH);
     for (int i = 0; i < nT; ++i) contentH += th(i) + folderHdrH[(size_t)i];
     const float viewH = std::max(1.f, bodyMax.y - bodyMin.y);
@@ -3175,9 +4058,9 @@ void drawArrange(float belowH, float rightW) {
         for (const auto& lane : t.automation)
             for (const AutoPoint& p : lane.second) projectEnd = std::max(projectEnd, p.t);
     }
-    const double viewSec = std::max(0.001, (double)(bodyMax.x - bodyMin.x) / g_pps);
-    const double totalSec = std::max({projectEnd + viewSec * 0.5, 10.0, (double)g_scrollX + viewSec});
-    const double maxX = std::max(0.0, totalSec - viewSec);
+    const double maxX = std::max({0.0, projectEnd - viewSec * 0.5, 10.0 - viewSec, (double)g_scrollX});
+    const double scrollSpan = maxX - minX;
+    const double totalSec = scrollSpan + viewSec;
     const float vTrackLen = viewH, hTrackLen = std::max(1.f, bodyMax.x - bodyMin.x);
     const float vThumbLen = std::min(vTrackLen, std::max(S(28), vTrackLen * viewH / std::max(viewH, contentH)));
     const float hThumbLen = std::min(hTrackLen, std::max(S(28), hTrackLen * (float)(viewSec / totalSec)));
@@ -3234,7 +4117,7 @@ void drawArrange(float belowH, float rightW) {
             g_drag = Drag::ScrollY;
             consumed = true;
         } else if (ImGui::IsMouseHoveringRect(hBarA, hBarB)) {
-            const float left = bodyMin.x + (maxX > 0.0 ? (float)(g_scrollX / maxX) * hRange : 0.f);
+            const float left = bodyMin.x + (scrollSpan > 0.0 ? (float)std::min(1.0, std::max(0.0, (g_scrollX - minX) / scrollSpan)) * hRange : 0.f);
             g_sbGrab = (m.x >= left && m.x <= left + hThumbLen) ? m.x - left : hThumbLen * 0.5f;
             g_drag = Drag::ScrollX;
             consumed = true;
@@ -3243,7 +4126,7 @@ void drawArrange(float belowH, float rightW) {
     if (g_drag == Drag::ScrollY && ImGui::IsMouseDown(0))
         g_scrollY = std::min(maxY, std::max(0.f, (m.y - bodyMin.y - g_sbGrab) / vRange * maxY));
     if (g_drag == Drag::ScrollX && ImGui::IsMouseDown(0))
-        g_scrollX = (float)std::min(maxX, std::max(0.0, (double)(m.x - bodyMin.x - g_sbGrab) / hRange * maxX));
+        g_scrollX = (float)std::min(maxX, std::max(minX, minX + (double)(m.x - bodyMin.x - g_sbGrab) / hRange * scrollSpan));
     if (g_drag == Drag::ScrollX || g_drag == Drag::ScrollY) { consumed = true; layout(); }
 
     if (edgeTrack >= 0) {
@@ -3323,7 +4206,7 @@ void drawArrange(float belowH, float rightW) {
                 }
                 reshapeDots(whLane->second, g_wh.idx, g_wh.orig, dS, dE, st, mo, g_wh.lo, g_wh.hi);
                 const ParsedTrack whParsed = parseTrack(*whTrack);
-                const CawParam* whParam = whTrack->kind == 0 ? laneParameter(whParsed, g_wh.channel) : nullptr;
+                const CawParam* whParam = hasClips(*whTrack) ? laneParameter(whParsed, g_wh.channel) : nullptr;
                 if (whParam) for (int index : g_wh.idx)
                     if (index >= 0 && index < (int)whLane->second.size())
                         whLane->second[(size_t)index].v = quantizeAutomation(whLane->second[(size_t)index].v, *whParam);
@@ -3652,6 +4535,7 @@ void drawArrange(float belowH, float rightW) {
         if (ImGui::IsKeyPressed(ImGuiKey_3, false)) g_tool = Tool::Cut;      // 3 = cut
         if (ImGui::IsKeyPressed(ImGuiKey_C, false)) g_tool = g_tool == Tool::Cut ? Tool::Select : Tool::Cut;   // C toggles cut
         if (ImGui::IsKeyPressed(ImGuiKey_4, false)) runJoinTool();           // 4 = join
+        if (ImGui::IsKeyPressed(ImGuiKey_Q, false)) qSelectedClips();
         if (g_selTrack >= 0 && g_selTrack < nT) {                            // M / S = mute / solo the selected track
             Track& selected = g_proj.tracks[(size_t)g_selTrack];
             if (ImGui::IsKeyPressed(ImGuiKey_M, false)) selected.muted = !selected.muted;
@@ -3688,9 +4572,17 @@ void drawArrange(float belowH, float rightW) {
                     g_selTrack = ti;
                     if (target >= 0) {
                         MidiClip& hit = track.midiClips[(size_t)target];
-                        if (ImGui::IsMouseClicked(1)) {
+                        if (ImGui::IsMouseClicked(0) &&
+                            tx(hit.start + hit.dur) - tx(hit.start) > S(46) &&
+                            m.x >= tx(hit.start + hit.dur) - S(21) && m.x <= tx(hit.start + hit.dur) - S(5) &&
+                            m.y >= laneTop + S(5) && m.y <= laneTop + S(21)) {
+                            hit.muted = !hit.muted;
+                        } else if (ImGui::IsMouseClicked(1)) {
                             g_ctxMidiId = hit.id;
-                            if (!g_selMidiClips.count(hit.id)) { g_selMidiClips.clear(); g_selMidiClips.insert(hit.id); }
+                            if (!g_selMidiClips.count(hit.id)) {
+                                g_selMidiClips.clear(); g_selMidiClips.insert(hit.id);
+                                g_selClips.clear(); g_selClip = -1;
+                            }
                             ImGui::OpenPopup("##midi_context");
                         } else if (g_tool == Tool::Cut) {
                             cutMidiClipAt(ti, target, xt(m.x));
@@ -3956,7 +4848,9 @@ void drawArrange(float belowH, float rightW) {
         } else if (ImGui::IsMouseClicked(1) && ci >= 0) {
             g_selTrack = ti; g_selClip = ci;
             g_ctxClipId = g_proj.tracks[(size_t)ti].clips[(size_t)ci].id;
-            if (!g_selClips.count(g_ctxClipId)) { g_selClips.clear(); g_selClips.insert(g_ctxClipId); }
+            if (!g_selClips.count(g_ctxClipId)) {
+                g_selClips.clear(); g_selClips.insert(g_ctxClipId); g_selMidiClips.clear();
+            }
             ImGui::OpenPopup("##clip_context");
         } else if (ImGui::IsMouseClicked(0) && ci >= 0 &&
                    tx(g_proj.tracks[(size_t)ti].clips[(size_t)ci].start + g_proj.tracks[(size_t)ti].clips[(size_t)ci].dur) -
@@ -4022,6 +4916,24 @@ void drawArrange(float belowH, float rightW) {
     if (inRuler && !consumed && ImGui::IsMouseClicked(0)) {
         g_drag = Drag::Playhead;
     }
+    if (inRuler && !consumed && ImGui::IsMouseClicked(1)) {
+        const double at = clampTimelineTime(xt(m.x));
+        if (!g_loopSelecting) {
+            g_loopAnchor = at;
+            g_loopSelecting = true;
+            g_proj.loopStart = g_proj.loopEnd = at;
+            g_proj.loopEnabled = false;
+        } else if (std::fabs(at - g_loopAnchor) >= 0.01) {
+            g_proj.loopStart = std::min(g_loopAnchor, at);
+            g_proj.loopEnd = std::max(g_loopAnchor, at);
+            g_proj.loopEnabled = true;
+            g_loopSelecting = false;
+        }
+        if (g_timelineRun) g_resync = 2;
+    }
+    if (inRuler && !consumed && g_drag == Drag::None)
+        helpTip(g_loopSelecting ? "Right-click the ruler to set the other loop boundary." :
+                "Right-click twice to set a loop. Left-click to move the playhead.");
 
     if (g_drag != Drag::None) {
         if (!ImGui::IsMouseDown(0)) {
@@ -4081,7 +4993,7 @@ void drawArrange(float belowH, float rightW) {
                 setPrimaryFromSet();
             } else if (g_drag == Drag::Marquee && g_marqDblKind != 0 && g_marqLane >= 0 && g_marqLane < nT) {
                 Track& lane = g_proj.tracks[(size_t)g_marqLane];
-                if (g_marqDblKind == 1 && lane.kind == 0) {
+                if (g_marqDblKind == 1 && hasClips(lane)) {
                     // new clip = new, independent instrument (own name, code copy, color, MIDI)
                     std::string code = lane.code;
                     if (g_selTrack == g_marqLane && g_selClip >= 0 && g_selClip < (int)lane.clips.size()) code = lane.clips[(size_t)g_selClip].code;
@@ -4099,6 +5011,7 @@ void drawArrange(float belowH, float rightW) {
                         MidiClip mc;
                         mc.id = newMidiId();
                         mc.clipId = owner;
+                        if (const Clip* target = findClip(owner)) mc.name = target->name;
                         mc.start = g_marqT;
                         mc.dur = 2.0;
                         lane.midiClips.push_back(mc);
@@ -4141,7 +5054,7 @@ void drawArrange(float belowH, float rightW) {
             if (g_dragOrig.size() == 1 && g_dragMidiOrig.empty() && g_selTrack >= 0 && g_selTrack < nT && g_selClip >= 0 &&
                 g_selClip < (int)g_proj.tracks[(size_t)g_selTrack].clips.size()) {
                 int nt = laneOf(m.y);
-                if (nt >= 0 && nt != g_selTrack && g_proj.tracks[(size_t)nt].kind == 0) {  // drag a single clip to another track (never onto a graph / marker track)
+                if (nt >= 0 && nt != g_selTrack && hasClips(g_proj.tracks[(size_t)nt])) {  // drag a single clip to another track (never onto a graph / marker track)
                     auto& from = g_proj.tracks[(size_t)g_selTrack].clips;
                     Clip tmp = from[(size_t)g_selClip];
                     from.erase(from.begin() + g_selClip);
@@ -4203,8 +5116,19 @@ void drawArrange(float belowH, float rightW) {
     const double t0 = g_scrollX, t1 = xt(bodyMax.x);
 
     ImGui::PushClipRect(ImVec2(rulerMin.x, org.y), bodyMax, true);
+    if (g_loopSelecting) {
+        const float x = tx(g_loopAnchor);
+        dl->AddLine(ImVec2(x, rulerMin.y), ImVec2(x, rulerMax.y), IM_COL32(250, 165, 50, 255), S(2));
+    } else if (g_proj.loopEnd - g_proj.loopStart >= 0.01) {
+        const float a = tx(g_proj.loopStart), b = tx(g_proj.loopEnd);
+        const ImU32 tint = g_proj.loopEnabled ? IM_COL32(240, 146, 45, 115) : IM_COL32(100, 100, 105, 90);
+        dl->AddRectFilled(ImVec2(a, rulerMin.y), ImVec2(b, rulerMax.y), tint);
+        dl->AddLine(ImVec2(a, rulerMin.y), ImVec2(a, rulerMax.y), IM_COL32(250, 165, 50, 255), S(2));
+        dl->AddLine(ImVec2(b, rulerMin.y), ImVec2(b, rulerMax.y), IM_COL32(250, 165, 50, 255), S(2));
+    }
     for (long long k = (long long)std::floor(t0 / minor); k * minor <= t1; ++k) {
         double t = k * minor;
+        if (t < 0.0) continue;
         float x = tx(t);
         bool isMajor = (k % 4 == 0);
         dl->AddLine(ImVec2(x, isMajor ? org.y + S(8) : org.y + S(17)), ImVec2(x, bodyMin.y),
@@ -4219,6 +5143,26 @@ void drawArrange(float belowH, float rightW) {
         }
     }
     ImGui::PopClipRect();
+
+    // Compact zoom lives next to the timeline ruler, not in the transport.
+    dl->AddRectFilled(ImVec2(org.x + S(4), org.y + S(2)),
+                      ImVec2(bodyMin.x - S(4), bodyMin.y - S(2)), IM_COL32(48, 52, 58, 255), S(4));
+    ImGui::SetCursorScreenPos(ImVec2(org.x + S(8), org.y + S(5)));
+    ImGui::TextDisabled("-");
+    ImGui::SameLine(0, S(4));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(S(2), 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.13f, 0.15f, 0.17f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.19f, 0.22f, 0.24f, 1.f));
+    ImGui::SetNextItemWidth(std::max(S(45), headerW - S(48)));
+    if (ImGui::SliderFloat("##timeline_zoom", &g_pps, kPpsMin, kPpsMax, "",
+                           ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoInput)) {
+        g_scrollX = zoomAroundPlayhead(g_pps, g_play, std::max(1.f, bodyMax.x - bodyMin.x));
+    }
+    if (ImGui::IsItemHovered()) helpTip("Zoom around the playhead: left zooms out, right zooms in. Ctrl+mouse wheel also centres on the playhead.");
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar();
+    ImGui::SameLine(0, S(4));
+    ImGui::TextDisabled("+");
 
     // ---- lanes + clips
     ImGui::PushClipRect(bodyMin, bodyMax, true);
@@ -4239,6 +5183,9 @@ void drawArrange(float belowH, float rightW) {
         Track& t = g_proj.tracks[(size_t)i];
         dl->AddRectFilled(ImVec2(bodyMin.x, y0), ImVec2(bodyMax.x, y1), trackColor(i, 24, t.color));
         dl->AddLine(ImVec2(bodyMin.x, y1), ImVec2(bodyMax.x, y1), IM_COL32(12, 12, 14, 255));
+        if (t.kind == 5 || t.kind == 6)
+            dl->AddText(ImVec2(bodyMin.x + S(12), y0 + S(10)), IM_COL32(155, 155, 165, 255),
+                        t.kind == 5 ? "SuperCollider: placeholder (not connected)" : "Pure Data: placeholder (not connected)");
         const float pad = S(5);
         for (int k = 0; k < (int)t.clips.size(); ++k) {
             const Clip& c = t.clips[(size_t)k];
@@ -4277,7 +5224,8 @@ void drawArrange(float belowH, float rightW) {
         if (hiddenTrack(i)) continue;
         Track& track = g_proj.tracks[(size_t)i];
         float laneY = baseBottom[(size_t)i];
-        const ParsedTrack parsed = parseTrack(track);
+        ParsedTrack parsed;
+        bool parsedReady = false;
         if (track.kind == 1 || track.kind == 2) {   // marker track: comment boxes; graph track: the same items in its first row
             const float top = yTop[(size_t)i] + S(6), bot = baseBottom[(size_t)i] - S(6);
             if (baseBottom[(size_t)i] >= bodyMin.y && yTop[(size_t)i] <= bodyMax.y) {
@@ -4296,6 +5244,7 @@ void drawArrange(float belowH, float rightW) {
             if (!autoShown(track, channel)) continue;
             const float laneY1 = laneY + S(automationHeight(track, channel));
             if (laneY1 < bodyMin.y || laneY > bodyMax.y) { laneY = laneY1; continue; }
+            if (!parsedReady) { parsed = parseTrack(track); parsedReady = true; }
             const ImVec2 a(bodyMin.x, laneY), b(bodyMax.x, laneY1);
             dl->AddRectFilled(a, b, IM_COL32(18, 19, 22, 255));
             dl->AddLine(ImVec2(a.x, laneY1), ImVec2(b.x, laneY1), IM_COL32(12, 12, 14, 255));
@@ -4338,10 +5287,10 @@ void drawArrange(float belowH, float rightW) {
                     }
                     const bool denseHere = pi > 0 && pi + 1 < (int)poly.size() && std::fabs(point.x - poly[(size_t)pi - 1].x) < S(9) && std::fabs(poly[(size_t)pi + 1].x - point.x) < S(9);
                     if (picked && denseHere) {
-                        dl->AddCircleFilled(point, S(2.5f), IM_COL32(255, 255, 255, 255));   // many selected dots (a wave): small, so the line stays readable
+                        dl->AddCircleFilled(point, S(2.f), IM_COL32(255, 255, 255, 255));   // many selected dots (a wave): small, so the line stays readable
                     } else if (picked) {
-                        dl->AddCircleFilled(point, S(6), IM_COL32(255, 255, 255, 255));
-                        dl->AddCircle(point, S(8), trackColor(i, 255, laneColor), 0, S(2));
+                        dl->AddCircleFilled(point, S(4), IM_COL32(255, 255, 255, 255));
+                        dl->AddCircle(point, S(5.5f), trackColor(i, 255, laneColor), 0, S(1.5f));
                     } else {
                         // pen strokes read as a plain line: dots packed close together on both sides are not drawn
                         // (a lone dot, or one at the end of a stroke, is still shown and can be grabbed)
@@ -4350,8 +5299,8 @@ void drawArrange(float belowH, float rightW) {
                         const bool denseR = pi + 1 < (int)poly.size() && std::fabs(poly[(size_t)pi + 1].x - point.x) < packed;
                         if (denseL && denseR) continue;
                         if (points[(size_t)pi].line) continue;   // inside a Pen 2 stroke: only the start and the end of the stroke have dots
-                        dl->AddCircleFilled(point, S(4), trackColor(i, 255, laneColor));
-                        dl->AddCircle(point, S(6), IM_COL32(255, 255, 255, 150), 0, S(1));
+                        dl->AddCircleFilled(point, S(2.8f), trackColor(i, 255, laneColor));
+                        dl->AddCircle(point, S(4), IM_COL32(255, 255, 255, 150), 0, S(1));
                     }
                 }
             }
@@ -4398,8 +5347,12 @@ void drawArrange(float belowH, float rightW) {
             dl->AddRectFilled(ImVec2(cx0, midiY + S(2)), ImVec2(cx1, midiBottom - S(2)), trackColor(i, selectedMidi ? 70 : 34, clipRgb), S(3));
             dl->AddRect(ImVec2(cx0, midiY + S(2)), ImVec2(cx1, midiBottom - S(2)),
                         selectedMidi ? IM_COL32(237, 128, 38, 255) : trackColor(i, 90, clipRgb), S(3), 0, selectedMidi ? S(2) : S(1));
-            if (mc.notes.empty() && cx1 - cx0 > S(70))
-                dl->AddText(ImVec2(cx0 + S(5), midiY + S(4)), IM_COL32(122, 124, 133, 255), ((tgt ? tgt->name : std::string("?")) + " MIDI").c_str());
+            if (cx1 - cx0 > S(70)) {
+                const std::string label = mc.name.empty() ? (tgt ? tgt->name : "?") : mc.name;
+                dl->PushClipRect(ImVec2(cx0 + S(2), midiY + S(2)), ImVec2(cx1 - S(23), midiBottom - S(2)), true);
+                dl->AddText(ImVec2(cx0 + S(5), midiY + S(4)), IM_COL32(190, 192, 198, 255), label.c_str());
+                dl->PopClipRect();
+            }
             for (const MidiNote& note : mc.notes) {
                 if (note.start >= mc.dur) continue;
                 anyNotes = true;
@@ -4409,6 +5362,13 @@ void drawArrange(float belowH, float rightW) {
                 const float y0 = midiBottom - padY - (note.pitch - miniPitchLow + 1) * noteStep;
                 const ImVec2 a(x0, y0 + S(1)), b(std::max(x0 + S(3), x1), y0 + noteStep - S(1));
                 dl->AddRectFilled(a, b, trackColor(i, 230, clipRgb), S(2));
+            }
+            if (mc.muted)
+                dl->AddRectFilled(ImVec2(cx0, midiY + S(2)), ImVec2(cx1, midiBottom - S(2)), IM_COL32(10, 10, 12, 150), S(3));
+            if (cx1 - cx0 > S(46)) {
+                const ImVec2 ma(cx1 - S(21), midiY + S(5)), mb(cx1 - S(5), midiY + S(21));
+                dl->AddRectFilled(ma, mb, mc.muted ? IM_COL32(190, 60, 52, 255) : IM_COL32(0, 0, 0, 110), S(3));
+                dl->AddText(ImVec2(ma.x + S(3), ma.y + S(1)), IM_COL32(255, 255, 255, mc.muted ? 255 : 170), "M");
             }
         }
     }
@@ -4445,8 +5405,7 @@ void drawArrange(float belowH, float rightW) {
                 dl->AddRectFilled(ImVec2(a.x + S(5), b.y - S(3)), b, fcol);
                 dl->AddLine(ImVec2(a.x, b.y), ImVec2(b.x, b.y), IM_COL32(12, 12, 14, 255));
                 const float cx = a.x + S(14), cy = (a.y + b.y) * 0.5f, rr = S(4.5f);
-                if (fo->collapsed) dl->AddTriangleFilled(ImVec2(cx - rr * 0.7f, cy - rr), ImVec2(cx - rr * 0.7f, cy + rr), ImVec2(cx + rr, cy), IM_COL32(200, 200, 210, 255));
-                else dl->AddTriangleFilled(ImVec2(cx - rr, cy - rr * 0.7f), ImVec2(cx + rr, cy - rr * 0.7f), ImVec2(cx, cy + rr), IM_COL32(200, 200, 210, 255));
+                drawChevron(dl, cx, cy, rr, fo->collapsed, IM_COL32(200, 200, 210, 255));
                 const std::string label = fo->name + "  (" + std::to_string(folderMemberCount(fo->id)) + ")";
                 dl->AddText(ImVec2(a.x + S(28), cy - ImGui::GetFontSize() * 0.5f), IM_COL32(225, 225, 235, 255), label.c_str());
                 ImGui::PushID(300000 + fo->id);
@@ -4498,28 +5457,14 @@ void drawArrange(float belowH, float rightW) {
                 const float barW = S(6), barGap = S(2);
                 const float totalW = lm.channels * barW + (lm.channels - 1) * barGap;
                 const float mx1 = r1.x - S(8), mx0 = mx1 - totalW;
-                const float ledH = S(7), top = y0 + S(5) + ledH + S(3), bot = y1 - S(5);
-                for (int c = 0; c < lm.channels; ++c) {   // one clip LED per channel, click a LED to reset it
-                    const float lx0 = mx0 + c * (barW + barGap), lx1 = lx0 + barW;
-                    const int meterIdx = lm.first + c;
-                    const bool clipped = g_laneClipped.count(meterIdx) > 0;
-                    dl->AddRectFilled(ImVec2(lx0, y0 + S(5)), ImVec2(lx1, y0 + S(5) + ledH), clipped ? IM_COL32(240, 50, 40, 255) : IM_COL32(60, 26, 26, 255), S(1.5f));
-                    if (ImGui::IsMouseHoveringRect(ImVec2(lx0, y0 + S(3)), ImVec2(lx1, y0 + S(5) + ledH + S(2))) && ImGui::IsMouseClicked(0)) g_laneClipped.erase(meterIdx);
-                }
+                const float top = y0 + S(5), bot = y1 - S(5);
                 if (bot - top > S(4)) {
                     for (int c = 0; c < lm.channels; ++c) {
                         const float bx0 = mx0 + c * (barW + barGap), bx1 = bx0 + barW;
-                        dl->AddRectFilled(ImVec2(bx0, top), ImVec2(bx1, bot), IM_COL32(22, 22, 25, 255));
                         const size_t idx = (size_t)(lm.first + c);
                         const float db = (g_liveCsound && idx < g_meterDb.size()) ? g_meterDb[idx] : -90.f;
-                        const float lo = -60.f, hi = 3.f;
-                        auto yAt = [&](float d) { return bot - (std::min(hi, std::max(lo, d)) - lo) / (hi - lo) * (bot - top); };
-                        struct Zone { float a, b; ImU32 col; };
-                        const Zone zones[] = {{lo, -12.f, IM_COL32(70, 190, 90, 255)}, {-12.f, -3.f, IM_COL32(225, 195, 60, 255)}, {-3.f, hi, IM_COL32(230, 70, 60, 255)}};
-                        for (const Zone& z : zones) {
-                            const float topDb = std::min(z.b, db);
-                            if (topDb > z.a) dl->AddRectFilled(ImVec2(bx0, yAt(topDb)), ImVec2(bx1, yAt(z.a)), z.col);
-                        }
+                        const bool clipped = idx < g_meterClipHold.size() && g_meterClipHold[idx] > 0.f;
+                        drawLedMeter(dl, bx0, bx1, top, bot, db, clipped, lm.csoundOnly);
                     }
                 }
                 break;
@@ -4563,14 +5508,16 @@ void drawArrange(float belowH, float rightW) {
                     prevRight = ImGui::GetItemRectMax().x;
                     const ImU32 ac = ImGui::IsItemHovered() ? IM_COL32(255, 255, 255, 255) : IM_COL32(170, 172, 182, 255);
                     const float cx = ap.x + asz * 0.5f, cy = ap.y + asz * 0.5f, r = asz * 0.26f;
-                    if (folded) ImGui::GetWindowDrawList()->AddTriangleFilled(ImVec2(cx - r * 0.7f, cy - r), ImVec2(cx - r * 0.7f, cy + r), ImVec2(cx + r, cy), ac);
-                    else ImGui::GetWindowDrawList()->AddTriangleFilled(ImVec2(cx - r, cy - r * 0.7f), ImVec2(cx + r, cy - r * 0.7f), ImVec2(cx, cy + r), ac);
+                    drawChevron(ImGui::GetWindowDrawList(), cx, cy, r, folded, ac);
                     if (ImGui::IsItemHovered()) helpTip(folded ? "Show the automation sub-tracks and the MIDI track" : "Hide all the automation sub-tracks and the MIDI track (the data stays)");
                     ImGui::SameLine(0, S(6));
                 }
             }
+            const bool placeholder = t.kind == 5 || t.kind == 6;
+            if (placeholder) ImGui::BeginDisabled();
             const bool plusClicked = ImGui::SmallButton("+");
             prevRight = ImGui::GetItemRectMax().x;
+            if (placeholder) ImGui::EndDisabled();
             if (plusClicked) ImGui::OpenPopup("add_automation_lane");
             if (ImGui::IsItemHovered()) helpTip("Show / add automation lanes and the MIDI lane");
             if (ImGui::BeginPopup("add_automation_lane")) {
@@ -4618,6 +5565,15 @@ void drawArrange(float belowH, float rightW) {
                 if (t.solo) ImGui::PopStyleColor(3);
                 if (ImGui::IsItemHovered()) helpTip(t.solo ? "Unsolo track" : "Solo track");
             }
+            if ((t.kind == 3 || t.kind == 4) && fitsRow(smallBtnW("Show", S(7)))) {   // VSTi / VSTe: open the plugin window again
+                ImGui::SameLine(0, S(8));
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(S(7), 0.f));
+                const bool showClicked = ImGui::SmallButton("Show##vst");
+                prevRight = ImGui::GetItemRectMax().x;
+                ImGui::PopStyleVar();
+                if (showClicked) vstui::openWindow(t.id);
+                if (ImGui::IsItemHovered()) helpTip("Open the plugin window: pick the 8 parameters, show the plugin interface");
+            }
             if (fitsRow(smallBtnW("sco", S(7)))) {
                 ImGui::SameLine(0, S(8));
                 { ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(S(7), 0.f));
@@ -4662,8 +5618,8 @@ void drawArrange(float belowH, float rightW) {
                 // R = live Rec: while the timeline plays, the value the code sends to "rec" is written into this lane as dots
                 const float rangeX = nameEnd;
                 const float limitX = bodyMin.x - S(std::max(40.f, leftBtnOff)) - S(4);
-                const bool showRange = t.kind == 0 && rangeX + S(26) <= limitX;
-                const bool showRec = t.kind == 0 && rangeX + S(showRange ? 58 : 26) <= limitX;
+                const bool showRange = hasClips(t) && rangeX + S(26) <= limitX;
+                const bool showRec = hasClips(t) && rangeX + S(showRange ? 58 : 26) <= limitX;
                 if (showRange) {
                     ImGui::SetCursorScreenPos(ImVec2(rangeX, laneTop + S(2)));
                     if (ImGui::Button("R##range", ImVec2(S(26), 0))) ImGui::OpenPopup("range_popup");
@@ -4737,7 +5693,7 @@ void drawArrange(float belowH, float rightW) {
                     if (showShapeCb) {
                     ImGui::SetCursorScreenPos(ImVec2(org.x + S(16), rowY));
                     ImGui::SetNextItemWidth(gcw);
-                    if (ImGui::Combo("##graph_shape", &gshape, "Curve\0Steps\0Straight\0Line, no dots\0Dashed\0Mirror smooth\0Mirror boxes\0Hairpin < >\0Bars\0")) t.scoreAutoShape[channel] = gshape;
+                    if (caw_ui::combo("##graph_shape", &gshape, "Curve\0Steps\0Straight\0Line, no dots\0Dashed\0Mirror smooth\0Mirror boxes\0Hairpin < >\0Bars\0")) t.scoreAutoShape[channel] = gshape;
                     if (ImGui::IsItemHovered()) helpTip("Shape of this line in the score");
                     }
                     const auto mgIt = t.scoreAutoMerge.find(channel);
@@ -4745,7 +5701,7 @@ void drawArrange(float belowH, float rightW) {
                     if (showMergeCb) {
                     ImGui::SetCursorScreenPos(ImVec2(org.x + S(16 + 8) + gcw, rowY));
                     ImGui::SetNextItemWidth(gcw);
-                    if (ImGui::Combo("##graph_merge", &gmerge, "Combine\0Half combine\0Separated\0")) t.scoreAutoMerge[channel] = gmerge;
+                    if (caw_ui::combo("##graph_merge", &gmerge, "Combine\0Half combine\0Separated\0")) t.scoreAutoMerge[channel] = gmerge;
                     if (ImGui::IsItemHovered()) helpTip("How this line joins the other lines of the graph in the score:\nCombine = one shape together with the other combined lines.\nHalf combine = drawn over them at 50%.\nSeparated = a strip of its own.");
                     }
                     if (showLookBtn) {   // look: stroke width and shape ratio
@@ -4910,6 +5866,15 @@ void drawArrange(float belowH, float rightW) {
     if (ImGui::IsMouseHoveringRect(hdrMin, hdrMax) && ImGui::IsMouseClicked(1) && m.y >= yTop[(size_t)nT] && !ImGui::IsPopupOpen("##track_ctx")) { g_ctxTrack = -1; ImGui::OpenPopup("##track_ctx"); }
     if (ImGui::BeginPopup("##track_ctx")) {
         if (ImGui::MenuItem("Add Csound track")) { g_selTrack = addLangTrack(0); g_selClip = -1; }
+        if (ImGui::MenuItem("Add SuperCollider track")) { g_selTrack = addPlaceholderTrack(true); g_selClip = -1; }
+        if (ImGui::IsItemHovered()) helpTip("Empty placeholder. SuperCollider playback is not implemented yet.");
+        if (ImGui::MenuItem("Add Pure Data track")) { g_selTrack = addPlaceholderTrack(false); g_selClip = -1; }
+        if (ImGui::IsItemHovered()) helpTip("Empty placeholder. Pure Data playback is not implemented yet.");
+        ImGui::Separator();
+        if (ImGui::MenuItem("Add VSTi")) { g_selTrack = addVstTrack(true); g_selClip = -1; }
+        if (ImGui::IsItemHovered()) helpTip("A VST3 instrument with MIDI input and parameter automation.");
+        if (ImGui::MenuItem("Add VSTe")) { g_selTrack = addVstTrack(false); g_selClip = -1; }
+        if (ImGui::IsItemHovered()) helpTip("A VST3 effect with audio input and parameter automation.");
         ImGui::Separator();
         if (ImGui::MenuItem("Add graph track")) { g_selTrack = addFreeAutomationTrack(); g_selClip = -1; }
         if (ImGui::IsItemHovered()) helpTip("An automation lane that is not linked to a clip. Its Csound channel is the track name: read it anywhere with  kVal chnget \"Name\".");
@@ -4987,10 +5952,30 @@ void drawArrange(float belowH, float rightW) {
             if (ImGui::ColorEdit3("##clip_ctx_color", rgb, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel))
                 clip->color = 0x01000000u | ((uint32_t)std::lround(rgb[0] * 255.f) << 16) |
                               ((uint32_t)std::lround(rgb[1] * 255.f) << 8) | (uint32_t)std::lround(rgb[2] * 255.f);
+            ImGui::SetNextItemWidth(S(120));
+            double clipStart = clip->start;
+            if (ImGui::InputDouble("Start (s)##clip_timing", &clipStart, 0.0, 0.0, "%.3f")) clip_timing::moveCodeClip(g_proj, *clip, clipStart);
+            ImGui::SetNextItemWidth(S(120));
+            double clipDur = clip->dur;
+            if (ImGui::InputDouble("Duration (s)##clip_timing", &clipDur, 0.0, 0.0, "%.3f")) clip->dur = clip_timing::duration(clipDur, clip->dur, 0.001);
+            drawClipQMenu();
             ImGui::Separator();
             if (ImGui::MenuItem("Edit this clip's code")) { clip->editorOpen = true; ImGui::CloseCurrentPopup(); }
-            if (ImGui::MenuItem("Open this clip's MIDI editor", nullptr, false, parseClip(*clip).midiEnabled)) {
-                openMidiEditorFor(laneIndex, *clip);
+            if (ImGui::MenuItem("Add MIDI clip", nullptr, false, g_proj.tracks[(size_t)laneIndex].kind == 0 || g_proj.tracks[(size_t)laneIndex].kind == 3)) {
+                historyFlush();
+                Track& lane = g_proj.tracks[(size_t)laneIndex];
+                clip->midiEnabled = true;
+                syncSharedCode(*clip);
+                MidiClip mc;
+                mc.id = newMidiId();
+                mc.clipId = clip->id;
+                mc.name = clip->name;
+                mc.start = clip->start;
+                mc.dur = std::max(0.01, clip->dur);
+                lane.midiClips.push_back(mc);
+                lane.midiHidden = false;
+                g_collapsedAuto.erase(lane.id);
+                historyFlush();
                 ImGui::CloseCurrentPopup();
             }
             if (ImGui::MenuItem("Duplicate (same instrument)", "Ctrl+D")) {
@@ -5004,14 +5989,6 @@ void drawArrange(float belowH, float rightW) {
                     if (lane.clips[(size_t)ci].id == g_ctxClipId) { duplicateClipAsNew(laneIndex, ci); break; }
                 ImGui::CloseCurrentPopup();
             }
-            if (ImGui::BeginMenu("Score")) { drawClipScoreMenu(*clip, &g_proj.tracks[(size_t)laneIndex]); ImGui::EndMenu(); }
-            if (ImGui::MenuItem("Use as lane template", nullptr, false, true)) {
-                g_proj.tracks[(size_t)laneIndex].code = clip->code;
-                g_proj.tracks[(size_t)laneIndex].templateMidiEnabled = clip->midiEnabled;
-                g_proj.tracks[(size_t)laneIndex].templatePFieldRules = clip->pFieldRules;
-                ImGui::CloseCurrentPopup();
-            }
-            if (ImGui::IsItemHovered()) helpTip("New clips double-clicked on this lane start from this code");
             ImGui::Separator();
             if (ImGui::MenuItem("Delete clip", "Del")) {
                 Track& lane = g_proj.tracks[(size_t)laneIndex];
@@ -5038,9 +6015,16 @@ void drawArrange(float belowH, float rightW) {
             Track& lane = g_proj.tracks[(size_t)midiLane];
             const Clip* current = findClip(mc->clipId);
             ImGui::TextDisabled("MIDI clip  ->  %s", current ? current->name.c_str() : "(no instrument)");
+            ImGui::SetNextItemWidth(S(120));
+            double start = mc->start;
+            if (ImGui::InputDouble("Start (s)##midi_clip_timing", &start, 0.0, 0.0, "%.3f")) mc->start = clip_timing::nonnegative(start, mc->start);
+            ImGui::SetNextItemWidth(S(120));
+            double dur = mc->dur;
+            if (ImGui::InputDouble("Duration (s)##midi_clip_timing", &dur, 0.0, 0.0, "%.3f")) mc->dur = clip_timing::duration(dur, mc->dur, 0.01);
+            drawClipQMenu();
             ImGui::Separator();
-            if (ImGui::MenuItem("Open piano roll")) { mc->editorOpen = true; ImGui::CloseCurrentPopup(); }
-            if (g_selMidiClips.size() > 1 && ImGui::MenuItem("Open the selected clips in ONE piano roll", "Enter")) {
+            if (ImGui::MenuItem("Open")) { mc->editorOpen = true; ImGui::CloseCurrentPopup(); }
+            if (g_selMidiClips.size() > 1 && ImGui::MenuItem("Open selected clips together", "Enter")) {
                 g_multiMidiIds.assign(g_selMidiClips.begin(), g_selMidiClips.end());
                 g_multiMidiOpen = true;
                 ImGui::CloseCurrentPopup();
@@ -5138,7 +6122,7 @@ void drawArrange(float belowH, float rightW) {
                     }
                     if (changed && rsOrig.size() == rsIdx.size() && !rsOrig.empty()) {
                         const ParsedTrack parsed = parseTrack(*laneTrack);
-                        const CawParam* param = laneTrack->kind == 0 ? laneParameter(parsed, g_autoSelChannel) : nullptr;
+                        const CawParam* param = hasClips(*laneTrack) ? laneParameter(parsed, g_autoSelChannel) : nullptr;
                         double vMin = rsOrig[0].v, vMax = rsOrig[0].v;
                         for (const AutoPoint& q : rsOrig) { vMin = std::min(vMin, q.v); vMax = std::max(vMax, q.v); }
                         const double center = (vMin + vMax) * 0.5, half = (vMax - vMin) * 0.5;
@@ -5197,7 +6181,7 @@ void drawArrange(float belowH, float rightW) {
         dl->AddRectFilled(hBarA, hBarB, IM_COL32(26, 26, 30, 255));
         dl->AddRectFilled(ImVec2(bodyMax.x, bodyMax.y), ImVec2(bodyMax.x + sb, bodyMax.y + sb), IM_COL32(33, 33, 37, 255));
         const float vTop = bodyMin.y + (maxY > 0.f ? g_scrollY / maxY * vRange : 0.f);
-        const float hLeft = bodyMin.x + (maxX > 0.0 ? (float)(g_scrollX / maxX) * hRange : 0.f);
+        const float hLeft = bodyMin.x + (scrollSpan > 0.0 ? (float)std::min(1.0, std::max(0.0, (g_scrollX - minX) / scrollSpan)) * hRange : 0.f);
         const ImVec2 vt0(vBarA.x + S(2), vTop), vt1(vBarB.x - S(2), vTop + vThumbLen);
         const ImVec2 ht0(hLeft, hBarA.y + S(2)), ht1(hLeft + hThumbLen, hBarB.y - S(2));
         auto thumbCol = [&](const ImVec2& a, const ImVec2& b, bool active) {
@@ -5222,6 +6206,25 @@ void drawArrange(float belowH, float rightW) {
     dl->AddLine(ImVec2(bodyMin.x, org.y), ImVec2(bodyMin.x, bodyMax.y), IM_COL32(12, 12, 14, 255), S(2));
     dl->AddLine(ImVec2(org.x, bodyMin.y), ImVec2(bodyMax.x, bodyMin.y), IM_COL32(12, 12, 14, 255), S(2));
 
+    if (inBody && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
+        (g_tool == Tool::Cut || g_tool == Tool::Pen || g_tool == Tool::Pen2)) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+        ImDrawList* fg = ImGui::GetForegroundDrawList();
+        const ImU32 ink = IM_COL32(240, 240, 244, 255), shadow = IM_COL32(8, 8, 10, 230);
+        if (g_tool == Tool::Cut) {
+            const ImVec2 a(m.x + S(5), m.y + S(14)), b(m.x + S(13), m.y + S(14));
+            fg->AddLine(ImVec2(m.x + S(6), m.y + S(12)), ImVec2(m.x + S(17), m.y + S(1)), shadow, S(4));
+            fg->AddLine(ImVec2(m.x + S(12), m.y + S(12)), ImVec2(m.x + S(1), m.y + S(1)), shadow, S(4));
+            fg->AddLine(ImVec2(m.x + S(6), m.y + S(12)), ImVec2(m.x + S(17), m.y + S(1)), ink, S(1.7f));
+            fg->AddLine(ImVec2(m.x + S(12), m.y + S(12)), ImVec2(m.x + S(1), m.y + S(1)), ink, S(1.7f));
+            fg->AddCircle(a, S(3), ink, 12, S(1.7f)); fg->AddCircle(b, S(3), ink, 12, S(1.7f));
+        } else {
+            const ImVec2 tip(m.x, m.y), back(m.x + S(13), m.y - S(13));
+            fg->AddLine(tip, back, shadow, S(6));
+            fg->AddLine(tip, back, ink, S(3));
+            fg->AddTriangleFilled(tip, ImVec2(m.x + S(3), m.y - S(6)), ImVec2(m.x + S(6), m.y - S(3)), IM_COL32(237, 128, 38, 255));
+        }
+    }
     ImGui::SetCursorScreenPos(org);
     ImGui::Dummy(avail);
     endChildTight();
@@ -5287,7 +6290,7 @@ void drawConsolePanel(ImDrawList* dl, const PRect& r, ImU32 panel, ImU32 frame, 
         ImGui::Separator();
         ImGui::TextDisabled("Clip");
         ImGui::SetNextItemWidth(S(200));
-        if (ImGui::BeginCombo("##logclip", g_logClip.empty() ? "All clips" : g_logClip.c_str())) {
+        if (caw_ui::beginCombo("##logclip", g_logClip.empty() ? "All clips" : g_logClip.c_str())) {
             if (ImGui::Selectable("All clips", g_logClip.empty())) g_logClip.clear();
             for (const Track& t : g_proj.tracks)
                 for (const Clip& c : t.clips)
@@ -5360,18 +6363,16 @@ void drawMeterPanel(float dt, float width, float belowH) {
         g_dispDb.assign((size_t)masterN, -90.f);
         g_holdDb.assign((size_t)masterN, -90.f);
         g_holdT.assign((size_t)masterN, 0.f);
-        g_clip.assign((size_t)masterN, 0);
     }
     for (int ch = 0; ch < masterN; ++ch) {
         const float pk = (g_monAge < 0.5f && (size_t)ch < g_peakIn.size()) ? g_peakIn[(size_t)ch] : 0.f;
         const float d = 20.f * std::log10(std::max(pk, 1e-5f));
-        g_dispDb[(size_t)ch] = std::max(d, g_dispDb[(size_t)ch] - 30.f * dt);
+        g_dispDb[(size_t)ch] = std::max(d, g_dispDb[(size_t)ch] - 36.f * dt);
         if (d >= g_holdDb[(size_t)ch]) { g_holdDb[(size_t)ch] = d; g_holdT[(size_t)ch] = 1.5f; }
         else {
             g_holdT[(size_t)ch] -= dt;
             if (g_holdT[(size_t)ch] <= 0.f) g_holdDb[(size_t)ch] = std::max(d, g_holdDb[(size_t)ch] - 20.f * dt);
         }
-        if (pk >= 1.0f) g_clip[(size_t)ch] = 1;
     }
 
     {   // drag the left edge to resize the panel, double-click = automatic width again
@@ -5381,35 +6382,44 @@ void drawMeterPanel(float dt, float width, float belowH) {
         if (ImGui::IsItemHovered() || active) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) g_meterW = 0.f;
         if (ImGui::IsItemActivated() && g_meterW <= 0.f) g_meterW = width / g_ui;
-        if (active) g_meterW = std::min(700.f, std::max(80.f, g_meterW - ImGui::GetIO().MouseDelta.x / g_ui));
+        if (active) g_meterW = std::min(700.f, std::max(120.f, g_meterW - ImGui::GetIO().MouseDelta.x / g_ui));
         if (active || ImGui::IsItemHovered()) dl->AddLine(ImVec2(org.x + S(2), org.y + S(6)), ImVec2(org.x + S(2), org.y + av.y - S(6)), active ? IM_COL32(237, 128, 38, 255) : IM_COL32(150, 150, 160, 255), S(2));
     }
     const ImVec2 mA(org.x + S(8), org.y + S(8)), mB(org.x + av.x - S(4), org.y + av.y - S(8));
     dl->AddRectFilled(mA, mB, panel, S(4));
     dl->AddRect(mA, mB, frame, S(4));
-    dl->AddText(ImVec2(mA.x + S(6), mA.y + S(3)), label, "MASTER");
     const float fh = ImGui::GetTextLineHeight();
-    const float ledTop = mA.y + S(3) + fh + S(3), ledBot = ledTop + S(9);   // clip LEDs sit below the title, whatever the font size
-    const float barTop = ledBot + S(6) + fh * 0.5f, barBot = mB.y - (fh * 2.f + S(10));
-    const float lo = -60.f, hi = 3.f;
-    auto dbY = [&](float d) { return barBot - (std::min(hi, std::max(lo, d)) - lo) / (hi - lo) * (barBot - barTop); };
     const float gap = S(masterN > 8 ? 2.f : 8.f);
     const float bx0 = mA.x + S(34);
     const float availBars = std::max(S(8), (mB.x - mA.x) - S(34) - S(8));
     const float barW = std::max(S(2), std::min(S(20), (availBars - gap * (float)(masterN - 1)) / (float)masterN));
+    const float barGroupW = barW * masterN + gap * std::max(0, masterN - 1);
+    const float gainBoxW = std::min(std::max(S(42), barW * std::min(masterN, 2) + (masterN > 1 ? gap : 0.f)),
+                                    std::max(S(42), mB.x - bx0));
+    const bool legacyOutput = g_playing && !g_useCsoundApi;
+    if (legacyOutput) ImGui::BeginDisabled();
+    const float dbValue = g_proj.cs.masterGain <= 0.f ? -80.f : 20.f * std::log10(g_proj.cs.masterGain);
+    int db = std::min(6, std::max(-80, (int)std::lround(dbValue)));
+    ImGui::SetCursorScreenPos(ImVec2(bx0 + (barGroupW - gainBoxW) * .5f, mA.y + S(6)));
+    ImGui::SetNextItemWidth(gainBoxW);
+    if (ImGui::DragInt("##master_gain_db", &db, 1.f, -80, 6, "%d", ImGuiSliderFlags_AlwaysClamp)) {
+        g_proj.cs.masterGain = std::pow(10.f, db / 20.f);
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        helpTip(legacyOutput ? "Master gain requires CAW host audio. Restart with the Csound API." : "Master gain in whole dB: drag, or Ctrl-click to type. 0 is unity.");
+    if (legacyOutput) ImGui::EndDisabled();
+    ImGui::SameLine(0, S(3));
+    ImGui::TextDisabled("dB");
+    const float barTop = mA.y + S(12) + ImGui::GetFrameHeight(), barBot = mB.y - (fh * 2.f + S(10));
+    auto dbY = [&](float d) {
+        const float f = std::min(1.f, std::max(0.f, (d + 60.f) / 60.f));
+        return barBot - std::pow(f, 1.8f) * std::max(0.f, barBot - barTop - S(12.f));
+    };
     const bool roomForNumbers = barW + gap >= S(26), roomForLabels = barW + gap >= S(11);
     for (int ch = 0; ch < masterN; ++ch) {
         const float x0 = bx0 + ch * (barW + gap), x1 = x0 + barW;
-        dl->AddRectFilled(ImVec2(x0, barTop), ImVec2(x1, barBot), IM_COL32(24, 24, 27, 255));
-        struct Zone { float a, b; ImU32 c; };
-        const Zone zones[] = {{lo, -12.f, IM_COL32(70, 190, 90, 255)}, {-12.f, -3.f, IM_COL32(225, 195, 60, 255)}, {-3.f, hi, IM_COL32(230, 70, 60, 255)}};
-        for (const Zone& z : zones) {
-            const float top = std::min(z.b, g_dispDb[(size_t)ch]);
-            if (top > z.a) dl->AddRectFilled(ImVec2(x0, dbY(top)), ImVec2(x1, dbY(z.a)), z.c);
-        }
-        const float hy = dbY(g_holdDb[(size_t)ch]);
-        dl->AddLine(ImVec2(x0, hy), ImVec2(x1, hy), IM_COL32(245, 245, 245, 255), S(2));
-        dl->AddRectFilled(ImVec2(x0, ledTop), ImVec2(x1, ledBot), g_clip[(size_t)ch] ? IM_COL32(240, 50, 40, 255) : IM_COL32(50, 24, 24, 255), S(2));
+        const bool clipped = (size_t)ch < g_meterClipHold.size() && g_meterClipHold[(size_t)ch] > 0.f;
+        drawLedMeter(dl, x0, x1, barTop, barBot, g_dispDb[(size_t)ch], clipped, false, true);
         if (roomForNumbers) {
             char buf[16];
             if (g_holdDb[(size_t)ch] < -90.f) std::snprintf(buf, sizeof buf, "-inf");
@@ -5428,12 +6438,13 @@ void drawMeterPanel(float dt, float width, float belowH) {
         const float y = dbY(tk);
         char buf[8];
         std::snprintf(buf, sizeof buf, "%d", (int)tk);
-        if (y - fh * 0.5f > ledBot + S(2)) dl->AddText(ImVec2(mA.x + S(6), y - fh * 0.5f), label, buf);   // never over the LEDs
+        if (y - fh * 0.5f > barTop) dl->AddText(ImVec2(mA.x + S(6), y - fh * 0.5f), label, buf);
         dl->AddLine(ImVec2(bx0 - S(4), y), ImVec2(bx0, y), label);
     }
-    ImGui::SetCursorScreenPos(mA);
-    if (ImGui::InvisibleButton("##meterreset", ImVec2(mB.x - mA.x, mB.y - mA.y))) std::fill(g_clip.begin(), g_clip.end(), (char)0);
-    if (ImGui::IsItemHovered()) helpTip("%d output channel(s) (nchnls in Settings). Click to reset clip indicators", masterN);
+    ImGui::SetCursorScreenPos(ImVec2(mA.x, barTop));
+    if (ImGui::InvisibleButton("##meterreset", ImVec2(mB.x - mA.x, std::max(S(1), mB.y - barTop))))
+        for (int ch = 0; ch < masterN && (size_t)ch < g_meterClipHold.size(); ++ch) g_meterClipHold[(size_t)ch] = 0.f;
+    if (ImGui::IsItemHovered()) helpTip("%d output channel(s). Red clip LEDs hold for 1.5 seconds.", masterN);
     endChildTight();
     ImGui::PopStyleColor();
 }
@@ -5536,34 +6547,21 @@ void drawMonitor(float dt) {
                     active ? IM_COL32(237, 128, 38, 255) : (ImGui::IsItemHovered() ? IM_COL32(150, 150, 160, 255) : IM_COL32(60, 60, 68, 255)), S(2));
     }
 
-    // ---------------- spectrum: light-weight logarithmic filter-bank display
+    // ---------------- audio-rate analyzer: FFT, waveform, or spectrogram
     if (g_viewSpectrum) {
-        g_specFrameClock = std::min(0.5f, g_specFrameClock + std::min(0.25f, std::max(0.f, dt)));
-        const bool update = !g_specFreeze && (g_specDisplay == 0 || g_specFrameClock >= 0.2f);
-        if (update) {
-            const float elapsed = g_specDisplay == 0 ? std::max(0.f, dt) : g_specFrameClock;
-            static const float fall[] = {90.f, 45.f, 20.f};
-            for (int b = 0; b < kMeterBands; ++b) {
-                const float target = (g_monAge < 0.5f && g_haveBands)
-                    ? 20.f * std::log10(std::max(g_bandAmp[b] * 1.4142f, 1e-6f)) : -120.f;
-                if (target > g_specSm[b])
-                    g_specSm[b] += (target - g_specSm[b]) * (1.f - std::exp(-25.f * elapsed));
-                else
-                    g_specSm[b] = std::max(target, g_specSm[b] - fall[g_specFall] * elapsed);
-            }
-            g_specFrameClock = 0.f;
-        }
         const ImVec2 sA = rs.a, sB = rs.b;
         dl->AddRectFilled(sA, sB, IM_COL32(18, 21, 24, 255), S(5));
         dl->AddRect(sA, sB, IM_COL32(43, 49, 53, 255), S(5));
-        dl->AddText(ImVec2(sA.x + S(10), sA.y + S(5)), IM_COL32(192, 200, 202, 255), "SPECTRUM");
+        dl->AddText(ImVec2(sA.x + S(10), sA.y + S(5)), IM_COL32(192, 200, 202, 255),
+                    g_analyzerMode == 0 ? (g_specStyle == 0 ? "PEAK EST." : "SPECTRUM") : g_analyzerMode == 1 ? "WAVEFORM" : "SPECTROGRAM");
+        const bool spectrumAvailable = (int)g_fftDb.size() == monitor_fft::bins && (g_rawAge < 0.6f || g_specFreeze);
         if (sB.x - sA.x > S(180)) {
-            const char* state = g_specFreeze ? "HOLD" : g_specDisplay ? "FRAMES" : "LIVE";
+            const char* state = g_specFreeze ? "HOLD" : g_rawAge < 0.6f ? "LIVE" : "WAIT";
             dl->AddText(ImVec2(sB.x - S(58), sA.y + S(5)), IM_COL32(111, 181, 171, 255), state);
         }
-        const float x0 = sA.x + S(33), x1 = sB.x - S(10), py0 = sA.y + S(28), py1 = sB.y - S(22);
+        const float x0 = sA.x + S(36), x1 = sB.x - S(18), py0 = sA.y + S(30), py1 = sB.y - S(24);
         const float w = x1 - x0, h = py1 - py0;
-        const float analysisMax = std::max(100.f, std::min(18000.f, sr * 0.45f));
+        const float analysisMax = std::max(100.f, std::min(18000.f, g_rawSampleRate * 0.5f));
         const float fHi = std::max(50.f, std::min(g_specMaxHz, analysisMax));
         const float fLo = std::max(25.f, std::min(g_specMinHz, fHi - 1.f));
         const bool logarithmic = g_specScale == 0;
@@ -5571,8 +6569,10 @@ void drawMonitor(float dt) {
         auto dy = [&](float d) { return py1 - monitor_math::clamp01((d - g_specDbFloor) / -g_specDbFloor) * h; };
         if (w > S(40) && h > S(35)) {
             ImGui::PushClipRect(sA, sB, true);
+            if (g_analyzerMode == 0) {
             if (g_specGrid) {
-                for (int d = 0; d >= (int)g_specDbFloor; d -= 30) {
+                const int gridStep = h >= S(230) ? 12 : 24;
+                for (int d = 0; d >= (int)g_specDbFloor; d -= gridStep) {
                     const float yy = dy((float)d);
                     dl->AddLine(ImVec2(x0, yy), ImVec2(x1, yy), IM_COL32(48, 55, 58, 140));
                     char txt[12]; std::snprintf(txt, sizeof txt, "%d", d);
@@ -5588,42 +6588,211 @@ void drawMonitor(float dt) {
                     char txt[12];
                     if (f >= 1000.f) std::snprintf(txt, sizeof txt, "%gk", f / 1000.f);
                     else std::snprintf(txt, sizeof txt, "%.0f", f);
-                    dl->AddText(ImVec2(px - S(5), py1 + S(4)), IM_COL32(103, 115, 118, 255), txt);
+                    const float textW = ImGui::CalcTextSize(txt).x;
+                    const float textX = std::max(sA.x + S(3), std::min(px - textW * 0.5f, sB.x - textW - S(3)));
+                    dl->AddText(ImVec2(textX, py1 + S(4)), IM_COL32(125, 137, 139, 255), txt);
                     prevX = px;
                 }
             }
-            const int desired = g_specDetail == 0 ? 72 : g_specDetail == 1 ? 144 : 256;
-            const int samples = std::max(16, std::min(desired, (int)(w / std::max(1.f, S(1)))));
+            // Optional detailed FFT line. The default is narrower 1/6-octave columns.
+            const int samples = std::max(16, std::min(1600, (int)w));
             std::vector<ImVec2> curve;
-            curve.reserve((size_t)samples + 1);
-            for (int j = 0; j <= samples; ++j) {
+            if (g_specStyle == 2 && spectrumAvailable) {
+              curve.reserve((size_t)samples + 1);
+              for (int j = 0; j <= samples; ++j) {
                 const float u = (float)j / samples;
                 const float freq = monitor_math::frequencyAt(u, fLo, fHi, logarithmic);
-                const float band = (float)((kMeterBands - 1) * std::log(freq / 25.f) / std::log(18000.f / 25.f));
-                const float v = monitor_math::sample(g_specSm, kMeterBands, band, g_specInterpolation == 1);
+                const float nextFreq = monitor_math::frequencyAt(std::min(1.f, (float)(j + 1) / samples), fLo, fHi, logarithmic);
+                const float bin = freq * monitor_fft::fftSize / g_rawSampleRate;
+                const float nextBin = nextFreq * monitor_fft::fftSize / g_rawSampleRate;
+                float v = g_specDbFloor;
+                if (spectrumAvailable) {
+                    v = std::max(monitor_math::sample(g_fftDb.data(), monitor_fft::bins, bin, false),
+                                 monitor_math::sample(g_fftDb.data(), monitor_fft::bins, nextBin, false));
+                    int a = std::max(0, (int)std::ceil(bin)), b = std::min(monitor_fft::bins - 1, (int)std::floor(nextBin));
+                    for (int k = a; k <= b; ++k) v = std::max(v, g_fftDb[(size_t)k]);
+                }
                 const float xx = x0 + u * w, yy = dy(v);
                 curve.push_back(ImVec2(xx, yy));
-                if (g_specStyle == 0 && j < samples && yy < py1 - 1.f) {
-                    const float next = x0 + (float)(j + 1) / samples * w + 0.25f;
-                    dl->AddRectFilledMultiColor(ImVec2(xx, yy), ImVec2(next, py1),
-                        IM_COL32(82, 197, 176, 70), IM_COL32(82, 197, 176, 70),
-                        IM_COL32(82, 197, 176, 4), IM_COL32(82, 197, 176, 4));
-                }
+              }
             }
-            if (curve.size() > 1) dl->AddPolyline(curve.data(), (int)curve.size(), IM_COL32(135, 223, 204, 240), 0, S(1.5f));
+            if (spectrumAvailable) {
+                if (g_specStyle == 0) {
+                    for (const auto& peak : g_tonePeaks) {
+                        const auto bounds = monitor_peaks::visualBounds(peak);
+                        if (bounds.second <= fLo || bounds.first >= fHi || peak.db <= g_specDbFloor) continue;
+                        const float a = fx((float)std::max<double>(fLo, bounds.first));
+                        const float b = fx((float)std::min<double>(fHi, bounds.second));
+                        if (b > a) dl->AddRectFilled(ImVec2(a, dy((float)peak.db)),
+                                                     ImVec2(b, py1), IM_COL32(121, 215, 192, 240));
+                    }
+                    if (w > S(360)) dl->AddText(ImVec2(x0 + S(4), py0 + S(5)), IM_COL32(128, 151, 145, 255),
+                                                "TONAL PEAKS  |  ESTIMATE");
+                } else if (g_specStyle == 3) {
+                    for (const auto& band : g_columnBands) {
+                        if (band.hi <= fLo || band.lo >= fHi || band.db <= g_specDbFloor) continue;
+                        const float a = fx((float)std::max<double>(fLo, band.lo));
+                        const float b = fx((float)std::min<double>(fHi, band.hi));
+                        if (b <= a) continue;
+                        // Each bar fills its own 1/6-octave interval. Shared
+                        // edges meet, without altering the logarithmic axis.
+                        dl->AddRectFilled(ImVec2(a, dy((float)band.db)),
+                                          ImVec2(b, py1), IM_COL32(121, 215, 192, 240));
+                    }
+                    if (w > S(360)) dl->AddText(ImVec2(x0 + S(4), py0 + S(5)), IM_COL32(128, 151, 145, 255),
+                                                "1/6 OCT ENERGY  |  dBFS");
+                } else if (g_specStyle == 1 && !g_spectrumBands.empty()) {
+                    // Smoothly connect measured 1/3-octave band powers. The
+                    // cubic interpolation is bounded to avoid invented peaks.
+                    std::vector<float> levels;
+                    for (const auto& band : g_spectrumBands) levels.push_back((float)band.db);
+                    std::vector<ImVec2> outline;
+                    outline.reserve((size_t)samples + 1);
+                    for (int j = 0; j <= samples; ++j) {
+                        const float u = (float)j / samples;
+                        const float freq = monitor_math::frequencyAt(u, fLo, fHi, logarithmic);
+                        const float idx = (float)(3.0 * std::log(freq / g_spectrumBands.front().center) / std::log(2.0));
+                        const float db = monitor_math::sample(levels.data(), (int)levels.size(), idx, true);
+                        const float xx = x0 + u * w, yy = dy(db);
+                        outline.push_back(ImVec2(xx, yy));
+                        if (j < samples && yy < py1)
+                            dl->AddRectFilled(ImVec2(xx, yy), ImVec2(x0 + (float)(j + 1) * w / samples + 0.2f, py1), IM_COL32(121, 215, 192, 170));
+                    }
+                    if (outline.size() > 1) dl->AddPolyline(outline.data(), (int)outline.size(), IM_COL32(160, 235, 213, 245), 0, S(1.f));
+                    if (w > S(360)) dl->AddText(ImVec2(x0 + S(4), py0 + S(5)), IM_COL32(128, 151, 145, 255), "COMBINED 1/3 OCT");
+                } else if (curve.size() > 1) {
+                    dl->AddPolyline(curve.data(), (int)curve.size(), IM_COL32(150, 229, 207, 245), 0, S(1.5f));
+                }
+                const int loBin = std::max(1, (int)std::ceil(fLo * monitor_fft::fftSize / g_rawSampleRate));
+                const int hiBin = std::min(monitor_fft::bins - 2, (int)std::floor(fHi * monitor_fft::fftSize / g_rawSampleRate));
+                if (hiBin >= loBin) {
+                    const auto it = std::max_element(g_fftDb.begin() + loBin, g_fftDb.begin() + hiBin + 1);
+                    const int peak = (int)(it - g_fftDb.begin());
+                    if (*it > g_specDbFloor + 3.f) {
+                        const float a = g_fftDb[(size_t)peak - 1], b = *it, c = g_fftDb[(size_t)peak + 1];
+                        const float denom = a - 2 * b + c;
+                        const float delta = std::abs(denom) > 1e-9f ? std::max(-0.5f, std::min(0.5f, 0.5f * (a - c) / denom)) : 0.f;
+                        const float peakHz = (peak + delta) * g_rawSampleRate / monitor_fft::fftSize;
+                        const float peakDb = b - 0.25f * (a - c) * delta;
+                        if (g_specStyle == 2)
+                            dl->AddCircleFilled(ImVec2(fx(peakHz), dy(peakDb)), S(2.5f), IM_COL32(192, 243, 227, 255));
+                        char readout[80];
+                        std::snprintf(readout, sizeof readout, "%s  %.1f Hz   %.1f dBFS", g_fftChannel == 0 ? "L" : g_fftChannel == 1 ? "R" : "MID", peakHz, peakDb);
+                        const float tw = ImGui::CalcTextSize(readout).x;
+                        if (tw + S(12) < w) dl->AddText(ImVec2(x1 - tw, py0 + S(5)), IM_COL32(166, 191, 184, 255), readout);
+                    }
+                }
+            } else {
+                dl->AddText(ImVec2(x0 + S(8), py0 + S(8)), IM_COL32(115, 129, 128, 255), "Waiting for complete audio frame");
+            }
+            } else if (g_analyzerMode == 1 && g_haveRaw && (g_rawAge < 0.6f || g_specFreeze)) {
+                std::vector<ImVec2> points;
+                points.reserve(monitor_fft::size);
+                const float* waveformLeft = g_specFreeze ? g_analyzerFrozenLeft : g_rawLeft;
+                const float* waveformRight = g_specFreeze ? g_analyzerFrozenRight : g_rawRight;
+                for (int i = 0; i < monitor_fft::size; ++i) {
+                    const float v = g_fftChannel == 1 ? waveformRight[i] : g_fftChannel == 2 ? (waveformLeft[i] + waveformRight[i]) * 0.5f : waveformLeft[i];
+                    points.emplace_back(x0 + w * i / (monitor_fft::size - 1.f), (py0 + py1) * 0.5f - std::max(-1.f, std::min(1.f, v)) * h * 0.48f);
+                }
+                dl->AddPolyline(points.data(), (int)points.size(), IM_COL32(135, 223, 204, 240), 0, S(1));
+                char duration[64]; std::snprintf(duration, sizeof duration, "%.1f ms, sample-level", 1000.0 * monitor_fft::size / g_rawSampleRate);
+                dl->AddText(ImVec2(x0, py1 + S(3)), IM_COL32(103, 115, 118, 255), duration);
+            } else if (g_analyzerMode == 2 && !g_fftHistory.empty() && (g_playing || g_specFreeze)) {
+                const int rows = std::min(100, std::max(16, (int)h));
+                for (size_t col = 0; col < g_fftHistory.size(); ++col) {
+                    const float xa = x0 + w * (float)col / g_fftHistory.size();
+                    const float xb = x0 + w * (float)(col + 1) / g_fftHistory.size() + 1;
+                    for (int row = 0; row < rows; ++row) {
+                        const float u = (float)row / rows;
+                        const float hz = monitor_math::frequencyAt(u, fLo, fHi, logarithmic);
+                        const float hz2 = monitor_math::frequencyAt((float)(row + 1) / rows, fLo, fHi, logarithmic);
+                        const int a = std::max(0, (int)std::floor(hz * monitor_fft::fftSize / g_rawSampleRate));
+                        const int b = std::min(monitor_fft::bins - 1, (int)std::ceil(hz2 * monitor_fft::fftSize / g_rawSampleRate));
+                        float db = g_specDbFloor;
+                        for (int k = a; k <= b; ++k) db = std::max(db, g_fftHistory[col][(size_t)k]);
+                        const float q = monitor_math::clamp01((db - g_specDbFloor) / -g_specDbFloor);
+                        const ImU32 color = IM_COL32((int)(q * 240), (int)(q * q * 180), (int)(q * 110), 255);
+                        dl->AddRectFilled(ImVec2(xa, py1 - h * (row + 1) / rows), ImVec2(xb, py1 - h * row / rows + 1), color);
+                    }
+                }
+                dl->AddText(ImVec2(x0, py1 + S(3)), IM_COL32(103, 115, 118, 255), "older                         now");
+                char high[16], low[16];
+                std::snprintf(high, sizeof high, "%.0fk", fHi / 1000.f);
+                std::snprintf(low, sizeof low, "%.0f", fLo);
+                dl->AddText(ImVec2(sA.x + S(4), py0), IM_COL32(145, 155, 158, 255), high);
+                dl->AddText(ImVec2(sA.x + S(4), py1 - S(12)), IM_COL32(145, 155, 158, 255), low);
+            }
             ImGui::PopClipRect();
         }
         ImGui::SetCursorScreenPos(ImVec2(sA.x, sA.y + S(22)));
         ImGui::InvisibleButton("##specmenu", ImVec2(std::max(1.f, sB.x - sA.x), std::max(1.f, sB.y - sA.y - S(22))));
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        if (g_analyzerMode == 0 && spectrumAvailable && ImGui::IsItemHovered() &&
+            mouse.x >= x0 && mouse.x <= x1 && mouse.y >= py0 && mouse.y <= py1) {
+            const float freq = monitor_math::frequencyAt((mouse.x - x0) / w, fLo, fHi, logarithmic);
+            dl->AddLine(ImVec2(mouse.x, py0), ImVec2(mouse.x, py1), IM_COL32(165, 190, 182, 105));
+            if (g_specStyle == 0) {
+                const monitor_peaks::Peak* closest = nullptr;
+                double distance = 1e30;
+                for (const auto& peak : g_tonePeaks) {
+                    const auto bounds = monitor_peaks::visualBounds(peak);
+                    if (freq < bounds.first || freq > bounds.second) continue;
+                    const double d = std::abs(std::log(freq / peak.frequency));
+                    if (d < distance) { distance = d; closest = &peak; }
+                }
+                if (closest) ImGui::SetTooltip("%.1f Hz  |  %.1f dBFS\nEstimated tonal peak; visual width is not measured bandwidth.",
+                                               closest->frequency, closest->db);
+            } else if (g_specStyle == 3) {
+                const auto found = std::find_if(g_columnBands.begin(), g_columnBands.end(),
+                    [freq](const monitor_bands::Band& band) { return freq >= band.lo && freq < band.hi; });
+                if (found != g_columnBands.end())
+                    ImGui::SetTooltip("%.1f Hz band  |  %.1f dBFS\n%.1f to %.1f Hz; peak-sine reference", found->center, found->db, found->lo, found->hi);
+            } else if (g_specStyle == 1 && !g_spectrumBands.empty()) {
+                std::vector<float> levels;
+                for (const auto& band : g_spectrumBands) levels.push_back((float)band.db);
+                const float idx = (float)(3.0 * std::log(freq / g_spectrumBands.front().center) / std::log(2.0));
+                const float db = monitor_math::sample(levels.data(), (int)levels.size(), idx, true);
+                ImGui::SetTooltip("%.1f Hz   %.1f dBFS\nInterpolated 1/3-octave band-energy shape", freq, db);
+            } else {
+                const float bin = freq * monitor_fft::fftSize / g_rawSampleRate;
+                const float db = monitor_math::sample(g_fftDb.data(), monitor_fft::bins, bin, false);
+                ImGui::SetTooltip("%.1f Hz   %.1f dBFS\nHann-window FFT sample", freq, db);
+            }
+        }
         if (ImGui::BeginPopupContextItem("##specmenu_popup")) {
-            ImGui::TextDisabled("SPECTRUM");
+            ImGui::TextDisabled("AUDIO ANALYZER");
             ImGui::Separator();
-            ImGui::MenuItem("Hold display", nullptr, &g_specFreeze);
-            if (ImGui::BeginMenu("Update")) {
-                if (ImGui::MenuItem("Continuous", nullptr, g_specDisplay == 0)) g_specDisplay = 0;
-                if (ImGui::MenuItem("Frames (5 / sec)", nullptr, g_specDisplay == 1)) g_specDisplay = 1;
+            if (g_analyzerMode == 0) {
+                ImGui::TextDisabled("SPECTRUM STYLE");
+                if (ImGui::MenuItem("Tonal peaks (smooth position, estimated)", nullptr, g_specStyle == 0)) { g_specStyle = 0; updateSpectrumDerived(); }
+                if (ImGui::MenuItem("Measured band-energy columns", nullptr, g_specStyle == 3)) { g_specStyle = 3; updateSpectrumDerived(); }
+                if (ImGui::MenuItem("Combined shape", nullptr, g_specStyle == 1)) { g_specStyle = 1; updateSpectrumDerived(); }
+                if (ImGui::MenuItem("Detailed FFT line", nullptr, g_specStyle == 2)) g_specStyle = 2;
+                ImGui::Separator();
+            }
+            bool hold = g_specFreeze;
+            if (ImGui::MenuItem("Hold display", nullptr, &hold)) {
+                if (hold) {
+                    std::copy(g_rawLeft, g_rawLeft + monitor_fft::size, g_analyzerFrozenLeft);
+                    std::copy(g_rawRight, g_rawRight + monitor_fft::size, g_analyzerFrozenRight);
+                    if (g_haveRaw) { analyzeCurrentRaw(); updateSpectrumDerived(); }
+                }
+                g_specFreeze = hold;
+            }
+            if (ImGui::BeginMenu("View")) {
+                if (ImGui::MenuItem("Spectrum", nullptr, g_analyzerMode == 0)) { g_analyzerMode = 0; updateSpectrumDerived(); }
+                if (ImGui::MenuItem("Waveform", nullptr, g_analyzerMode == 1)) g_analyzerMode = 1;
+                if (ImGui::MenuItem("Spectrogram", nullptr, g_analyzerMode == 2)) { if (g_analyzerMode != 2) g_fftHistory.clear(); g_analyzerMode = 2; }
                 ImGui::EndMenu();
             }
+            ImGui::BeginDisabled(g_specFreeze);
+            if (ImGui::BeginMenu("Input")) {
+                if (ImGui::MenuItem("Left", nullptr, g_fftChannel == 0)) { g_fftChannel = 0; g_fftHistory.clear(); g_fftDb.clear(); g_spectrumBands.clear(); g_columnBands.clear(); g_tonePeaks.clear(); }
+                if (ImGui::MenuItem("Right", nullptr, g_fftChannel == 1)) { g_fftChannel = 1; g_fftHistory.clear(); g_fftDb.clear(); g_spectrumBands.clear(); g_columnBands.clear(); g_tonePeaks.clear(); }
+                if (ImGui::MenuItem("Mid (L + R) / 2", nullptr, g_fftChannel == 2)) { g_fftChannel = 2; g_fftHistory.clear(); g_fftDb.clear(); g_spectrumBands.clear(); g_columnBands.clear(); g_tonePeaks.clear(); }
+                ImGui::EndMenu();
+            }
+            ImGui::EndDisabled();
             if (ImGui::BeginMenu("Frequency scale")) {
                 if (ImGui::MenuItem("Logarithmic", nullptr, g_specScale == 0)) g_specScale = 0;
                 if (ImGui::MenuItem("Linear", nullptr, g_specScale == 1)) g_specScale = 1;
@@ -5645,29 +6814,14 @@ void drawMonitor(float dt) {
                 }
                 ImGui::EndMenu();
             }
-            if (ImGui::BeginMenu("Response")) {
-                if (ImGui::MenuItem("Fast", nullptr, g_specFall == 0)) g_specFall = 0;
-                if (ImGui::MenuItem("Balanced", nullptr, g_specFall == 1)) g_specFall = 1;
-                if (ImGui::MenuItem("Slow", nullptr, g_specFall == 2)) g_specFall = 2;
-                ImGui::EndMenu();
-            }
-            if (ImGui::BeginMenu("Interpolation")) {
-                if (ImGui::MenuItem("Linear", nullptr, g_specInterpolation == 0)) g_specInterpolation = 0;
-                if (ImGui::MenuItem("Cubic", nullptr, g_specInterpolation == 1)) g_specInterpolation = 1;
-                ImGui::EndMenu();
-            }
             if (ImGui::BeginMenu("Appearance")) {
-                if (ImGui::MenuItem("Fill + line", nullptr, g_specStyle == 0)) g_specStyle = 0;
-                if (ImGui::MenuItem("Line", nullptr, g_specStyle == 1)) g_specStyle = 1;
                 ImGui::MenuItem("Grid", nullptr, &g_specGrid);
-                ImGui::Separator();
-                if (ImGui::MenuItem("Economy drawing", nullptr, g_specDetail == 0)) g_specDetail = 0;
-                if (ImGui::MenuItem("Balanced drawing", nullptr, g_specDetail == 1)) g_specDetail = 1;
-                if (ImGui::MenuItem("Fine drawing", nullptr, g_specDetail == 2)) g_specDetail = 2;
                 ImGui::EndMenu();
             }
             ImGui::Separator();
-            ImGui::TextDisabled("Live filter-bank estimate, not an FFT.");
+            ImGui::TextDisabled("2048-sample Hann, 4x zero padded.");
+            ImGui::TextDisabled("Observation spacing %.2f Hz; zero padding does not improve resolution.", (float)g_rawSampleRate / monitor_fft::size);
+            ImGui::TextDisabled("Tonal peaks are estimates; use band energy for unsuppressed data.");
             ImGui::EndPopup();
         }
     }
@@ -5679,7 +6833,7 @@ void drawMonitor(float dt) {
         dl->AddRect(cA, cB, IM_COL32(43, 49, 53, 255), S(5));
         dl->AddText(ImVec2(cA.x + S(10), cA.y + S(5)), IM_COL32(192, 200, 202, 255), "SIGNAL");
         if (cB.x - cA.x > S(150)) {
-            const char* state = g_scopeFreeze ? "HOLD" : g_scopeDisplay ? "FRAMES" : "LIVE";
+            const char* state = g_scopeFreeze ? "HOLD" : g_rawAge >= 0.6f ? "WAIT" : g_scopeDisplay ? "TRIG" : "LIVE";
             dl->AddText(ImVec2(cB.x - S(58), cA.y + S(5)), IM_COL32(111, 181, 171, 255), state);
         }
         const float x0 = cA.x + S(10), x1 = cB.x - S(10), py0 = cA.y + S(28), py1 = cB.y - S(20);
@@ -5696,47 +6850,42 @@ void drawMonitor(float dt) {
                                 i == 0 ? IM_COL32(68, 79, 81, 180) : IM_COL32(44, 51, 54, 125));
                 }
             }
-            const bool available = g_scopeFreeze ? g_scopeFrozenHasFrame : (g_scopeHasFrame && g_monAge < 0.5f);
-            const float* left = g_scopeFreeze ? g_scopeFrozenL : g_scopeL;
-            const float* right = g_scopeFreeze ? g_scopeFrozenR : g_scopeR;
+            const bool available = g_scopeFreeze ? g_scopeFrozenHasFrame : (g_haveRaw && g_rawAge < 0.6f);
+            const float* left = g_scopeFreeze ? g_rawFrozenLeft : g_rawLeft;
+            const float* right = g_scopeFreeze ? g_rawFrozenRight : g_rawRight;
             if (available) {
-                if (!g_scopeFreeze && g_scopeDisplay == 0) {
-                    const float alpha = 1.f - std::exp(-std::min(0.25f, std::max(0.f, dt)) * 28.f);
-                    for (int i = 0; i < kScopePoints; ++i) {
-                        g_scopeDisplayL[i] += (left[i] - g_scopeDisplayL[i]) * alpha;
-                        g_scopeDisplayR[i] += (right[i] - g_scopeDisplayR[i]) * alpha;
-                    }
-                    left = g_scopeDisplayL;
-                    right = g_scopeDisplayR;
-                }
-                const float trigger = g_scopeDisplay == 1 ? monitor_math::triggerStart(left, right, kScopePoints) : 0.f;
-                const int count = g_scopeSmooth == 0 ? kScopePoints : g_scopeSmooth == 1 ? 192 : 320;
-                const bool cubic = g_scopeSmooth != 0;
+                const auto window = monitor_math::scopeWindow(left, right, monitor_fft::size, g_rawSampleRate,
+                    (float)g_scopeMs, g_scopeDisplay == 1, g_scopeChannels);
+                const int count = window.samples - 1;
                 ImGui::PushClipRect(ImVec2(x0, py0), ImVec2(x1, py1), true);
-                const int first = g_scopeChannels == 2 ? 1 : 0;
-                const int last = g_scopeChannels == 0 ? 1 : first;
-                for (int ch = first; ch <= last; ++ch) {
+                const int traces = g_scopeChannels == 0 ? 2 : 1;
+                for (int trace = 0; trace < traces; ++trace) {
+                    const int ch = g_scopeChannels == 0 ? 1 - trace : g_scopeChannels == 2 ? 1 : 0;
                     std::vector<ImVec2> points;
                     points.reserve((size_t)count + 1);
                     for (int i = 0; i <= count; ++i) {
                         const float u = (float)i / count;
-                        const float pos = trigger + u * ((float)(kScopePoints - 1) - trigger);
-                        const float l = monitor_math::sample(left, kScopePoints, pos, cubic);
-                        const float r = monitor_math::sample(right, kScopePoints, pos, cubic);
+                        const float pos = window.start + u * count;
+                        const float l = monitor_math::sample(left, monitor_fft::size, pos, false);
+                        const float r = monitor_math::sample(right, monitor_fft::size, pos, false);
                         const float v = g_scopeChannels == 3 ? (l + r) * 0.5f : ch == 0 ? l : r;
                         points.emplace_back(x0 + u * w, mid - std::max(-1.f, std::min(1.f, v)) * hh);
                     }
                     const ImU32 color = ch == 0 ? IM_COL32(135, 223, 204, 235) : IM_COL32(241, 167, 112, 195);
+                    const ImU32 glow = ch == 0 ? IM_COL32(135, 223, 204, 30) : IM_COL32(241, 167, 112, 25);
+                    dl->AddPolyline(points.data(), (int)points.size(), glow, 0, S(4.f));
                     dl->AddPolyline(points.data(), (int)points.size(), color, 0, S(1.5f));
                 }
                 ImGui::PopClipRect();
-                const int shownMs = g_scopeFreeze && g_scopeFrozenMs > 0 ? g_scopeFrozenMs :
-                    (g_scopeActiveMs > 0 ? g_scopeActiveMs : scopeWindowMs());
                 char timeText[32];
-                const float actual = shownMs * (1.f - trigger / (kScopePoints - 1.f));
+                const float actual = 1000.f * (window.samples - 1.f) / g_rawSampleRate;
                 if (actual >= 1000.f) std::snprintf(timeText, sizeof timeText, "%.2f s", actual / 1000.f);
-                else std::snprintf(timeText, sizeof timeText, "%.0f ms", actual);
+                else std::snprintf(timeText, sizeof timeText, "%.1f ms", actual);
                 dl->AddText(ImVec2(x0, py1 + S(3)), IM_COL32(103, 115, 118, 255), timeText);
+                if (g_scopeDisplay == 1 && !window.triggered && w > S(125)) {
+                    const char* text = "no trigger";
+                    dl->AddText(ImVec2(x1 - ImGui::CalcTextSize(text).x, py1 + S(3)), IM_COL32(103, 115, 118, 255), text);
+                }
             } else {
                 dl->AddText(ImVec2(x0 + S(6), mid - S(7)), IM_COL32(101, 113, 116, 255), "Waiting for signal");
             }
@@ -5749,10 +6898,9 @@ void drawMonitor(float dt) {
             bool freeze = g_scopeFreeze;
             if (ImGui::MenuItem("Hold display", nullptr, &freeze)) {
                 if (freeze) {
-                    std::copy(g_scopeL, g_scopeL + kScopePoints, g_scopeFrozenL);
-                    std::copy(g_scopeR, g_scopeR + kScopePoints, g_scopeFrozenR);
-                    g_scopeFrozenHasFrame = g_scopeHasFrame && g_monAge < 0.5f;
-                    g_scopeFrozenMs = g_scopeActiveMs;
+                    std::copy(g_rawLeft, g_rawLeft + monitor_fft::size, g_rawFrozenLeft);
+                    std::copy(g_rawRight, g_rawRight + monitor_fft::size, g_rawFrozenRight);
+                    g_scopeFrozenHasFrame = g_haveRaw && g_rawAge < 0.6f;
                 }
                 g_scopeFreeze = freeze;
             }
@@ -5769,32 +6917,16 @@ void drawMonitor(float dt) {
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Time window")) {
-                for (int ms : {100, 200, 500, 1000, 2000, 4000}) {
-                    char text[16];
-                    if (ms >= 1000) std::snprintf(text, sizeof text, "%d s", ms / 1000);
-                    else std::snprintf(text, sizeof text, "%d ms", ms);
+                for (int ms : {2, 4, 6, 10, 20, 40}) {
+                    char text[32]; std::snprintf(text, sizeof text, "%d ms", ms);
                     if (ImGui::MenuItem(text, nullptr, g_scopeMs == ms)) g_scopeMs = ms;
                 }
-                ImGui::Separator();
-                ImGui::TextDisabled("Restart Csound to apply.");
-                ImGui::EndMenu();
-            }
-            if (ImGui::BeginMenu("Sampling")) {
-                if (ImGui::MenuItem("Sample", nullptr, g_scopeSample == 0)) g_scopeSample = 0;
-                if (ImGui::MenuItem("Signed peak", nullptr, g_scopeSample == 1)) g_scopeSample = 1;
-                ImGui::Separator();
-                ImGui::TextDisabled("Restart Csound to apply.");
-                ImGui::EndMenu();
-            }
-            if (ImGui::BeginMenu("Interpolation")) {
-                if (ImGui::MenuItem("Linear", nullptr, g_scopeSmooth == 0)) g_scopeSmooth = 0;
-                if (ImGui::MenuItem("Cubic", nullptr, g_scopeSmooth == 1)) g_scopeSmooth = 1;
-                if (ImGui::MenuItem("Cubic high-res", nullptr, g_scopeSmooth == 2)) g_scopeSmooth = 2;
+                ImGui::TextDisabled("Max %.1f ms at this sample rate.", 1000.f * monitor_fft::size / g_rawSampleRate);
                 ImGui::EndMenu();
             }
             ImGui::MenuItem("Grid", nullptr, &g_scopeGrid);
             ImGui::Separator();
-            ImGui::TextDisabled("Decimated monitor samples.");
+            ImGui::TextDisabled("2048 consecutive audio-rate samples; up to 30 frames/s.");
             ImGui::EndPopup();
         }
     }
@@ -5844,7 +6976,7 @@ void drawMonitor(float dt) {
 bool intCombo(const char* label, int& v, std::initializer_list<int> opts) {
     std::string cur = std::to_string(v);
     bool changed = false;
-    if (ImGui::BeginCombo(label, cur.c_str())) {
+    if (caw_ui::beginCombo(label, cur.c_str())) {
         for (int o : opts) {
             std::string s = std::to_string(o);
             if (ImGui::Selectable(s.c_str(), o == v)) { v = o; changed = true; }
@@ -5865,11 +6997,11 @@ bool devCombo(const char* label, int& idx, const std::vector<AudioDevice>& list,
     for (const AudioDevice& device : list) if (device.id == idx) current = std::to_string(device.id) + ": " + device.name;
     bool changed = false;
     ImGui::SetNextItemWidth(std::max(S(260), ImGui::GetContentRegionAvail().x - S(8)));   // device names are long: use the whole row
-    if (ImGui::BeginCombo(label, current.c_str())) {
+    if (caw_ui::beginCombo(label, current.c_str())) {
         if (ImGui::Selectable("None", idx == -2)) { idx = -2; changed = true; }
         if (ImGui::Selectable("Default", idx == -1)) { idx = -1; changed = true; }
         for (const AudioDevice& device : list) {
-            if (!nameHasTag(device.name, tag) && device.id != idx) continue;
+            if (!cawDeviceHasHostApi(device.name, tag) && device.id != idx) continue;
             ImGui::PushID(device.id);
             const std::string labelText = std::to_string(device.id) + ": " + device.name;
             if (ImGui::Selectable(labelText.c_str(), idx == device.id)) { idx = device.id; changed = true; }
@@ -5978,6 +7110,17 @@ void drawSettings() {
         const ImVec4 head(0.95f, 0.60f, 0.20f, 1.f);
         if (ImGui::BeginTabBar("##settings_tabs")) {
 
+            if (ImGui::BeginTabItem("General", nullptr, g_settingsGoto == 6 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                ImGui::TextColored(head, "AUTOSAVE");
+                ImGui::Checkbox("Autosave recovery copy", &s.autosaveEnabled);
+                row("Every (minutes)");
+                ImGui::SetNextItemWidth(S(100));
+                if (ImGui::InputInt("##autosave_minutes", &s.autosaveMinutes, 1, 5))
+                    s.autosaveMinutes = std::min(120, std::max(1, s.autosaveMinutes));
+                ImGui::TextWrapped("A separate recovery file is saved next to the project. Unsaved projects use the CAW Autosaves folder in your home directory. The original project is never overwritten.");
+                ImGui::EndTabItem();
+            }
+
             // ---------------------------------------------------------- Audio: sound card, sample rate, buffers, latency
             if (ImGui::BeginTabItem("Audio", nullptr, g_settingsGoto == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
                 ImGui::TextColored(head, "SOUND CARD");
@@ -5987,37 +7130,64 @@ void drawSettings() {
                     syncOptionsFromSettings(s);
                     refreshAudioDevices();
                 }
-                // Like Cabbage: first the device TYPE (ASIO / WASAPI ...), then only the devices of that type.
-                static int devType = -1;   // 0 all, 1 ASIO, 2 WASAPI, 3 DirectSound, 4 MME, 5 WDM-KS
-                static const char* typeName[] = {"All", "ASIO", "WASAPI", "DirectSound", "MME", "WDM-KS"};
-                static const char* typeTag[] = {"", "ASIO", "WASAPI", "DirectSound", "MME", "WDM-KS"};
-                if (devType < 0) {   // first time: the type of the selected device; WASAPI when nothing is chosen
-                    devType = s.outDev < 0 ? 2 : 0;
+                // Like Cabbage: first the device TYPE (ASIO / WASAPI / Core Audio / ALSA ...), then only the devices of that type.
+                // EVERY driver type of this operating system is always listed (even when Csound's PortAudio found no device for it), so none is missing.
+                struct DriverType { const char* name; const char* tag; bool win, mac, lin; };
+                static const DriverType kDrivers[] = {
+                    {"All",         "",            true,  true,  true },
+                    {"ASIO",        "ASIO",        true,  false, false},
+                    {"WASAPI",      "WASAPI",      true,  false, false},
+                    {"DirectSound", "DirectSound", true,  false, false},
+                    {"MME",         "MME",         true,  false, false},
+                    {"WDM-KS",      "WDM-KS",      true,  false, false},
+                    {"Core Audio",  "Core Audio",  false, true,  false},
+                    {"ALSA",        "ALSA",        false, false, true },
+                    {"JACK",        "JACK",        false, false, true },
+                    {"OSS",         "OSS",         false, false, true },
+                };
+                static std::vector<int> osDrivers;   // indices into kDrivers that exist on this OS
+                if (osDrivers.empty())
+                    for (int i = 0; i < (int)(sizeof(kDrivers) / sizeof(kDrivers[0])); ++i)
+                        if (plat::isWindows ? kDrivers[i].win : plat::isMac ? kDrivers[i].mac : kDrivers[i].lin) osDrivers.push_back(i);
+                const int driverCount = (int)(sizeof(kDrivers) / sizeof(kDrivers[0]));
+                static int devType = -1;   // index into kDrivers; 0 = All
+                bool driverHasDevices[16] = {true};
+                for (const AudioDevice& d : g_outDevs)
+                    for (int t = 1; t < driverCount; ++t)
+                        if (cawDeviceHasHostApi(d.name, kDrivers[t].tag)) driverHasDevices[t] = true;
+                // Windows: the Windows default card lives in WASAPI. Other systems start with All (PortAudio's default device).
+                const int defaultType = plat::isWindows ? 2 : 0;
+                if (devType < 0) {
+                    devType = (s.outDev < 0 && driverHasDevices[defaultType]) ? defaultType : 0;
                     for (const AudioDevice& d : g_outDevs)
-                        if (d.id == s.outDev) for (int t = 1; t < 6; ++t) if (nameHasTag(d.name, typeTag[t])) devType = t;
+                        if (d.id == s.outDev) for (int t = 1; t < driverCount; ++t)
+                            if (cawDeviceHasHostApi(d.name, kDrivers[t].tag)) devType = t;
                 }
                 if (s.rtaudio == "portaudio") {
                     row("Audio device type");
-                    if (ImGui::BeginCombo("##devtype", typeName[devType])) {
-                        for (int t = 0; t < 6; ++t) {
-                            if (!ImGui::Selectable(typeName[t], devType == t)) continue;
+                    auto typeLabel = [&](int t) { return std::string(kDrivers[t].name) + (t > 0 && !driverHasDevices[t] ? "  (no devices found)" : ""); };
+                    if (caw_ui::beginCombo("##devtype", kDrivers[devType].name)) {
+                        for (int t : osDrivers) {
+                            if (!ImGui::Selectable(typeLabel(t).c_str(), devType == t)) continue;
                             devType = t;
-                            auto firstOf = [&](const std::vector<AudioDevice>& list) { for (const AudioDevice& d : list) if (nameHasTag(d.name, typeTag[t])) return d.id; return -1; };
-                            const bool isWasapi = std::string(typeTag[t]) == "WASAPI";
-                            bool okOut = s.outDev < 0 && isWasapi, okIn = s.inDev < 0 && isWasapi;
-                            for (const AudioDevice& d : g_outDevs) if (d.id == s.outDev && nameHasTag(d.name, typeTag[t])) okOut = true;
-                            for (const AudioDevice& d : g_inDevs) if (d.id == s.inDev && nameHasTag(d.name, typeTag[t])) okIn = true;
-                            (void)firstOf;
-                            if (t > 0 && !okOut) s.outDev = isWasapi ? -1 : pickDefaultDevice(g_outDevs, typeTag[t], false);   // WASAPI: -1 = follow the Windows default
-                            if (t > 0 && !okIn) s.inDev = isWasapi ? -1 : pickDefaultDevice(g_inDevs, typeTag[t], true);
-                            if (t == 1) { s.bufHW = std::max(1024, s.bufSW * 4); }
+                            const std::string tag = kDrivers[t].tag;
+                            const bool isSystemDefaultType = plat::isWindows && tag == "WASAPI";   // -1 follows the Windows default card
+                            bool okOut = s.outDev < 0 && (isSystemDefaultType || t == 0), okIn = s.inDev < 0;
+                            for (const AudioDevice& d : g_outDevs) if (d.id == s.outDev && cawDeviceHasHostApi(d.name, tag)) okOut = true;
+                            for (const AudioDevice& d : g_inDevs) if (d.id == s.inDev && cawDeviceHasHostApi(d.name, tag)) okIn = true;
+                            if (t > 0 && !okOut) s.outDev = isSystemDefaultType ? -1 : pickDefaultDevice(g_outDevs, tag, false);
+                            if (t > 0 && !okIn) s.inDev = isSystemDefaultType ? -1 : pickDefaultDevice(g_inDevs, tag, true);
+                            if (tag == "ASIO") { s.bufHW = std::max(1024, s.bufSW * 4); }
                             syncOptionsFromSettings(s);
                         }
                         ImGui::EndCombo();
                     }
+                    if (ImGui::IsItemHovered()) helpTip("All driver types of this system are listed. Types marked (no devices found) are not provided by the PortAudio inside your Csound (for example WDM-KS or ASIO need a PortAudio built with them). Use Refresh device list after connecting a soundcard.");
+                    if (devType > 0 && !driverHasDevices[devType])
+                        ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1.f), "Csound's PortAudio reports no %s devices. Try another Csound build, or choose All.", kDrivers[devType].name);
                 }
-                const std::string devTag = s.rtaudio == "portaudio" ? std::string(typeTag[devType]) : std::string();
-                const bool asioMode = s.rtaudio == "portaudio" && devType == 1;
+                const std::string devTag = s.rtaudio == "portaudio" ? std::string(kDrivers[devType].tag) : std::string();
+                const bool asioMode = s.rtaudio == "portaudio" && std::string(kDrivers[devType].tag) == "ASIO";
                 row("Output device");
                 if (devCombo("##out", s.outDev, g_outDevs, devTag)) syncOptionsFromSettings(s);
                 if (ImGui::IsItemHovered()) helpTip("The device that plays the sound (-odac). System default or None are possible.");
@@ -6026,17 +7196,36 @@ void drawSettings() {
                 if (ImGui::IsItemHovered()) helpTip("The device Csound records from (-iadc), only needed if instruments use inch / in.");
                 row("");
                 if (ImGui::Button("Refresh device list")) refreshAudioDevices();
+                row("Test sound");
+                const bool soundTestBusy = g_testSound.running() || g_playing;
+                if (soundTestBusy) ImGui::BeginDisabled();
+                if (ImGui::Button("Play test sound")) {
+                    int selectedId = s.outDev;
+                    if (selectedId == -1 && plat::isWindows) selectedId = pickDefaultDevice(g_outDevs, "WASAPI", false);   // elsewhere: PortAudio default (empty label)
+                    std::string selected;
+                    if (selectedId >= 0) {
+                        selected = "<selected device missing>";
+                        for (const auto& device : g_outDevs)
+                            if (device.id == selectedId) { selected = device.name; break; }
+                    }
+                    g_testSound.start(selected, s.outDev == -2, s.sr, s.nchnls, s.bufSW, s.bufHW);
+                }
+                if (soundTestBusy) ImGui::EndDisabled();
+                if (ImGui::IsItemHovered()) helpTip("Plays a quiet C++-generated tone on the selected Csound output, using PortAudio directly. It does not use Csound. If the device is busy, stop Csound and retry.");
+                ImGui::TextWrapped("Tests the selected output directly, without Csound. Stop Csound if the device is busy.");
+                const std::string testMessage = g_testSound.message();
+                if (!testMessage.empty()) ImGui::TextWrapped("%s", testMessage.c_str());
 
                 ImGui::Spacing();
                 ImGui::TextColored(head, "ENGINE");
                 row("Sample rate");
                 {
                     static const int rates[] = {44100, 48000, 88200, 96000, 192000};
-                    if (ImGui::BeginCombo("##sr", (std::to_string(s.sr) + " Hz").c_str())) {
+                    if (caw_ui::beginCombo("##sr", (std::to_string(s.sr) + " Hz").c_str())) {
                         for (int r : rates) if (ImGui::Selectable((std::to_string(r) + " Hz").c_str(), s.sr == r)) s.sr = r;
                         ImGui::EndCombo();
                     }
-                    if (ImGui::IsItemHovered()) helpTip("Use the sample rate of your sound card / ASIO driver (see its control panel). A different rate makes Windows or the driver convert, which can crackle.");
+                    if (ImGui::IsItemHovered()) helpTip("Use the sample rate of your sound card / ASIO driver (see its control panel). A different rate makes the system or the driver convert, which can crackle.");
                 }
                 row("Control period (ksmps)");
                 ImGui::InputInt("##ksmps", &s.ksmps, 0, 0);
@@ -6055,7 +7244,7 @@ void drawSettings() {
                         const double srv = (double)std::max(1000, s.sr);
                         char cur[64];
                         std::snprintf(cur, sizeof cur, "%d samples (%.1f ms)", s.bufSW, 1000.0 * s.bufSW / srv);
-                        if (ImGui::BeginCombo("##bufsize", cur)) {
+                        if (caw_ui::beginCombo("##bufsize", cur)) {
                             for (int n : sizes) {
                                 char item[64];
                                 std::snprintf(item, sizeof item, "%d samples (%.1f ms)", n, 1000.0 * n / srv);
@@ -6078,7 +7267,7 @@ void drawSettings() {
                         if (ImGui::IsItemHovered()) helpTip("Copies the output latency shown above into the Sound sync slider.");
                     }
                     if (asioMode) ImGui::TextDisabled("ASIO: ONE buffer size. It must be the buffer of the ASIO driver itself (its control panel, or Voicemeeter's ASIO buffer setting). -B (hardware ring) is set to 4x that automatically.");
-                    if (!asioMode && ImGui::TreeNode("Advanced buffers (-b / -B)")) {
+                    if (!asioMode && caw_ui::treeNode("Advanced buffers (-b / -B)")) {
                         row("Software buffer (-b)");
                         if (ImGui::InputInt("##bufsw", &s.bufSW, 64, 256)) { s.bufSW = std::min(16384, std::max(16, s.bufSW)); syncOptionsFromSettings(s); }
                         row("Hardware buffer (-B)");
@@ -6105,42 +7294,25 @@ void drawSettings() {
                 row("Csound");
                 ImGui::SetNextItemWidth(S(330));
                 inputStr("##exe", s.csoundExe, 0);
-                ImGui::TextDisabled("csound.exe. ");
+                ImGui::TextDisabled("%s. ", plat::csoundProgramName());
                 ImGui::TextDisabled("A path from another computer is ignored if the file is not here.");
-                ImGui::EndTabItem();
-            }
-
-            // ---------------------------------------------------------- Render
-            if (ImGui::BeginTabItem("Render", nullptr, g_settingsGoto == 2 ? ImGuiTabItemFlags_SetSelected : 0)) {
-                ImGui::TextColored(head, "RENDER AUDIO");
-                row("File");
-                ImGui::SetNextItemWidth(S(330));
-                inputStr("##rf", s.renderFile, 0);
-                row("Format");
-                {
-                    static const char* fmts[] = {"WAV 16-bit", "WAV 24-bit", "WAV 32-bit float"};
-                    s.renderFormat = std::min(2, std::max(0, s.renderFormat));
-                    if (ImGui::BeginCombo("##fmt", fmts[s.renderFormat])) {
-                        for (int i = 0; i < 3; ++i)
-                            if (ImGui::Selectable(fmts[i], s.renderFormat == i)) s.renderFormat = i;
-                        ImGui::EndCombo();
-                    }
-                }
-                row("Tail after last clip (s)");
-                if (ImGui::InputDouble("##tail", &s.tail, 0.5, 2.0, "%.1f")) s.tail = std::min(60.0, std::max(0.0, s.tail));
-                if (ImGui::IsItemHovered()) helpTip("Seconds of silence rendered after the last note so reverbs and releases can ring out");
+                row("MP3 encoder");
+                ImGui::TextDisabled("Automatic: native encoder, bundled FFmpeg, or FFmpeg on PATH.");
                 ImGui::EndTabItem();
             }
 
             // ---------------------------------------------------------- Editor
             if (ImGui::BeginTabItem("Editor", nullptr, g_settingsGoto == 3 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                ImGui::TextColored(head, "PROGRAM INTERFACE");
+                row("Program font size");
+                ImGui::SliderFloat("##program_font_size", &g_proj.cs.programFontSize, 12.f, 26.f, "%.0f px");
                 ImGui::TextColored(head, "CODE EDITOR");
-                row("Font size");
+                row("Code font size");
                 ImGui::SliderFloat("##editor_font_size", &g_proj.cs.editorFontSize, 10.f, 30.f, "%.0f px");
                 row("Font style");
                 const char* editorStyles[] = {"Regular", "Bold", "Italic"};
                 g_proj.cs.editorFontStyle = std::min(2, std::max(0, g_proj.cs.editorFontStyle));
-                if (ImGui::BeginCombo("##editor_font_style", editorStyles[g_proj.cs.editorFontStyle])) {
+                if (caw_ui::beginCombo("##editor_font_style", editorStyles[g_proj.cs.editorFontStyle])) {
                     for (int i = 0; i < 3; ++i)
                         if (ImGui::Selectable(editorStyles[i], g_proj.cs.editorFontStyle == i)) g_proj.cs.editorFontStyle = i;
                     ImGui::EndCombo();
@@ -6242,7 +7414,7 @@ const TextEditor::LanguageDefinition& csoundLanguage() {
     TextEditor::Identifier known;
     known.mDeclaration = "Csound opcode";
     for (const char* op : kCsoundOpcodes) lang.mIdentifiers.insert(std::make_pair(std::string(op), known));
-    for (const char* op : {"cawRun", "dawrun", "cawset", "cawfile"}) lang.mIdentifiers.insert(std::make_pair(std::string(op), known));
+    for (const char* op : {"cawMath", "cawRun", "dawrun", "cawset", "cawfile"}) lang.mIdentifiers.insert(std::make_pair(std::string(op), known));
     for (const std::string& op : g_extraOpcodes) lang.mIdentifiers.insert(std::make_pair(op, known));
     // first in the list = wins over the generic identifier rule
     lang.mTokenRegexStrings.insert(lang.mTokenRegexStrings.begin(), {"p[0-9]+\\b", TextEditor::PaletteIndex::PreprocIdentifier});
@@ -6488,7 +7660,7 @@ void drawUdoPool() {
             const bool hasTrailingNewline = !source.empty() && source.back() == '\n';
             const int style = std::min(2, std::max(0, g_proj.cs.editorFontStyle));
             if (g_codeFonts[style]) ImGui::PushFont(g_codeFonts[style]);
-            ImGui::SetWindowFontScale(g_proj.cs.editorFontSize / 17.f);
+            ImGui::SetWindowFontScale(g_proj.cs.editorFontSize / g_proj.cs.programFontSize);
             const int editorKey = -200001 - g_udoPoolSelected;
             if (codeEditorBody(g_codeEditors, editorKey, source, 0.f, 0, false)) {
                 if (hasTrailingNewline && (source.empty() || source.back() != '\n')) source.push_back('\n');
@@ -6560,7 +7732,7 @@ void drawInstrPool() {
                 ImGui::Separator();
                 const int style = std::min(2, std::max(0, g_proj.cs.editorFontStyle));
                 if (g_codeFonts[style]) ImGui::PushFont(g_codeFonts[style]);
-                ImGui::SetWindowFontScale(g_proj.cs.editorFontSize / 17.f);
+                ImGui::SetWindowFontScale(g_proj.cs.editorFontSize / g_proj.cs.programFontSize);
                 (void)codeEditorBody(g_codeEditors, -300001 - idx, g_proj.instrPool[(size_t)idx], 0.f, 0, false);
                 ImGui::SetWindowFontScale(1.f);
                 if (g_codeFonts[style]) ImGui::PopFont();
@@ -6671,7 +7843,7 @@ void drawOrchestraPool() {
         ImGui::Separator();
         const int style = std::min(2, std::max(0, g_proj.cs.editorFontStyle));
         if (g_codeFonts[style]) ImGui::PushFont(g_codeFonts[style]);
-        ImGui::SetWindowFontScale(g_proj.cs.editorFontSize / 17.f);
+        ImGui::SetWindowFontScale(g_proj.cs.editorFontSize / g_proj.cs.programFontSize);
         (void)codeEditorBody(g_codeEditors, -400001, g_proj.orchestraCode, 0.f, 0, false);
         ImGui::SetWindowFontScale(1.f);
         if (g_codeFonts[style]) ImGui::PopFont();
@@ -6793,6 +7965,14 @@ void drawEditor() {
             if (!clip.editorOpen) { g_clipWinSeen.erase(clip.id); continue; }
             // Clips that share an instrument (duplicates) have the same name. Each still gets its own window: a newly opened
             // one is cascaded (never exactly on top of another editor), comes to the front, and its title tells the start time.
+            // A clip whose instrument (same name) is already open in another editor window does not get a second window:
+            // the window that is already open comes to the front instead.
+            if (!g_clipWinSeen.count(clip.id)) {
+                int openId = -1;
+                for (const Track& ot : g_proj.tracks) for (const Clip& oc : ot.clips)
+                    if (oc.id != clip.id && oc.name == clip.name && oc.editorOpen && g_clipWinSeen.count(oc.id)) openId = oc.id;
+                if (openId >= 0) { clip.editorOpen = false; g_focusClipWin = openId; continue; }
+            }
             const bool justOpened = g_clipWinSeen.insert(clip.id).second;
             if (justOpened) {
                 int others = 0;
@@ -6814,8 +7994,6 @@ void drawEditor() {
             if (ImGui::Begin(title.c_str(), &open)) {
                 winMaxTitleButton(clip.id);
                 if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) g_textEditorFocused = true;
-                if (g_codeFonts[style]) ImGui::PushFont(g_codeFonts[style]);
-                ImGui::SetWindowFontScale(g_proj.cs.editorFontSize / 17.f);
                 const ImGuiStyle& st = ImGui::GetStyle();
                 auto btnW = [&](const char* t) { return ImGui::CalcTextSize(t).x + st.FramePadding.x * 2.f; };
                 // right-align a group of buttons: put the cursor so the group ends at the right edge (never left of the current x)
@@ -6857,9 +8035,13 @@ void drawEditor() {
                 {   // MIDI as a toggle button
                     const bool on = clip.midiEnabled;
                     if (on) pushBtnOn(ImVec4(0.93f, 0.50f, 0.15f, 0.85f));
-                    if (ImGui::Button("MIDI##clip_midi")) { clip.midiEnabled = !clip.midiEnabled; syncSharedCode(clip); }
+                    if (ImGui::Button("MIDI##clip_midi")) {
+                        clip.midiEnabled = !clip.midiEnabled;
+                        syncSharedCode(clip);
+                        if (clip.midiEnabled) ensureMidiClipFor((int)ti, clip);
+                    }
                     if (on) ImGui::PopStyleColor(3);
-                    if (ImGui::IsItemHovered()) helpTip("Enable MIDI for this instrument. MIDI notes send pitch and velocity in p4 and p5.");
+                    if (ImGui::IsItemHovered()) helpTip("Enable MIDI and create a MIDI clip if needed. Notes send pitch and velocity in p4 and p5.");
                 }
                 ImGui::SameLine();
                 if (ImGui::Button(runLabel.c_str())) ImGui::OpenPopup("clip_runs_popup");
@@ -6868,9 +8050,24 @@ void drawEditor() {
                     ImGui::TextDisabled("RUNS AND P-FIELDS");
                     ImGui::SetNextItemWidth(S(80));
                     if (ImGui::InputInt("Runs", &runs, 0, 0)) clip.runs = std::min(256, std::max(1, runs));
-                    ImGui::TextDisabled("One rule per line, for example {p: 6, from: 400, +100}");
-                    if (inputMulti("##pfield_rules", clip.pFieldRules, ImVec2(S(380), S(110)))) syncSharedCode(clip);
-                    ImGui::TextDisabled("Rules apply to each run. Restart Csound after editing.");
+                    ImGui::TextDisabled("One rule per p-field. Examples below are alternatives.");
+                    if (inputMulti("##pfield_rules", clip.pFieldRules, ImVec2(S(380), S(150)))) syncSharedCode(clip);
+                    if (clip.pFieldRules.empty() && !ImGui::IsItemActive()) {
+                        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+                        const ImVec2 pad = ImGui::GetStyle().FramePadding;
+                        ImDrawList* dl = ImGui::GetWindowDrawList();
+                        dl->PushClipRect(a, b, true);
+                        dl->AddText(ImVec2(a.x + pad.x, a.y + pad.y), ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                            "{p: 6, from: 60, to: 90}\n"
+                            "{p: 6, from: 60, +5}\n"
+                            "{p: 6, from: 90, -5}\n"
+                            "{p: 6, from: 60, *2}\n"
+                            "{p: 6, from: 90, /2}\n"
+                            "{p: 6, from: 60}");
+                        dl->PopClipRect();
+                    }
+                    ImGui::TextDisabled("Examples are hints, not active rules. Restart Csound after editing.");
+                    ImGui::TextDisabled("For arrays or complex math, use cawMath in the instrument instead.");
                     ImGui::EndPopup();
                 }
                 ImGui::SameLine();
@@ -6886,7 +8083,11 @@ void drawEditor() {
                 // ---- code (takes all the room that is left)
                 const float bottomRow = ImGui::GetFrameHeight() + st.ItemSpacing.y * 3.f + S(8);
                 bool codeEdited = false;
+                if (g_codeFonts[style]) ImGui::PushFont(g_codeFonts[style]);
+                ImGui::SetWindowFontScale(g_proj.cs.editorFontSize / g_proj.cs.programFontSize);
                 codeEdited = codeEditorBody(g_clipCodeEditors, clip.id, clip.code, bottomRow, 0, true) || codeEdited;
+                ImGui::SetWindowFontScale(1.f);
+                if (g_codeFonts[style]) ImGui::PopFont();
                 if (codeEdited) syncSharedCode(clip);
 
                 // ---- ONE slim bottom row: Start | Duration | End ........ shared-instrument note
@@ -6927,8 +8128,6 @@ void drawEditor() {
                         if (ImGui::IsItemHovered()) helpTip("These clips are one instrument (same name): editing the code here changes all of them.");
                     }
                 }
-                ImGui::SetWindowFontScale(1.f);
-                if (g_codeFonts[style]) ImGui::PopFont();
             }
             ImGui::End();
             clip.editorOpen = open;
@@ -6944,9 +8143,9 @@ void drawEditor() {
             if (ImGui::Begin(title.c_str(), &open)) {
                 winMaxTitleButton(100000 + lane.id);
                 if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) g_textEditorFocused = true;
-                if (g_codeFonts[style]) ImGui::PushFont(g_codeFonts[style]);
-                ImGui::SetWindowFontScale(g_proj.cs.editorFontSize / 17.f);
                 ImGui::TextDisabled("New clips on lane %s copy this code.", lane.name.c_str());
+                if (g_codeFonts[style]) ImGui::PushFont(g_codeFonts[style]);
+                ImGui::SetWindowFontScale(g_proj.cs.editorFontSize / g_proj.cs.programFontSize);
                 (void)codeEditorBody(g_codeEditors, lane.id, lane.code);
                 ImGui::SetWindowFontScale(1.f);
                 if (g_codeFonts[style]) ImGui::PopFont();
@@ -6965,6 +8164,35 @@ const char* midiPitchName(int pitch) {
     static char text[16];
     std::snprintf(text, sizeof(text), "%s%d", names[pitch % 12], pitch / 12 - 1);
     return text;
+}
+
+// Match the project timeline's logarithmic zoom and playhead-centered focus.
+bool midiZoomSlider(const char* id, float& zoom) {
+    ImGui::TextDisabled("-");
+    ImGui::SameLine(0, S(4));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(S(2), 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.13f, 0.15f, 0.17f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.19f, 0.22f, 0.24f, 1.f));
+    ImGui::SetNextItemWidth(S(110));
+    const bool changed = ImGui::SliderFloat(id, &zoom, kPpsMin, kPpsMax, "",
+        ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoInput);
+    if (ImGui::IsItemHovered()) helpTip("Zoom around the playhead. Ctrl+mouse wheel also zooms.");
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar();
+    ImGui::SameLine(0, S(4));
+    ImGui::TextDisabled("+");
+    return changed;
+}
+
+// Same 110-pixel travel as the zoom slider, rotated to scroll pitch vertically.
+void midiPitchSlider(const char* id, int& pitchLow) {
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(S(2), 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.13f, 0.15f, 0.17f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.19f, 0.22f, 0.24f, 1.f));
+    ImGui::VSliderInt(id, ImVec2(S(18), S(110)), &pitchLow, 0, 127 - kMidiVisiblePitches + 1, "");
+    if (ImGui::IsItemHovered()) helpTip("Scroll the visible pitch range.");
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar();
 }
 
 // ONE piano roll for several MIDI clips (select the MIDI clips in the timeline, press Enter). Every clip keeps its own notes and colour;
@@ -6998,12 +8226,8 @@ void drawMultiMidiEditor() {
             sel.clear();
         }
         {
-            ImGui::SetNextItemWidth(S(140));
-            ImGui::SliderFloat("##multi_zoom", &pps, 30.f, 800.f, "%.0f px/s");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Octave -")) pitchLow = std::max(0, pitchLow - 12);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Octave +")) pitchLow = std::min(127 - kMidiVisiblePitches + 1, pitchLow + 12);
+            if (midiZoomSlider("##multi_zoom", pps))
+                scrollX = zoomAroundPlayhead(pps, g_play, std::max(1.f, ImGui::GetWindowWidth() - S(120)));
             ImGui::SameLine();
             if (!sel.empty() && ImGui::SmallButton("Delete notes")) {
                 std::map<int, std::vector<int>> per;
@@ -7045,17 +8269,24 @@ void drawMultiMidiEditor() {
                 } else if (sel.size() > 1) {
                     ImGui::Text("%d notes selected", (int)sel.size());
                     ImGui::SameLine();
-                    if (ImGui::SmallButton("Sync start")) {   // all selected notes start together (on the timeline), at the earliest one
+                    const bool qButton = ImGui::SmallButton("Q##multi_note_sync");
+                    const bool qKey = !io.WantTextInput && !io.KeyCtrl && !io.KeyShift && !io.KeyAlt &&
+                        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && ImGui::IsKeyPressed(ImGuiKey_Q, false);
+                    if (qButton || qKey) {   // align notes to the earliest timeline start
+                        historyFlush();
                         double first = 1e300;
                         for (const auto& sp : sel) if (const MidiClip* sm = findMidiClip(sp.first)) first = std::min(first, sm->start + sm->notes[(size_t)sp.second].start);
                         for (const auto& sp : sel) if (MidiClip* sm = findMidiClip(sp.first)) sm->notes[(size_t)sp.second].start = std::max(0.0, first - sm->start);
+                        historyFlush();
                     }
-                    if (ImGui::IsItemHovered()) helpTip("Sync start: the selected notes all start at the same time on the timeline (the earliest of them)");
+                    if (ImGui::IsItemHovered()) helpTip("Q: align selected note starts to the earliest, within their clip boundaries.");
                 } else {
                     ImGui::TextDisabled("%d clips in this roll. Click a note to select it and edit it here, drag to box-select (Ctrl adds), drag notes to move, drag a right edge to resize, Del deletes. Notes cannot be added here.", (int)g_multiMidiIds.size());
                 }
             }
         }
+        midiPitchSlider("##multi_pitch_range", pitchLow);
+        ImGui::SameLine();
         const int pitchHigh = pitchLow + kMidiVisiblePitches - 1;
         const float keyboardW = S(64), rowH = S(kMidiRowH), rollH = rowH * (float)kMidiVisiblePitches;
         ImGui::BeginChild("##multi_roll", ImVec2(0, std::max(S(360), rollH + S(26))), true, ImGuiWindowFlags_HorizontalScrollbar);
@@ -7066,9 +8297,8 @@ void drawMultiMidiEditor() {
         ImGui::InvisibleButton("##multi_canvas", ImVec2(available.x, rollH + S(24)));
         const bool hovered = ImGui::IsItemHovered();
         if (hovered && io.KeyCtrl && io.MouseWheel != 0.f) {
-            const double tm = scrollX + (double)(io.MousePos.x - pianoX) / std::max(1.f, pps);
-            pps = std::min(800.f, std::max(30.f, pps * (1.f + 0.12f * io.MouseWheel)));
-            scrollX = (float)std::max(0.0, tm - (double)(io.MousePos.x - pianoX) / pps);
+            pps = std::min(kPpsMax, std::max(kPpsMin, pps * (1.f + 0.12f * io.MouseWheel)));
+            scrollX = zoomAroundPlayhead(pps, g_play, std::max(1.f, pianoRight - pianoX));
         } else if (hovered && (io.MouseWheelH != 0.f || (io.KeyShift && io.MouseWheel != 0.f))) {
             const float wheel = io.MouseWheelH != 0.f ? io.MouseWheelH : io.MouseWheel;
             scrollX = std::max(0.f, scrollX - wheel * 60.f / std::max(1.f, pps));
@@ -7249,45 +8479,56 @@ void drawMidiEditor() {
         ImGui::SetNextWindowSize(ImVec2(S(1000), S(760)), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowPos(ImVec2(S(250), S(100)), ImGuiCond_FirstUseEver);
         winMaxPrepare(200000 + mc.id);
-        const std::string title = "MIDI Editor - " + tgt.name + "###midi_editor_clip_" + std::to_string(mc.id);
+        const std::string title = "MIDI Editor - " + (mc.name.empty() ? tgt.name : mc.name) + "###midi_editor_clip_" + std::to_string(mc.id);
         bool open = mc.editorOpen;
         if (ImGui::Begin(title.c_str(), &open)) {
             winMaxTitleButton(200000 + mc.id);
-            if (ImGui::IsWindowAppearing()) g_midiScrollX = (float)std::max(0.0, mc.start - 0.25);
+            if (ImGui::IsWindowAppearing()) {
+                g_midiScrollX = (float)std::max(0.0, mc.start - 0.25);
+            }
             ImGuiIO& io = ImGui::GetIO();
             const ImVec2 mouse = io.MousePos;
             {
-                // Type the name of a Csound instrument to send this MIDI clip to it; the clip takes that instrument's color.
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted("Name");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(S(150));
+                inputStrHint("##midi_clip_name", tgt.name.c_str(), mc.name);
+                if (ImGui::IsItemHovered()) helpTip("MIDI clip name. Changing this does not change its instrument.");
+                ImGui::SameLine();
+                const bool wasMuted = mc.muted;
+                if (wasMuted) pushBtnOn(ImVec4(0.75f, 0.24f, 0.20f, 1.f));
+                if (ImGui::Button("M##midi_editor_mute")) mc.muted = !mc.muted;
+                if (wasMuted) ImGui::PopStyleColor(3);
+                if (ImGui::IsItemHovered()) helpTip("Mute only this MIDI clip.");
+                ImGui::SameLine();
+                // The instrument is routing, separate from the editable clip name.
                 static std::unordered_map<int, std::string> nameBuf;
                 std::string& typed = nameBuf[mc.id];
                 static std::unordered_map<int, bool> nameEditing;
                 if (!nameEditing[mc.id]) typed = tgt.name;
-                int found = 0;
-                for (const Track& tr : g_proj.tracks)
-                    for (const Clip& c : tr.clips) if (c.name == typed) found = c.id;
-                const bool valid = found != 0;
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextColored(ImVec4(0.94f, 0.60f, 0.28f, 1.f), "Instrument");
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(S(150));
-                if (!valid) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.40f, 0.35f, 1.f));
-                if (inputStr("##midi_target_name", typed, 0, nameFilter) && found) mc.clipId = found;
-                if (!valid) ImGui::PopStyleColor();
+                const bool changed = inputStr("##midi_target_name", typed, 0, nameFilter);
                 nameEditing[mc.id] = ImGui::IsItemActive();
                 if (ImGui::IsItemHovered()) helpTip("Name of the Csound instrument that receives these notes (p4 = pitch, p5 = velocity)");
-                ImGui::SameLine();
-                ImGui::TextDisabled("%s", valid ? "" : "no instrument with this name");
-                ImGui::SameLine();
+                int found = 0;
+                for (const Track& tr : g_proj.tracks)
+                    for (const Clip& c : tr.clips) if (c.name == typed) { found = c.id; break; }
+                if (changed && found) mc.clipId = found;
+                if (!found) { ImGui::SameLine(); ImGui::TextDisabled("no instrument with this name"); }
             }
-            ImGui::SetNextItemWidth(S(150));
-            ImGui::SliderFloat("##midi_zoom", &g_midiPps, 30.f, 800.f, "%.0f px/s");
-            if (ImGui::IsItemHovered()) helpTip("Zoom of this piano roll (independent from the project zoom). Ctrl+wheel zooms too.");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Octave -")) g_midiPitchLow = std::max(0, g_midiPitchLow - 12);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Octave +")) g_midiPitchLow = std::min(127 - kMidiVisiblePitches + 1, g_midiPitchLow + 12);
-            ImGui::SameLine();
-            ImGui::TextDisabled("Free timing, no quantize");
+            if (midiZoomSlider("##midi_zoom", g_midiPps))
+                g_midiScrollX = zoomAroundPlayhead(g_midiPps, g_play, std::max(1.f, ImGui::GetWindowWidth() - S(120)));
+            ImGui::SameLine(); ImGui::SetNextItemWidth(S(95));
+            double clipStart = mc.start;
+            if (ImGui::InputDouble("Start (s)##midi_editor_clip", &clipStart, 0.0, 0.0, "%.3f")) mc.start = clip_timing::nonnegative(clipStart, mc.start);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(S(95));
+            double clipDur = mc.dur;
+            if (ImGui::InputDouble("Duration (s)##midi_editor_clip", &clipDur, 0.0, 0.0, "%.3f")) mc.dur = clip_timing::duration(clipDur, mc.dur, 0.01);
+            if (ImGui::IsItemHovered()) helpTip("Shortening the clip can cut note playback. Note data is kept.");
 
             const bool mine = g_midiSelectedTrackId == trackId;
             for (auto it = g_midiSel.begin(); mine && it != g_midiSel.end();)
@@ -7316,12 +8557,17 @@ void drawMidiEditor() {
             } else if (selCount > 1) {
                 ImGui::Text("%d notes selected", (int)selCount);
                 ImGui::SameLine();
-                if (ImGui::SmallButton("Sync start")) {   // all selected notes start together, at the earliest one
+                const bool qButton = ImGui::SmallButton("Q##midi_note_sync");
+                const bool qKey = !io.WantTextInput && !io.KeyCtrl && !io.KeyShift && !io.KeyAlt &&
+                    ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && ImGui::IsKeyPressed(ImGuiKey_Q, false);
+                if (qButton || qKey) {
+                    historyFlush();
                     double first = 1e300;
                     for (int idx : g_midiSel) first = std::min(first, mc.notes[(size_t)idx].start);
                     for (int idx : g_midiSel) mc.notes[(size_t)idx].start = first;
+                    historyFlush();
                 }
-                if (ImGui::IsItemHovered()) helpTip("Sync start: the selected notes all start at the same time (the earliest of them)");
+                if (ImGui::IsItemHovered()) helpTip("Q: align selected note starts to the earliest.");
                 ImGui::SameLine();
             } else {
                 ImGui::TextDisabled("Double-click an empty cell to add a note, click to select, drag on empty space to box-select (Ctrl adds). Drag notes to move, drag the right edge to resize.");
@@ -7348,6 +8594,8 @@ void drawMidiEditor() {
                 }
             }
 
+            midiPitchSlider("##midi_pitch_range", g_midiPitchLow);
+            ImGui::SameLine();
             const int pitchLow = g_midiPitchLow;
             const int pitchHigh = pitchLow + kMidiVisiblePitches - 1;
             const float keyboardW = S(64);
@@ -7366,9 +8614,8 @@ void drawMidiEditor() {
             ImGui::InvisibleButton("##midi_roll_canvas", ImVec2(available.x, rollH + S(24)));
             const bool canvasHovered = ImGui::IsItemHovered();
             if (canvasHovered && io.KeyCtrl && io.MouseWheel != 0.f) {
-                const double tm = g_midiScrollX + (double)(io.MousePos.x - pianoX) / std::max(1.f, g_midiPps);
-                g_midiPps = std::min(800.f, std::max(30.f, g_midiPps * (1.f + 0.12f * io.MouseWheel)));
-                g_midiScrollX = (float)std::max(0.0, tm - (double)(io.MousePos.x - pianoX) / g_midiPps);
+                g_midiPps = std::min(kPpsMax, std::max(kPpsMin, g_midiPps * (1.f + 0.12f * io.MouseWheel)));
+                g_midiScrollX = zoomAroundPlayhead(g_midiPps, g_play, std::max(1.f, pianoRight - pianoX));
             } else if (canvasHovered && (io.MouseWheelH != 0.f || (io.KeyShift && io.MouseWheel != 0.f))) {
                 const float wheel = io.MouseWheelH != 0.f ? io.MouseWheelH : io.MouseWheel;
                 g_midiScrollX = std::max(0.f, g_midiScrollX - wheel * 60.f / std::max(1.f, g_midiPps));
@@ -7601,6 +8848,9 @@ void appSetupStyle(float dpi) {
     ImGuiStyle& s = ImGui::GetStyle();
     s.WindowRounding = 4; s.FrameRounding = 3; s.GrabRounding = 3; s.ScrollbarRounding = 3;
     s.FramePadding = ImVec2(9, 5); s.ItemSpacing = ImVec2(8, 6); s.WindowBorderSize = 1;
+    // Hide ImGui's title-bar collapse triangle on all CAW windows. Users can
+    // still double-click the title bar to collapse/expand standard windows.
+    s.WindowMenuButtonPosition = ImGuiDir_None;
     s.ButtonTextAlign = ImVec2(0.5f, 0.5f);
     s.ScaleAllSizes(dpi);
     g_ui = dpi;
@@ -7638,6 +8888,61 @@ void appSetCodeFonts(ImFont* regular, ImFont* bold, ImFont* italic) {
     g_codeFonts[2] = italic ? italic : regular;
 }
 
+void appSetMarkFonts(ImFont* ui, ImFont* code) {
+    g_markUiFont = ui;
+    g_markCodeFont = code;
+}
+
+void appPrepareLogo() {
+    ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+    const int id = atlas->AddCustomRectRegular(512, 512);
+    unsigned char* pixels = nullptr;
+    int width = 0, height = 0;
+    atlas->GetTexDataAsRGBA32(&pixels, &width, &height);
+    const ImFontAtlasCustomRect* rect = atlas->GetCustomRectByIndex(id);
+    if (!pixels || !rect || !rect->IsPacked() || width <= 0 || height <= 0) return;
+    size_t pixel = 0;
+    for (size_t i = 0; i + 1 < sizeof(kLogoRle); i += 2) {
+        const unsigned count = kLogoRle[i], color = kLogoRle[i + 1];
+        for (unsigned n = 0; n < count && pixel < 512u * 512u; ++n, ++pixel) {
+            const size_t x = pixel % 512u, y = pixel / 512u;
+            unsigned char* dst = pixels + ((size_t)(rect->Y + y) * (size_t)width + rect->X + x) * 4u;
+            std::memcpy(dst, kLogoPalette + color * 4u, 4u);
+        }
+    }
+    if (pixel != 512u * 512u) return;
+    atlas->CalcCustomRectUV(rect, &g_logoUv0, &g_logoUv1);
+    g_logoReady = true;
+}
+
+bool appNeedsResponsiveFrames() {
+    return g_playing || g_timelineRun || g_renderActive || g_testProc.active() || g_testSound.running();
+}
+
+void appDrawStartupSplash() {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::Begin("##startup", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs);
+    ImGui::PopStyleVar();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 origin = vp->WorkPos, size = vp->WorkSize;
+    dl->AddRectFilled(origin, ImVec2(origin.x + size.x, origin.y + size.y), IM_COL32(20, 23, 28, 255));
+    const float iconSize = S(240), left = origin.x + (size.x - iconSize) * .5f, top = origin.y + size.y * .5f - S(170);
+    drawLogo(dl, ImVec2(left, top), iconSize);
+    auto centerText = [&](const char* text, float y, ImU32 color, float scale) {
+        ImFont* font = ImGui::GetFont();
+        const float fontSize = ImGui::GetFontSize() * scale;
+        const ImVec2 extent = font->CalcTextSizeA(fontSize, FLT_MAX, 0.f, text);
+        dl->AddText(font, fontSize, ImVec2(origin.x + (size.x - extent.x) * .5f, y), color, text);
+    };
+    centerText("CAW - Code Audio Workstation", top + iconSize + S(18), IM_COL32(248, 244, 237, 255), 1.35f);
+    centerText("0.0.34 beta", top + iconSize + S(52), IM_COL32(220, 221, 225, 255), 1.f);
+    ImGui::End();
+}
+
 void appInit() {
     for (float& v : g_specSm) v = -120.f;
     refreshAudioDevices();
@@ -7661,7 +8966,7 @@ void drawHelpPanel() {
     ImGui::PopStyleColor();
 }
 
-void appFrame(float dt) {
+void appFrame(float dt, bool visible) {
     struct FrameTimer {   // CAW_FRAMELOG=1: log every UI frame that takes longer than 20 ms
         std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~FrameTimer() {
@@ -7671,8 +8976,21 @@ void appFrame(float dt) {
         }
     } frameTimer;
     ImGuiIO& io = ImGui::GetIO();
+    static const float baseFontScale = io.FontGlobalScale;
+    io.FontGlobalScale = baseFontScale * g_proj.cs.programFontSize / 17.f;
     pollProcesses(dt);
     pollTestAndScan(dt);
+    if (!visible) {
+        // Keep transport, export completion, recording, autosave and plugin
+        // learning alive without rebuilding an invisible arrangement.
+        updateMeters(dt);
+        updateRecording();
+        vstui::serviceLearn(g_proj);
+        if (g_playing && g_useCsoundApi) g_apiProc.setMasterGain(g_proj.cs.masterGain);
+        historyTick(dt);
+        tickAutosave(dt);
+        return;
+    }
     const bool globalKeys = !io.WantTextInput && !g_textEditorFocused;  // code editors keep their own Ctrl+Z
     if (io.KeyCtrl && !io.KeyShift && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_Q, false)) appRequestClose();
     if (!io.WantTextInput && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) saveProject(false);
@@ -7710,7 +9028,7 @@ void appFrame(float dt) {
     drawTransport();
     g_helpShown = g_helpNext; g_helpNext.clear();
     const float belowH = (g_showMonitor ? S(g_monitorH + kMonitorSplitterH) : 0.f) + helpPanelHeight();
-    const float autoMeterW = std::min(320.f, std::max(104.f, 40.f + masterChannels(g_proj.cs) * 28.f));
+    const float autoMeterW = std::min(320.f, std::max(160.f, 40.f + masterChannels(g_proj.cs) * 28.f));
     const float meterW = g_viewMeter ? S(g_meterW > 0.f ? g_meterW : autoMeterW) : 0.f;
     drawArrange(belowH, meterW);
     if (g_viewMeter) {
@@ -7723,6 +9041,22 @@ void appFrame(float dt) {
     }
     drawHelpPanel();
     ImGui::End();
+
+    if (g_confirmRenderOverwrite) {
+        ImGui::OpenPopup("Confirm audio export");
+        g_confirmRenderOverwrite = false;
+    }
+    if (ImGui::BeginPopupModal("Confirm audio export", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (g_renderWarnVst) ImGui::TextWrapped("CAW saves exposed writable VST parameter values, including unmapped ones. Plugin-specific state, samples and preset data may not be restored. Check your export.");
+        if (g_renderWillOverwrite) {
+            ImGui::TextWrapped("This file already exists: %s", renderFilePath().string().c_str());
+            ImGui::TextUnformatted("Replace it after the new export succeeds?");
+        }
+        if (ImGui::Button(g_renderWillOverwrite ? "Replace" : "Export anyway")) { ImGui::CloseCurrentPopup(); startRenderNow(); }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
 
     if (g_askSaveOnClose) { ImGui::OpenPopup("Save changes?###save_on_close"); g_askSaveOnClose = false; }
     if (ImGui::BeginPopupModal("Save changes?###save_on_close", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -7740,17 +9074,25 @@ void appFrame(float dt) {
     }
 
     drawSettings();
+    drawAudioExport();
     drawScoreEditor();
+    drawScoreExportWindow();
+    drawCodeExportWindow();
+    drawScoreMapWindow();
     drawEditor();
     drawAudioPool();
     drawIncludePool();
     drawMidiEditor();
     drawMultiMidiEditor();
+    vstui::drawWindows(g_proj);
+    if (g_playing && g_useCsoundApi) g_apiProc.setMasterGain(g_proj.cs.masterGain);
     historyTick(dt);
+    tickAutosave(dt);
 }
 
 // Close button / Ctrl+Q / File > Exit: with unsaved changes the program first asks to save.
 void appRequestClose() {
+    vstui::captureParameters(g_proj);
     if (serializeProject(g_proj) != g_savedSnap) g_askSaveOnClose = true;
     else g_quitRequested = true;
 }

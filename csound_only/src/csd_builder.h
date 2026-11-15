@@ -17,6 +17,7 @@ struct ParsedTrack {
     bool launcher = false;              // the code starts copies of itself (dawrun / schedule "this"): the clip's x field is then the copy count
     std::vector<int> lineMap;          // body line (0-based) -> line of the clip code (1-based, 0 = generated); kept in step with the meter taps
     int scoreSig = 0;                   // the code sends to the channel "score": 0 none, 1 number (k / i), 2 signal (a), 3 string
+    std::map<std::string, int> scoreStreams; // named cawscore streams: 1 k-rate, 2 a-rate, 3 string, 4 i-rate
     bool hasRec = false;                // the code sends to the channel "rec" (chnset kVal, "rec"): recorded into an automation lane (Capture / Rec)
     std::vector<std::string> writeChannels; // named automation destinations emitted by cawset
     int outChannels = 0;                // output channels found in out / outs / outq / outch ... (only when taps are on)
@@ -50,7 +51,7 @@ ParsedTrack parseTrack(const Track& t);
 // output channels gets `channels` consecutive entries (a mono instrument = 1, stereo = 2, quad = 4 ... max 8).
 // Master meter = one entry per output channel (nchnls), so indices 0 .. masterChannels-1 are the master outputs.
 inline int masterChannels(const CsoundSettings& s) { return s.nchnls < 1 ? 1 : (s.nchnls > 64 ? 64 : s.nchnls); }
-struct LaneMeterInfo { int trackId = 0; int first = 0; int channels = 0; };
+struct LaneMeterInfo { int trackId = 0; int first = 0; int channels = 0; bool csoundOnly = false; };
 std::vector<LaneMeterInfo> meterLayout(const Project& p);
 // Clips (unique names, project order) whose code sends to the channel "rec": the engine monitor streams them to the app for the live Rec button.
 std::vector<std::string> recClipNames(const Project& p);
@@ -58,6 +59,7 @@ struct CawWriteTarget { std::string clip, channel; };
 std::vector<CawWriteTarget> cawWriteTargets(const Project& p);
 constexpr int kMeterBands = 64;     // spectrum bands sent by the monitor instrument (25 Hz .. 18 kHz, logarithmic)
 constexpr int kScopePoints = 128;    // scope points per channel
+constexpr int kScoreSpectrumBins = 48; // log bands captured per audio-rate cawscore stream
 
 // Csound options of a live run as generated from the settings fields (used while "options" is empty).
 std::string defaultOptions(const CsoundSettings& s);
@@ -75,6 +77,10 @@ extern int (*g_cawDefaultDevice)(bool capture);
 // Set by the app before every Play: control periods per scope point (the scope time window).
 extern int g_cawScopeDiv;
 extern int g_cawScopePeak;
+// Local OSC port selected by the app; zero means the legacy text fallback.
+extern int g_cawMonitorPort;
+// Set only when the live engine is hosted through Csound's API.
+extern bool g_cawMonitorApi;
 
 // Run / Play link without port, stdin or tables: numbered command files (caw_cmd_<n>.txt + caw_cmd_serial.txt) that the running Csound reads when the serial changes.
 // Clips and automation channels are referred to by their number in these lists (fixed when Run is pressed).
@@ -90,6 +96,7 @@ struct TimelineEvent { bool automation = false; std::string name; double start =
 std::vector<TimelineEvent> timelineEvents(const Project& p, double from, bool includeSounding = true);
 unsigned long long timelineSignature(const Project& p);          // changes when anything Play would start changes
 
+std::string vstBusName(const Track& t);   // audio bus name of a VSTe track: cawsa "<name>", aL, aR
 std::string buildCsd(const Project& p, const std::string& mode, double fromTime = 0.0, std::vector<OrcSpan>* spans = nullptr);
 
 // One-clip test CSD (no audio output).

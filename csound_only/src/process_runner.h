@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-// Runs a console program (csound.exe) hidden, captures its stdout + stderr line by line.
+// Runs a console program (csound / csound.exe) hidden, captures its stdout + stderr line by line.
 class ProcessRunner {
 public:
     ProcessRunner();
@@ -22,7 +22,8 @@ public:
     std::vector<std::string> takeOutput();        // new lines since the last call
     const std::string& lastError() const;
 
+public:
+    struct Impl;   // platform specific, defined in process.cpp
 private:
-    struct Impl;
     std::unique_ptr<Impl> d;
 };

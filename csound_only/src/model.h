@@ -27,6 +27,7 @@ struct Clip {
     int scoreDetail = 0;                  // score: 0 OVERALL = the whole shape of the sound the clip makes (amplitude shape + frequency position, measured from the rendered clip); 1 DETAILED = additionally everything the code sends to the channel "score" (numbers, signals, strings), plus text, time and parameters
     bool scoreShowLang = false;           // score: the coding language (Csound) is written next to the name
     int scoreStyle = 0;                   // score, sound material: 0 shape, 1 line, 2 grains (scattered), 3 block, 4 sliced wave (granular), 5 FM graph, 6 dots and lines (keys, leads)
+    std::map<std::string, int> scoreDataStyle; // named streams: 0 default, 1 steps, 2 dots, 3 hidden, 4 audio spectrum
     std::string scoreLabel;               // score: text instead of the clip name (empty = name)
     double scoreFreqLo = 0.0;             // score: frequency band of this sound in Hz (0 / 0 = not set); makes the graphic lane a frequency axis
     double scoreFreqHi = 0.0;
@@ -48,6 +49,8 @@ struct MidiClip {
     double dur = 1.0;
     std::vector<MidiNote> notes;
     bool editorOpen = false;              // UI-only state, not serialized
+    std::string name;                     // empty = show the target instrument's name
+    bool muted = false;                   // mute only this MIDI region
 };
 
 // ---- score (SVG score export). Everything here is saved in the project file.
@@ -117,7 +120,7 @@ struct IncludeAsset {
 struct CawParam  { std::string chn; double min, max, step; double value; };  // value = start value of the channel
 
 struct Track {
-    int kind = 0;                                    // 0 = normal track (clips), 1 = marker track (comments / guidance), 2 = free automation (not linked to a clip: the Csound channel is the track NAME, read with chnget "Name")
+    int kind = 0;                                    // 0 Csound, 1 marker, 2 graph, 3 VSTi, 4 VSTe, 5 SuperCollider placeholder, 6 Pure Data placeholder
     int lang = 0;                                    // language of the template: always 0 = Csound
     double autoMin = 0.0, autoMax = 1.0;             // free automation (kind 2): value range
     std::vector<TrackMark> marks;                    // marker track (kind 1)
@@ -158,6 +161,15 @@ struct Track {
     int scoreLane = 0;                               // 0 = own lane in the score, >0 = id of a ScoreLaneDef this track belongs to
     int scoreOverlap = 0;                            // tracks with the same score name share ONE lane: 0 overlap = their shapes are combined into one (same colour: one shape, different colours: both colours), 1 separated = drawn on top of each other at 50% opacity, not combined
     std::map<std::string, int> scoreAuto;            // automation channel -> 0 hidden, 1 own automation lane with the full curve, 2 compact contour lane; missing = 1 (every automation with points is in the score)
+    // VSTi (kind 3) / VSTe (kind 4). The plugin file is kept in "code". Only the 8 picked parameters are visible to the code.
+    std::vector<int> vstPick;                        // plugin parameter indexes of kP1..kP8 (up to 8)
+    std::vector<double> vstInit;                     // value of each picked parameter when it was picked (start value of kP1..kP8)
+    std::string vstPath;                             // the .vst3 file
+    std::map<uint32_t, double> vstParameterState;     // writable parameter IDs and normalized values
+    std::string vstOut;                              // audio out: empty = master, else a bus name (a VSTe track name, or a free name Csound reads with cawra)
+    bool vstOutMaster = false;                       // with a bus: also to the master
+    std::vector<std::string> vstPickName;            // automation lane name of each picked parameter (the clips of the track get one lane per name)
+    int vstMidi = 2;                                 // VSTi: 0 = CAW MIDI clips, 1 = device MIDI, 2 = both
 };
 
 // General Csound engine settings (written into the generated CSD header / options)
@@ -179,15 +191,25 @@ struct CsoundSettings {
 
     // render + external csound program
     std::string csoundExe = "csound";       // full path to csound.exe, or just "csound" if it is on PATH
+    std::string ffmpegExe;                  // optional path to an ffmpeg executable
     std::string renderFile = "render.wav";
-    int renderFormat = 0;                   // 0 = WAV 16-bit, 1 = WAV 24-bit, 2 = WAV 32-bit float
+    int renderFormat = 0;                   // 0..2 WAV, 3 FLAC 24-bit, 4 MP3 via ffmpeg
     double tail = 2.0;                      // seconds of silence added after the last clip (reverb tails)
+    bool autosaveEnabled = false;           // separate recovery file, never overwrites the project
+    int autosaveMinutes = 5;
+    float masterGain = 1.f;                 // linear output gain, shared by live host output and export
+    int exportChannels = 2;                // output channels, independent of engine channel count
+    int exportFlacBits = 24;               // lossless FLAC bit depth, not bitrate
+    int exportMp3Kbps = 192;               // MP3 constant bitrate
+    float programFontSize = 17.f;           // interface font, independent of the code editor
     float editorFontSize = 17.f;
     int editorFontStyle = 0;                 // 0 regular, 1 bold, 2 italic
 };
 
 struct Project {
     CsoundSettings cs;
+    double loopStart = 0.0, loopEnd = 0.0;
+    bool loopEnabled = false;
     std::vector<Track> tracks;
     std::vector<TrackFolder> folders;                // folder groups of the track panel
     std::string udoCode;                             // project-wide Csound UDO definitions, emitted before instruments

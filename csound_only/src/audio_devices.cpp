@@ -1,10 +1,6 @@
 #include "audio_devices.h"
-#include "process.h"
-
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+#include "process_runner.h"
+#include <portaudio.h>
 
 #include <chrono>
 #include <regex>
@@ -51,5 +47,28 @@ std::vector<AudioDevice> listCsoundDevices(const std::string& executable,
     if (devices.empty()) {
         error = "Csound returned no device list for this backend. Check that this Csound build includes " + backend + ".";
     }
+    return devices;
+}
+
+std::vector<AudioDevice> listPortAudioDevices(bool output, std::string& error) {
+    error.clear();
+    std::vector<AudioDevice> devices;
+    const PaError init = Pa_Initialize();
+    if (init != paNoError) { error = std::string("PortAudio initialization: ") + Pa_GetErrorText(init); return devices; }
+    const int count = Pa_GetDeviceCount();
+    for (int i = 0; i < count; ++i) {
+        const PaDeviceInfo* d = Pa_GetDeviceInfo(i);
+        if (!d || !d->name) continue;
+        if ((output ? d->maxOutputChannels : d->maxInputChannels) <= 0) continue;
+        const PaHostApiInfo* host = Pa_GetHostApiInfo(d->hostApi);
+        if (!host || !host->name) continue;
+        AudioDevice dev;
+        dev.id = i;
+        dev.name = std::string(d->name) + " [" + host->name + ", " + std::to_string(d->maxInputChannels) + " in, " +
+                   std::to_string(d->maxOutputChannels) + " out]";
+        devices.push_back(std::move(dev));
+    }
+    Pa_Terminate();
+    if (devices.empty()) error = "PortAudio found no " + std::string(output ? "output" : "input") + " devices.";
     return devices;
 }

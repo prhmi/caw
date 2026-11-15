@@ -1,6 +1,9 @@
 #include <filesystem>
 #include "csd_builder.h"
 #include "caw_toggles.h"
+#include "vst_lang.h"
+#include "monitor_fft.h"
+#include "monitor_frame.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -13,6 +16,7 @@
 #include <set>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 
 std::string channelName(const std::string& instr, const std::string& chn) {
     return instr + "_" + chn;
@@ -25,6 +29,15 @@ std::string scoreProbePath() {
 }
 
 namespace {
+// Hex encoding keeps arbitrary literal stream names safe in Csound channel
+// names and in the whitespace-delimited probe file.
+std::string scoreNameHex(const std::string& name) {
+    static const char* digits = "0123456789abcdef";
+    std::string out;
+    for (unsigned char c : name) { out += digits[c >> 4]; out += digits[c & 15]; }
+    return out;
+}
+
 std::vector<std::string> splitArgs(const std::string& text) {
     std::vector<std::string> out;
     std::string cur;
@@ -89,7 +102,8 @@ int addMeterTaps(const std::string& instrName, std::string& body, std::vector<in
     return maxCh;
 }
 
-// "dawrun" / self-scheduling.  In a clip's code you can write
+// "cawMath" / self-scheduling. Legacy cawRun and dawrun remain supported.
+// In a clip's code you can write
 //     (cawRun is the short form: cawRun <p4 maths>, <p5 maths>, <p6 start step inc>, ...  with iRun = copies, indx = copy number)
 //     indx = 0
 //     while indx < 5 do
@@ -104,8 +118,8 @@ int addMeterTaps(const std::string& instrName, std::string& body, std::vector<in
 // srcBase: clip line of the first input line (1 = the code is the clip as typed, 0 = one generated line was put on top).
 std::string applyDawRun(const std::string& instrName, const std::string& code, int runs, bool& launcher,
                         std::vector<int>* map = nullptr, int srcBase = 1) {
-    static const std::regex selfRe(R"re(^(\s*)(?:schedule|dawrun|cawRun)\s+"this"\s*,\s*(.*)$)re");
-    static const std::regex dawRe(R"re(^(\s*)(?:dawrun|cawRun)\s+(.*)$)re");
+    static const std::regex selfRe(R"re(^(\s*)(?:schedule|dawrun|cawRun|cawMath)\s+"this"\s*,\s*(.*)$)re");
+    static const std::regex dawRe(R"re(^(\s*)(?:dawrun|cawRun|cawMath)\s+(.*)$)re");
     static const std::regex openRe(R"re(^\s*(?:while\b.*\bdo|until\b.*\bdo|if\b.*\bthen)\s*(?:;.*)?$)re");
     static const std::regex closeRe(R"re(^\s*(?:od|endif|fi)\s*(?:;.*)?$)re");
     std::vector<std::string> lines;
@@ -310,7 +324,21 @@ ParsedTrack parseCodeUncached(const std::string& instrName, const std::string& s
             std::smatch m;
             static const std::regex recSend(R"re(^(\s*chnset\s+)([^,;]+?)(\s*,\s*)"rec"(.*)$)re");
             static const std::regex writeSend(R"re(^(\s*)cawset\s+([^,;]+?)\s*,\s*"([^"]+)"(\s*(?:;.*)?)$)re");
-            if (std::regex_match(line, m, writeSend)) {
+            static const std::regex namedScore(R"re(^([ \t]*)cawscore[ \t]+"([^"\r\n]+)"[ \t]*,[ \t]*([^;]+?)([ \t]*(?:;.*)?)$)re");
+            if (std::regex_match(line, m, namedScore)) {
+                const std::string name = m[2].str(), expr = m[3].str();
+                size_t f = expr.find_first_not_of(" \t");
+                if (f != std::string::npos && (expr[f] == '-' || expr[f] == '+'))
+                    f = expr.find_first_not_of(" \t", f + 1);
+                const size_t ratePos = f != std::string::npos && expr[f] == 'g' && f + 1 < expr.size() ? f + 1 : f;
+                const char ch = ratePos == std::string::npos ? 'k' : expr[ratePos];
+                const int sig = (ch == '"' || ch == 'S') ? 3 : ch == 'a' ? 2 :
+                    (ch == 'i' || ch == 'p' || ch == '-' || ch == '+' || ch == '.' || (ch >= '0' && ch <= '9')) ? 4 : 1;
+                out.scoreStreams.emplace(name, sig);
+                line = m[1].str() + "chnset " + expr + ", \"" +
+                    channelName(instrName, "cawscore_" + scoreNameHex(name)) + "\"" + m[4].str();
+                changed = true;
+            } else if (std::regex_match(line, m, writeSend)) {
                 const std::string channel = m[3].str();
                 if (std::find(out.writeChannels.begin(), out.writeChannels.end(), channel) == out.writeChannels.end())
                     out.writeChannels.push_back(channel);
@@ -413,7 +441,7 @@ bool autoLaneActive(const Track& t, const std::string& channel) {
 bool clipHasMidiNotes(const Project& p, int clipId) {
     for (const Track& t : p.tracks)
         for (const MidiClip& mc : t.midiClips)
-            if (mc.clipId == clipId) for (const MidiNote& n : mc.notes) if (n.start < mc.dur) return true;
+            if (!mc.muted && mc.clipId == clipId) for (const MidiNote& n : mc.notes) if (n.start < mc.dur) return true;
     return false;
 }
 
@@ -421,7 +449,7 @@ std::vector<MidiNote> clipMidiNotes(const Project& p, int clipId) {
     std::vector<MidiNote> all;
     for (const Track& t : p.tracks)
         for (const MidiClip& mc : t.midiClips) {
-            if (mc.clipId != clipId) continue;
+            if (mc.muted || mc.clipId != clipId) continue;
             const double mcEnd = mc.start + mc.dur;
             for (const MidiNote& n : mc.notes) {
                 if (n.start >= mc.dur) continue;
@@ -446,7 +474,9 @@ const Clip* clipById(const Project& p, int id) {
 }  // namespace
 
 namespace {
-ParsedTrack parseClipWithRanges(const Clip& c, const Track* t, bool taps) {
+ParsedTrack parseClipWithRangesUncached(const Clip& c0, const Track* t, bool taps) {
+    Clip c = c0;
+    if (t && (t->kind == 3 || t->kind == 4)) c.code = vstlang::translate(*t, c0.code);   // CAW code -> Csound
     // Metadata is assembled privately for the existing preprocessor, never shown
     // or stored as part of the user's Csound text.
     std::string metadata;
@@ -467,9 +497,60 @@ ParsedTrack parseClipWithRanges(const Clip& c, const Track* t, bool taps) {
     }
     metadata += c.pFieldRules;
     if (c.midiEnabled) metadata += " midi: \"on\" ";
-    if (c.code.find("<caw>") != std::string::npos)
-        return parseCode(c.name, c.code, taps, c.runs); // older projects during import
+    if (c.code.find("<caw>") != std::string::npos) {
+        ParsedTrack parsed = parseCode(c.name, c.code, taps, c.runs); // older projects during import
+        parsed.midiEnabled = parsed.midiEnabled || c.midiEnabled;
+        return parsed;
+    }
     return parseCode(c.name, "<caw>" + metadata + "</caw>" + c.code, taps, c.runs);
+}
+
+// Cache the entire clip parse, including metadata scans and VST translation.
+// The exact key contains every input used by this parser; editing code, MIDI,
+// parameter ranges or VST routing/parameter names causes a fresh parse.
+ParsedTrack parseClipWithRanges(const Clip& c, const Track* t, bool taps) {
+    static std::unordered_map<std::string, ParsedTrack> cache;
+    static size_t bytes = 0;
+    std::string key;
+    auto addRaw = [&key](const auto& value) {
+        key.append(reinterpret_cast<const char*>(&value), sizeof(value));
+    };
+    auto addText = [&key, &addRaw](const std::string& value) {
+        const size_t n = value.size(); addRaw(n); key.append(value);
+    };
+    addText(c.name); addText(c.code); addText(c.pFieldRules);
+    addRaw(c.runs); addRaw(c.midiEnabled); addRaw(taps);
+    const bool hasTrack = t != nullptr; addRaw(hasTrack);
+    if (t) {
+        addRaw(t->kind);
+        const size_t count = t->automationRanges.size(); addRaw(count);
+        for (const auto& item : t->automationRanges) {
+            addText(item.first);
+            addRaw(item.second.min); addRaw(item.second.max);
+            addRaw(item.second.step); addRaw(item.second.value);
+        }
+        if (t->kind == 3 || t->kind == 4) {
+            addRaw(t->id); addText(t->name);
+            const size_t picks = t->vstPick.size(); addRaw(picks);
+            const size_t names = t->vstPickName.size(); addRaw(names);
+            for (const std::string& name : t->vstPickName) addText(name);
+        }
+    }
+    const auto found = cache.find(key);
+    if (found != cache.end()) return found->second;
+    ParsedTrack parsed = parseClipWithRangesUncached(c, t, taps);
+    // Bound retained source/output memory. A single huge clip is not cached.
+    size_t estimate = sizeof(ParsedTrack) + key.size() + parsed.body.size() + parsed.lineMap.size() * sizeof(int);
+    for (const auto& p : parsed.params) estimate += p.chn.size() + sizeof(p);
+    for (const auto& s : parsed.writeChannels) estimate += s.size();
+    for (const auto& s : parsed.scoreStreams) estimate += s.first.size() + sizeof(s) + 3 * sizeof(void*);
+    constexpr size_t maxBytes = 16u * 1024u * 1024u;
+    if (estimate <= maxBytes) {
+        if (bytes + estimate > maxBytes || cache.size() >= 4096) { cache.clear(); bytes = 0; }
+        cache.emplace(std::move(key), parsed);
+        bytes += estimate;
+    }
+    return parsed;
 }
 }
 
@@ -480,10 +561,18 @@ std::vector<LaneMeterInfo> meterLayout(const Project& p) {
     std::vector<LaneMeterInfo> out;
     int next = masterChannels(p.cs);
     for (const Track& t : p.tracks) {
-        int ch = 0;
-        for (const Clip& c : t.clips) ch = std::max(ch, parseClip(c, true).outChannels);
+        const bool vst = t.kind == 3 || t.kind == 4;
+        int ch = vst ? 2 : 0; // the VST rack currently produces stereo
+        if (!vst) for (const Clip& c : t.clips) ch = std::max(ch, parseClip(c, true).outChannels);
         if (ch <= 0) continue;
-        out.push_back({t.id, next, ch});
+        bool csoundOnly = false;
+        if (vst && !vstlang::cleanBus(t.vstOut).empty() && !t.vstOutMaster) {
+            bool feedsEffect = false;
+            for (const Track& dest : p.tracks)
+                if (dest.kind == 4 && vstlang::busName(dest) == vstlang::cleanBus(t.vstOut)) { feedsEffect = true; break; }
+            csoundOnly = !feedsEffect;
+        }
+        out.push_back({t.id, next, ch, csoundOnly});
         next += ch;
     }
     return out;
@@ -641,6 +730,8 @@ void syncOptionsFromSettings(CsoundSettings& s) {
 int (*g_cawDefaultDevice)(bool capture) = nullptr;
 int g_cawScopeDiv = 1;
 int g_cawScopePeak = 0;
+int g_cawMonitorPort = 0;
+bool g_cawMonitorApi = false;
 
 std::string buildOptions(const CsoundSettings& s, const std::string& mode) {
     if (mode != "render") {
@@ -658,15 +749,16 @@ std::string buildOptions(const CsoundSettings& s, const std::string& mode) {
         }
         return opts;
     }
-    static const char* fmt[] = {"-W -s", "-W -3", "-W -f"};
-    return std::string(fmt[std::min(2, std::max(0, s.renderFormat))]) + " -d";
+    // CAW owns offline audio output and writes the chosen file itself.
+    return "-n -d";
 }
 
 std::vector<std::string> engineClipNames(const Project& p) {
     std::vector<std::string> out;
+    std::unordered_set<std::string> seen;
     for (const Track& t : p.tracks)
         for (const Clip& c : t.clips)
-            if (std::find(out.begin(), out.end(), c.name) == out.end()) out.push_back(c.name);
+            if (seen.insert(c.name).second) out.push_back(c.name);
     return out;
 }
 
@@ -678,11 +770,12 @@ std::string engineFilePrefix() {   // the command files: <prefix>serial.txt and 
 
 std::vector<std::string> engineChannelNames(const Project& p) {
     std::vector<std::string> out;
+    std::unordered_set<std::string> seen;
     for (const Track& t : p.tracks)
         for (const Clip& c : t.clips)
             for (const CawParam& prm : parseClip(c).params) {
                 const std::string n = channelName(c.name, prm.chn);
-                if (std::find(out.begin(), out.end(), n) == out.end()) out.push_back(n);
+                if (seen.insert(n).second) out.push_back(n);
             }
     return out;
 }
@@ -703,9 +796,12 @@ std::vector<TimelineEvent> timelineEvents(const Project& p, double from, bool in
         ev.automation = automation; ev.name = name; ev.start = st; ev.dur = du; ev.a = a; ev.b = b;
         out.push_back(std::move(ev));
     };
+    std::unordered_map<int, const Clip*> clipsById;
+    for (const Track& t : p.tracks)
+        for (const Clip& c : t.clips) clipsById.emplace(c.id, &c);  // first duplicate matches old lookup
     auto findClip = [&](int id) -> const Clip* {
-        for (const Track& t : p.tracks) for (const Clip& c : t.clips) if (c.id == id) return &c;
-        return nullptr;
+        const auto it = clipsById.find(id);
+        return it == clipsById.end() ? nullptr : it->second;
     };
     bool anySolo = false;
     for (const Track& t : p.tracks) if (t.solo && !t.muted) anySolo = true;
@@ -723,10 +819,11 @@ std::vector<TimelineEvent> timelineEvents(const Project& p, double from, bool in
                 const int runs = pc.launcher ? 1 : std::min(256, std::max(1, c.runs));
                 for (int r = 0; r < runs; ++r)
                     add(false, c.name, c.start + c.dur * (double)r / runs, c.start + c.dur * (double)(r + 1) / runs,
-                        pc.midiEnabled ? 60.0 : 0.0, pc.midiEnabled ? 100.0 : 0.0);
+                        (t.kind == 0 && pc.midiEnabled) ? 60.0 : 0.0, (t.kind == 0 && pc.midiEnabled) ? 100.0 : 0.0);
             }
             // 2. MIDI clips are free in time: they only borrow the instrument (name) of their Csound clip; every note is one start (p4 pitch, p5 velocity)
             for (const MidiClip& mc : t.midiClips) {
+                if (mc.muted) continue;
                 const Clip* target = findClip(mc.clipId);
                 if (!target || target->muted) continue;
                 for (const MidiNote& n : mc.notes) {
@@ -861,18 +958,90 @@ std::string resolveCawFiles(const Project& p, const std::string& code) {
     return result;
 }
 
+// ---- VSTi / VSTe tracks: one always-running instrument holds the track code; the engine thread (vst_rack.h) reads the channels it writes.
+std::string vstBusName(const Track& t) { return vstlang::busName(t); }
+// Declarations of a VST track (once): the parameter channels, the MIDI event ring (a table the engine reads), the note helper instrument.
+std::string vstOrchestra(const Track& t) {
+    const std::string id = std::to_string(t.id), bus = vstBusName(t);
+    const size_t n = std::min<size_t>(8, t.vstPick.size());
+    std::ostringstream o;
+    o << "gkCawVstW_" << id << " init 0\n"
+      << "giCawVstTab_" << id << " ftgen 0, 0, 4096, 2, 0\n"
+      << "chn_k \"cawvst_" << id << "_wr\", 3\nchn_k \"cawvst_" << id << "_tab\", 3\n"
+      << "chnset giCawVstTab_" << id << ", \"cawvst_" << id << "_tab\"\n";
+    for (size_t k = 1; k <= n; ++k) {
+        const double saved = k <= t.vstInit.size() && std::isfinite(t.vstInit[k - 1]) ? t.vstInit[k - 1] : 0.5;
+        const double initial = std::min(1.0, std::max(0.0, saved));
+        o << "chn_k \"cawvst_" << id << "_p" << k << "\", 3\n"
+          << "chnset " << std::setprecision(10) << initial << ", \"cawvst_" << id << "_p" << k << "\"\n";
+    }
+    if (t.kind == 4) o << "chn_a \"cawbus_" << bus << "_L\", 3\nchn_a \"cawbus_" << bus << "_R\", 3\n";
+    if (!vstlang::cleanBus(t.vstOut).empty()) {
+        const std::string ob = vstlang::cleanBus(t.vstOut);
+        o << "chn_a \"cawbus_" << ob << "_L\", 3\nchn_a \"cawbus_" << ob << "_R\", 3\n";
+    }
+    o << "opcode CawVstEv_" << id << ", 0, kkk\n"                      // one MIDI message into the ring: status, data1, data2
+      << "kS, kD1, kD2 xin\n"
+      << "gkCawVstW_" << id << " = gkCawVstW_" << id << " + 1\n"
+      << "kBase = (gkCawVstW_" << id << " % 1024) * 4\n"
+      << "tablew kS, kBase, giCawVstTab_" << id << "\ntablew kD1, kBase + 1, giCawVstTab_" << id << "\ntablew kD2, kBase + 2, giCawVstTab_" << id << "\n"
+      << "chnset gkCawVstW_" << id << ", \"cawvst_" << id << "_wr\"\nendop\n\n"
+      << "instr CawVstNote_" << id << "\n"                              // one note: on at the start, off when it ends
+      << "kF init 1\nkOff init 0\nif kF == 1 then\nCawVstEv_" << id << " 144, p4, p5\nkF = 0\nendif\n"
+      << "xtratim 0.02\nkR release\nif kR == 1 && kOff == 0 then\nCawVstEv_" << id << " 128, p4, 0\nkOff = 1\nendif\nendin\n\n";
+    return o.str();
+}
+const char* kVstUdos =
+    "opcode cawsa, 0, Saa\n"                       // cawsa "TrackName", aLeft, aRight: send audio into a VSTe track (any number of senders add up)
+    "SN, aL, aR xin\n"
+    "SA strcat \"cawbus_\", SN\nSL strcat SA, \"_L\"\nSR strcat SA, \"_R\"\n"
+    "chnmix aL, SL\nchnmix aR, SR\n"
+    "endop\n\n"
+    "opcode cawra, aa, S\n"                       // aL, aR cawra "BusName": read the sound a VSTi / VSTe sent to the bus "BusName"
+    "SN xin\n"
+    "SA strcat \"cawbus_\", SN\nSL strcat SA, \"_L\"\nSR strcat SA, \"_R\"\n"
+    "aL chnget SL\naR chnget SR\n"
+    "xout aL, aR\n"
+    "endop\n\n";
+
+// Append to one buffer while counting emitted lines. This avoids copying and
+// rescanning the complete orchestra prefix for every source-map entry.
+class CountingStringBuffer : public std::streambuf {
+public:
+    std::string str() const { return buffer_.str(); }
+    size_t lines() const { return lines_; }
+protected:
+    std::streamsize xsputn(const char* data, std::streamsize count) override {
+        const std::streamsize written = buffer_.sputn(data, count);
+        lines_ += (size_t)std::count(data, data + written, '\n');
+        return written;
+    }
+    int_type overflow(int_type ch) override {
+        if (traits_type::eq_int_type(ch, traits_type::eof())) return traits_type::not_eof(ch);
+        const int_type result = buffer_.sputc(traits_type::to_char_type(ch));
+        if (!traits_type::eq_int_type(result, traits_type::eof()) && traits_type::to_char_type(ch) == '\n') ++lines_;
+        return result;
+    }
+private:
+    std::stringbuf buffer_;
+    size_t lines_ = 0;
+};
+
 std::string buildCsd(const Project& p, const std::string& mode, double fromTime, std::vector<OrcSpan>* spans) {
     if (spans) spans->clear();
-    std::ostringstream o;
+    CountingStringBuffer orchestraBuffer;
+    std::ostream o(&orchestraBuffer);
     o << "<CsoundSynthesizer>\n<CsOptions>\n" << buildOptions(p.cs, mode) << "\n</CsOptions>\n"
       << "<CsInstruments>\n" << buildHeader(p.cs) << "\n";
     o << automationOpcodes();
+    for (const Track& t : p.tracks) if (t.kind == 3 || t.kind == 4) { o << kVstUdos; break; }
     if (!p.orchestraCode.empty()) o << resolveCawFiles(p, p.orchestraCode) << "\n\n";
     o << includeDirectives(p, false);
     if (!p.includes.empty()) o << "\n";
     if (!p.udoCode.empty()) o << resolveCawFiles(p, p.udoCode) << "\n\n";
     for (const std::string& instr : p.instrPool) o << resolveCawFiles(p, instr) << "\n\n";
     const bool engine = mode == "engine";
+    const std::vector<std::string> chans = engineChannelNames(p);
     {   // names the timeline refers to by number (see engineChannelNames)
         auto arr = [&o](const char* var, const std::vector<std::string>& v) {
             o << var << "[] fillarray ";
@@ -880,7 +1049,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
             for (size_t i = 0; i < v.size(); ++i) o << (i ? ", " : "") << "\"" << v[i] << "\"";
             o << "\n";
         };
-        arr("gSCawChans", engineChannelNames(p));            // automation ramps (CawAuto) name their channel by number
+        arr("gSCawChans", chans);                           // automation ramps (CawAuto) name their channel by number
         if (engine) {
             arr("gSCawClips", engineClipNames(p));            // the commands name clips by number (fixed when Run is pressed)
             o << "giCawSerial init 0\ngiCawTabA init 0\ngiCawTabB init 0\n";
@@ -908,7 +1077,8 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
     const bool probe = mode == "render" && p.score.analyze;           // Render audio also measures the clips for the score
     const bool tap = (engine && p.cs.monitorFeed) || probe;           // meter buses (gaCawT_*) are needed by the monitor and by the probe
     std::vector<std::string> probeAmp;                                // clips measured (amplitude + frequency)
-    std::vector<std::pair<std::string, int>> probeData;              // clips that send to the channel "score" (name, 1 number / 2 signal / 3 string)
+    struct ProbeStream { std::string clip, stream; int sig; };
+    std::vector<ProbeStream> probeData;
     std::set<std::string> busDeclared;
     if (tap) {   // meter buses must exist before the instruments that write to them
         for (const Track& t : p.tracks)
@@ -920,6 +1090,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
     }
 
     for (const Track& t : p.tracks) {
+        if (t.kind == 3 || t.kind == 4) o << vstOrchestra(t);   // then its clips are built like any other clip (CAW code translated first)
 
         // Every clip is its own instrument: own instr name, own code, own channels, own MIDI.
         for (const Clip& clip : t.clips) {
@@ -929,7 +1100,12 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                     if (pc.outChannels >= 1) probeAmp.push_back(clip.name);
                     if (pc.scoreSig) {
                         o << (pc.scoreSig == 2 ? "chn_a" : pc.scoreSig == 3 ? "chn_S" : "chn_k") << " \"" << channelName(clip.name, "score") << "\", 3\n";
-                        probeData.push_back({clip.name, pc.scoreSig});
+                        probeData.push_back({clip.name, "", pc.scoreSig});
+                    }
+                    for (const auto& stream : pc.scoreStreams) {
+                        const std::string chan = channelName(clip.name, "cawscore_" + scoreNameHex(stream.first));
+                        o << (stream.second == 2 ? "chn_a" : stream.second == 3 ? "chn_S" : "chn_k") << " \"" << chan << "\", 3\n";
+                        probeData.push_back({clip.name, stream.first, stream.second});
                     }
                 }
                 for (const CawParam& c : pc.params) {
@@ -944,10 +1120,9 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                     if (!channel.empty()) o << "chn_k \"" << channelName(clip.name, "write_" + channel) << "\", 3\n";
                 o << "\ninstr " << clip.name << "\n";
                 if (spans) {
-                    const std::string so = o.str();
                     OrcSpan sp;
                     sp.name = clip.name;
-                    sp.first = (int)std::count(so.begin(), so.end(), '\n') + 1;   // Csound counts the lines of the whole .csd file (options and header lines included)
+                    sp.first = (int)orchestraBuffer.lines() + 1;  // lines of the whole .csd, including header
                     sp.lineMap = pc.lineMap;
                     spans->push_back(sp);
                 }
@@ -958,7 +1133,6 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
 
     // ---- the score = the timeline events: every clip is an instrument, its start time on the timeline is p2 (a render and a live Play use the same score)
     {
-        const std::vector<std::string> chans = engineChannelNames(p);
         o << "instr CawAuto\nSCawC = gSCawChans[p6 - 1]\nkCawA line p4, p3, p5\nchnset kCawA, SCawC\nendin\n\n";   // a ramp of one automation channel: p4 -> p5 over p3, p6 = channel number
         if (!engine) {   // Run only defines the instruments; Play sends the same events to the running Csound (see CawTransport)
             for (const TimelineEvent& ev : timelineEvents(p, fromTime)) {
@@ -976,8 +1150,9 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
         }
     }
     if (engine) {
-        // Run: Csound stays alive. The app talks to it with small numbered command files (no ports, no stdin, only NUMBERS: no text is parsed in Csound):
-        //   caw_cmd_serial.txt  = the number of the last command, 8 digits, changed IN PLACE (never replaced); CawPoll looks at it 100 times a second, nothing is printed
+        // Run: Csound stays alive and reads small numbered command files.
+        // The API host publishes the last completed serial via a control channel;
+        // the legacy process path polls caw_cmd_serial.txt instead.
         //   caw_cmd_<n>.txt     = command n:  mode  rows  then <rows> rows of 6 numbers:  type  number  delay  dur  a  b
         //       mode 1 = replaces the running timeline, 0 = plays next to it
         //       type 10 start clip <number> (delay s from now, dur, p4 = a, p5 = b)   type 11 ramp of channel <number> from a to b
@@ -987,22 +1162,36 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
         const std::string pre = engineFilePrefix();
         o << "instr CawStop\n"                                   // silence: every clip and every ramp
           << "iCawK = 0\niCawLen lenarray gSCawClips\n"
-          << "while iCawK < iCawLen do\nSCawN = gSCawClips[iCawK]\niCawL strlen SCawN\nif iCawL > 0 then\nturnoff2i SCawN, 0, 0\nendif\niCawK += 1\nod\n"
-          << "turnoff2i \"CawAuto\", 0, 0\nendin\n\n"
-          << "instr CawStopOne\nSCawN = gSCawClips[p4 - 1]\nturnoff2i SCawN, 0, 0\nendin\n\n"
+          << "while iCawK < iCawLen do\nSCawN = gSCawClips[iCawK]\niCawL strlen SCawN\nif iCawL > 0 then\nturnoff2_i nstrnum(SCawN), 0, 0\nendif\niCawK += 1\nod\n"
+          << "turnoff2_i nstrnum(\"CawAuto\"), 0, 0\n";
+        // VST note events live in separate child instruments. Release those
+        // too, so a loop wrap or transport stop sends their note-offs.
+        for (const Track& track : p.tracks)
+            if (track.kind == 3 || track.kind == 4)
+                o << "turnoff2_i nstrnum(\"CawVstNote_" << track.id << "\"), 0, 1\n";
+        o << "endin\n\n"
+          << "instr CawStopOne\nSCawN = gSCawClips[p4 - 1]\nturnoff2_i nstrnum(SCawN), 0, 0\nendin\n\n"
           << "opcode CawNum, i, S\nSIn xin\niLen strlen SIn\niJ = 1\niN = 0\n"          // the digits of a text as a number (a CR / LF or an empty text does no harm)
           << "while iJ <= iLen do\niC strchar SIn, iJ\nif iC >= 48 && iC <= 57 then\niN = iN * 10 + iC - 48\nendif\niJ += 1\nod\nxout iN\nendop\n\n"
-          << "instr CawPoll\nkCawT metro 100\nif kCawT == 1 then\nevent \"i\", \"CawLoad\", 0, 0\nendif\nendin\n\n"
-          << "instr CawLoad\n"
-          << "SCawL, iCawOk readfi \"" << pre << "serial.txt\"\n"
-          << "iCawS CawNum SCawL\n"
-          << "if iCawOk > 0 then\n"
-          << "while giCawSerial < iCawS do\n"                  // every command that is new, in order
+          ;
+        if (g_cawMonitorApi) {
+            // The API host publishes completed command files through a channel.
+            o << "instr CawPoll\nkCawT metro 100\nkCawS chnget \"__caw_cmd_serial\"\n"
+              << "if kCawT == 1 && kCawS > giCawSerial then\n"
+              << "event \"i\", \"CawLoad\", 0, 0, kCawS\nendif\nendin\n\n"
+              << "instr CawLoad\niCawS = p4\nif iCawS > 0 then\n";
+        } else {
+            o << "instr CawPoll\nkCawT metro 100\nif kCawT == 1 then\nevent \"i\", \"CawLoad\", 0, 0\nendif\nendin\n\n"
+              << "instr CawLoad\n"
+              << "SCawL, iCawOk readfi \"" << pre << "serial.txt\"\n"
+              << "iCawS CawNum SCawL\nif iCawOk > 0 then\n";
+        }
+        o << "while giCawSerial < iCawS do\n"                  // every command that is new, in order
           << "giCawSerial += 1\n"
           << "SCawF sprintf \"" << pre << "%d.txt\", giCawSerial\n"
           << "iCawF ftgen 0, 0, 0, -23, SCawF\n"
           << "iCawMode table 0, iCawF\niCawRows table 1, iCawF\n"
-          << "if iCawMode == 1 then\nturnoff2i \"CawTransport\", 0, 0\nturnoff2i \"CawAuto\", 0, 0\nendif\n"
+          << "if iCawMode == 1 then\nturnoff2_i nstrnum(\"CawTransport\"), 0, 0\nturnoff2_i nstrnum(\"CawAuto\"), 0, 0\nendif\n"
           << "if iCawRows > 0 then\n"
           << "iCawSz = iCawRows * -6\niCawTn ftgen 0, 0, iCawSz, -2, 0\n"
           << "if iCawMode == 1 then\nif giCawTabB > 0 then\nftfree giCawTabB, 0\nendif\ngiCawTabB = giCawTabA\ngiCawTabA = iCawTn\nendif\n"
@@ -1016,10 +1205,10 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
           << "elseif iCawTy == 12 then\niCawP1 = nstrnum(\"CawStop\")\n"
           << "else\niCawP1 = nstrnum(\"CawStopOne\")\niCawA = iCawIx\nendif\n"
           << "iCawQ = iCawK * 6\n"
-          << "tabwi iCawP1, iCawQ, iCawTn\ntabwi iCawDl, iCawQ + 1, iCawTn\ntabwi iCawDu, iCawQ + 2, iCawTn\n"
-          << "tabwi iCawA, iCawQ + 3, iCawTn\ntabwi iCawB, iCawQ + 4, iCawTn\ntabwi iCawP6, iCawQ + 5, iCawTn\n"
+          << "tabw_i iCawP1, iCawQ, iCawTn\ntabw_i iCawDl, iCawQ + 1, iCawTn\ntabw_i iCawDu, iCawQ + 2, iCawTn\n"
+          << "tabw_i iCawA, iCawQ + 3, iCawTn\ntabw_i iCawB, iCawQ + 4, iCawTn\ntabw_i iCawP6, iCawQ + 5, iCawTn\n"
           << "iCawK += 1\nod\n"
-          << "eventi \"i\", \"CawTransport\", 0, 86400, iCawTn, iCawRows\n"
+          << "event_i \"i\", \"CawTransport\", 0, 86400, iCawTn, iCawRows\n"
           << "endif\n"
           << "ftfree iCawF, 0\n"
           << "od\n"
@@ -1038,10 +1227,9 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
           << "if kCawRow >= p5 then\nturnoff\nendif\nendin\n\n";
         score << "i \"CawPoll\" 0 86400\n";
         if (p.cs.monitorFeed && !cawEnv("CAW_NO_MON")) {
-            // ---- monitor: runs after every other instrument and prints meter / scope / spectrum frames (20 per second)
+            // ---- monitor: runs after every other instrument; OSC when enabled, otherwise legacy text
             const std::vector<LaneMeterInfo> layout = meterLayout(p);
             std::ostringstream mon;
-            mon << "opcode CawBand, k, aii\naIn, iF, iBw xin\naB butterbp aIn, iF, iBw\nkR rms aB\nxout kR\nendop\n\n";   // one spectrum band
             const int mch = masterChannels(p.cs);
             // every output channel of the master (nchnls) gets its own peak meter
             if (p.cs.nchnls <= 1) {
@@ -1051,12 +1239,12 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                 for (int c = 1; c <= p.cs.nchnls; ++c) list += std::string(c > 1 ? ", " : "") + "aM" + std::to_string(c);
                 mon << "instr CawMon\n" << list << " monitor\naL = aM1\naR = aM2\n";
             }
-            mon << "kTrig metro 20\n";
+            mon << "kTrig metro 30\n";
             std::vector<std::string> peaks;
             for (int c = 1; c <= mch; ++c) {
                 const std::string id = std::to_string(c);
                 mon << "aAbsM" << id << " = abs(aM" << id << ")\n"
-                    << "kPkM" << id << " maxk aAbsM" << id << ", kTrig, 1\n";
+                    << "kPkM" << id << " max_k aAbsM" << id << ", kTrig, 1\n";
                 peaks.push_back("kPkM" + id);
             }
             // lane buses
@@ -1067,14 +1255,15 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                     for (int c = 1; c <= lm.channels; ++c) {
                         std::string sum;
                         std::set<std::string> seen;
-                        for (const Clip& clip : t.clips) {
+                        if (t.kind != 3 && t.kind != 4) for (const Clip& clip : t.clips) {
                             if (!seen.insert(clip.name).second) continue;
                             if (parseClip(clip, true).outChannels < c) continue;
                             sum += (sum.empty() ? "" : " + ") + std::string("gaCawT_") + clip.name + "_" + std::to_string(c);
                         }
+                        // VST peaks arrive from the API rack, not from Csound's clip tap buses.
                         const std::string id = std::to_string(lm.first + c - 1);
                         mon << "aLn" << id << " = abs(" << (sum.empty() ? "0" : sum) << ")\n"
-                            << "kLn" << id << " maxk aLn" << id << ", kTrig, 1\n";
+                            << "kLn" << id << " max_k aLn" << id << ", kTrig, 1\n";
                         peaks.push_back("kLn" + id);
                     }
                 }
@@ -1084,8 +1273,8 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                 for (const Track& t : p.tracks) for (const Clip& c : t.clips) if (c.name == name) ch = std::max(ch, parseClip(c, true).outChannels);
                 for (int c = 1; c <= ch; ++c) mon << "gaCawT_" << name << "_" << c << " = 0\n";
             }
-            // scope ring buffers: one decimated point per kDiv control periods,
-            // either the latest point or the largest signed point in the bucket.
+            // Legacy scope data is only needed by the text fallback.
+            if (!g_cawMonitorApi && g_cawMonitorPort == 0) {
             mon << "kDiv init " << std::max(1, g_cawScopeDiv) << "\n"   // control periods per scope point (= the scope time window, set by the app before each Play)
                 << "kScL[] init " << kScopePoints << "\nkScR[] init " << kScopePoints << "\nkW init 0\nkScN init 0\nkAccL init 0\nkAccR init 0\n"
                 << "kSmpL downsamp aL\nkSmpR downsamp aR\n";
@@ -1097,49 +1286,86 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
             mon
                 << "kScN = kScN + 1\nif kScN >= kDiv then\nkScL[kW] = kAccL\nkScR[kW] = kAccR\nkAccL = 0\nkAccR = 0\nkScN = 0\n"
                 << "kW = kW + 1\nif kW >= " << kScopePoints << " then\nkW = 0\nendif\nendif\n";
-            // spectrum bands
-            mon << "aMono = (aL + aR) * 0.5\n";
-            const double ratio = std::pow(18000.0 / 25.0, 1.0 / (kMeterBands - 1));
-            // 16 real band filters (every 4th band + the last), the other bands are interpolated in a loop when a frame is sent.
-            auto computed = [&](int b) { return b % 4 == 0 || b == kMeterBands - 1; };
-            mon << "kB[] init " << kMeterBands << "\n";
-            for (int b = 0; b < kMeterBands; ++b) {
-                if (!computed(b)) continue;
-                const double fc = 25.0 * std::pow(ratio, b);
-                if (fc * 1.2 > p.cs.sr * 0.45) continue;   // above what this sample rate can hold: stays 0
-                mon << "kBt CawBand aMono, " << fc << ", " << fc * (ratio - 1.0) * 1.5 << "\nkB[" << b << "] = kBt\n";
             }
-            // ---- send one frame to the app: a text line on Csound's output (CAWM / CAWS / CAWL / CAWR <first index> <values>), 20 times a second
-            auto sendList = [&](char tag, int startIndex, const std::vector<std::string>& names) {
-                for (size_t i = 0; i < names.size(); i += 16) {
-                    const size_t n = std::min<size_t>(16, names.size() - i);
+            // Legacy text output (also retained for the explicit fallback).
+            auto sendList = [&](char tag, int startIndex, const std::vector<std::string>& names, const char* trigger = "kTrig", size_t chunkSize = 16) {
+                for (size_t i = 0; i < names.size(); i += chunkSize) {
+                    const size_t n = std::min(chunkSize, names.size() - i);
                     mon << "printf \"CAW" << tag << " " << (startIndex + (int)i);
-                    for (size_t k = 0; k < n; ++k) mon << " %f";
-                    mon << "\\n\", kTrig";
+                    for (size_t k = 0; k < n; ++k) mon << " %.9g";
+                    mon << "\\n\", " << trigger;
                     for (size_t k = 0; k < n; ++k) mon << ", " << names[i + k];
                     mon << "\n";
                 }
             };
-            // when a frame is sent (20 times a second): unwrap the scope ring buffer and fill the interpolated spectrum bands
+            if (!g_cawMonitorApi && g_cawMonitorPort == 0) {
             mon << "kOutL[] init " << kScopePoints << "\nkOutR[] init " << kScopePoints << "\n"
                 << "if kTrig == 1 then\n"
                 << "kJ = 0\nwhile kJ < " << kScopePoints << " do\n"
                 << "kQ = kW + kJ\nif kQ >= " << kScopePoints << " then\nkQ = kQ - " << kScopePoints << "\nendif\n"
                 << "kOutL[kJ] = kScL[kQ]\nkOutR[kJ] = kScR[kQ]\nkJ += 1\nod\n"
-                << "kJ = 0\nwhile kJ < " << kMeterBands << " do\n"
-                << "kLo = 4 * int(kJ / 4)\nkHi = min(" << (kMeterBands - 1) << ", kLo + 4)\n"
-                << "if kHi > kLo then\nkW2 = (kJ - kLo) / (kHi - kLo)\nkB[kJ] = kB[kLo] * (1 - kW2) + kB[kHi] * kW2\nendif\nkJ += 1\nod\n"
                 << "endif\n";
-            sendList('M', 0, peaks);
-            std::vector<std::string> bands, scopeL, scopeR;
-            for (int b = 0; b < kMeterBands; ++b) bands.push_back("kB[" + std::to_string(b) + "]");
-            sendList('S', 0, bands);
+            }
+            if (g_cawMonitorApi) {
+                mon << "if kTrig == 1 then\n";
+                for (size_t i = 0; i < peaks.size(); ++i)
+                    mon << "chnset " << peaks[i] << ", \"__caw_meter_" << i << "\"\n";
+                mon << "endif\n";
+            } else if (g_cawMonitorPort > 0) {
+                mon << "kMeterSeq init 0\nif kTrig == 1 then\nkMeterSeq = (kMeterSeq + 1) % 1000000\nendif\n";
+                for (size_t i = 0; i < peaks.size(); i += 16) {
+                    const size_t n = std::min<size_t>(16, peaks.size() - i);
+                    mon << "OSCsend kMeterSeq, \"127.0.0.1\", " << g_cawMonitorPort
+                        << ", \"/caw/meter\", \"ii" << std::string(n, 'f')
+                        << "\", kMeterSeq, " << i;
+                    for (size_t k = 0; k < n; ++k) mon << ", " << peaks[i + k];
+                    mon << "\n";
+                }
+            } else sendList('M', 0, peaks);
+            std::vector<std::string> scopeL, scopeR;
             for (int j = 0; j < kScopePoints; ++j) {
                 scopeL.push_back("kOutL[" + std::to_string(j) + "]");
                 scopeR.push_back("kOutR[" + std::to_string(j) + "]");
             }
-            sendList('L', 0, scopeL);
-            sendList('R', 0, scopeR);
+            if (!g_cawMonitorApi && g_cawMonitorPort == 0) {
+                sendList('L', 0, scopeL);
+                sendList('R', 0, scopeR);
+            }
+            // Audio-rate circular buffers: a complete uniform 2048-sample stereo
+            // frame, not one downsamp point per control period. Send at 30 fps.
+            if (!g_cawMonitorApi) {
+            mon << "iRawL ftgen 0, 0, -" << monitor_fft::size << ", 2, 0\n"
+                << "iRawR ftgen 0, 0, -" << monitor_fft::size << ", 2, 0\n"
+                << "aRawPhase phasor sr / " << monitor_fft::size << "\n"
+                << "aRawIndex = aRawPhase * " << monitor_fft::size << "\n"
+                << "tablew aL, aRawIndex, iRawL, 0, 0, 1\n"
+                << "tablew aR, aRawIndex, iRawR, 0, 0, 1\n"
+                << "kRawPhase downsamp aRawPhase\n"
+                << "kRawTrig metro 30\n"
+                << "kRawAge timeinsts\nif kRawAge < " << monitor_fft::size << " / sr then\nkRawTrig = 0\nendif\n";
+            if (g_cawMonitorPort > 0) {
+                mon << "kRawSeq init 0\nif kRawTrig == 1 then\n"
+                    << "kRawHead = (int(kRawPhase * " << monitor_fft::size << " + 0.5) + ksmps) % " << monitor_fft::size << "\n"
+                    << "kRawSeq = (kRawSeq + 1) % 1000000\n"
+                    << "OSCsend kRawSeq, \"127.0.0.1\", " << g_cawMonitorPort
+                    << ", \"/caw/raw\", \"iiGG\", kRawSeq, kRawHead, iRawL, iRawR\nendif\n";
+            } else {
+                mon << "kRawL[] init " << monitor_fft::size << "\nkRawR[] init " << monitor_fft::size << "\n"
+                    << "if kRawTrig == 1 then\n"
+                    << "kRawHead = (int(kRawPhase * " << monitor_fft::size << " + 0.5) + ksmps) % " << monitor_fft::size << "\n"
+                    << "kRawJ = 0\nwhile kRawJ < " << monitor_fft::size << " do\n"
+                    << "kRawQ = (kRawHead + kRawJ) % " << monitor_fft::size << "\n"
+                    << "kRawL[kRawJ] table kRawQ, iRawL\nkRawR[kRawJ] table kRawQ, iRawR\n"
+                    << "kRawJ += 1\nod\nendif\n";
+                std::vector<std::string> rawL, rawR;
+                for (int j = 0; j < monitor_fft::size; ++j) {
+                    rawL.push_back("kRawL[" + std::to_string(j) + "]");
+                    rawR.push_back("kRawR[" + std::to_string(j) + "]");
+                }
+                sendList('U', 0, rawL, "kRawTrig", MonitorFrameAssembler::chunkSize);
+                sendList('V', 0, rawR, "kRawTrig", MonitorFrameAssembler::chunkSize);
+            }
+            }
             {   // live Rec: the value each clip sends to its channel "rec", 50 times per second (CAWC <first index> <values>)
                 const std::vector<CawWriteTarget> recNames = cawWriteTargets(p);
                 if (!recNames.empty()) {
@@ -1172,23 +1398,69 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
         //   S <clip> <time> <text>                  string sent to the channel "score"
         const std::string file = scoreProbePath();
         o << "instr CawScoreProbe\nkPbT times\nkPbM metro 20\n";
+        int probeFft = 2048;
+        while (probeFft < 2 * std::max(1, p.cs.ksmps)) probeFft *= 2;
         int n = 0;
         for (const std::string& name : probeAmp) {
             const std::string id = std::to_string(++n);
             o << "aPb" << id << " = gaCawT_" << name << "_1\n"
               << "kPbR" << id << " rms aPb" << id << "\n"
-              << "fPb" << id << " pvsanal aPb" << id << ", 1024, 256, 1024, 1\n"
+              << "fPb" << id << " pvsanal aPb" << id << ", " << probeFft << ", " << probeFft / 2 << ", " << probeFft << ", 1\n"
               << "kPbC" << id << " pvscent fPb" << id << "\n"
               << "if kPbM == 1 then\nfprintks \"" << file << "\", \"A " << name << " %f %f %f\\n\", kPbT, kPbR" << id << ", kPbC" << id << "\nendif\n";
         }
-        for (const auto& [name, sig] : probeData) {
+        for (const auto& stream : probeData) {
+            const std::string& name = stream.clip;
+            const int sig = stream.sig;
             const std::string id = std::to_string(++n);
-            const std::string chan = channelName(name, "score");
-            if (sig == 3) o << "SPb" << id << " chnget \"" << chan << "\"\nif kPbM == 1 then\nfprintks \"" << file << "\", \"S " << name << " %f %s\\n\", kPbT, SPb" << id << "\nendif\n";
+            const std::string encoded = scoreNameHex(stream.stream);
+            const std::string chan = channelName(name, stream.stream.empty() ? "score" : "cawscore_" + encoded);
+            const std::string prefix = stream.stream.empty() ? "" : encoded + " ";
+            if (sig == 3) o << "SPb" << id << " chnget \"" << chan << "\"\nif kPbM == 1 then\nfprintks \"" << file << "\", \"" << (stream.stream.empty() ? "S " : "T ") << name << " " << prefix << "%f %s\\n\", kPbT, SPb" << id << "\nendif\n";
+            else if (sig == 2 && !stream.stream.empty()) {
+                // Capture the full audio-rate extrema in each 50 ms interval.
+                // Plot as a min/max envelope, never as a 20 Hz audio waveform.
+                o << "aPd" << id << " chnget \"" << chan << "\"\n"
+                  << "kPdLo" << id << " max_k aPd" << id << ", kPbM, 3\n"
+                  << "kPdHi" << id << " max_k aPd" << id << ", kPbM, 2\n"
+                  << "if kPbM == 1 && kPbT >= 0.05 then\nfprintks \"" << file << "\", \"W " << name << " " << prefix
+                  << "%f %.9g %.9g\\n\", kPbT, kPdLo" << id << ", kPdHi" << id << "\nendif\n";
+                // Capture actual FFT data from this specific audio channel.
+                // pvs magnitudes are combined into logarithmic bands and
+                // stored for relative, time-averaged score visualization.
+                const int fftSize = probeFft;
+                const double fHi = std::min(18000.0, 0.5 * std::max(1, p.cs.sr));
+                o << "fSp" << id << " pvsanal aPd" << id << ", " << fftSize << ", " << fftSize / 2 << ", " << fftSize << ", 1\n"
+                  << "iSpTab" << id << " ftgen 0, 0, -" << (fftSize / 2 + 1) << ", 2, 0\n"
+                  << "kSpNew" << id << " pvsftw fSp" << id << ", iSpTab" << id << "\n"
+                  << "kSpBands" << id << "[] init " << kScoreSpectrumBins << "\n"
+                  << "if kPbM == 1 && kPbT >= " << fftSize << " / sr then\n"
+                  << "kSpJ" << id << " = 0\nwhile kSpJ" << id << " < " << kScoreSpectrumBins << " do\n"
+                  << "kSpF0" << id << " = 50 * exp(log(" << (fHi / 50.0) << ") * kSpJ" << id << " / " << kScoreSpectrumBins << ")\n"
+                  << "kSpF1" << id << " = 50 * exp(log(" << (fHi / 50.0) << ") * (kSpJ" << id << " + 1) / " << kScoreSpectrumBins << ")\n"
+                  << "kSpLo" << id << " = min(" << fftSize / 2 << ", max(1, int(kSpF0" << id << " * " << fftSize << " / sr)))\n"
+                  << "kSpHi" << id << " = min(" << fftSize / 2 << ", max(kSpLo" << id << ", int(kSpF1" << id << " * " << fftSize << " / sr)))\n"
+                  << "kSpSum" << id << " = 0\nkSpK" << id << " = kSpLo" << id << "\n"
+                  << "while kSpK" << id << " <= kSpHi" << id << " do\n"
+                  << "kSpV" << id << " table kSpK" << id << ", iSpTab" << id << "\n"
+                  << "kSpSum" << id << " += kSpV" << id << " * kSpV" << id << "\n"
+                  << "kSpK" << id << " += 1\nod\n"
+                  << "kSpBands" << id << "[kSpJ" << id << "] = sqrt(kSpSum" << id << ")\n"
+                  << "kSpJ" << id << " += 1\nod\n";
+                for (int start = 0; start < kScoreSpectrumBins; start += 16) {
+                    o << "fprintks \"" << file << "\", \"F " << name << " " << prefix << "%f " << start;
+                    for (int k = 0; k < 16; ++k) o << " %.9g";
+                    o << "\\n\", kPbT";
+                    for (int k = 0; k < 16; ++k) o << ", kSpBands" << id << "[" << (start + k) << "]";
+                    o << "\n";
+                }
+                o << "endif\n";
+            }
             else {
                 if (sig == 2) o << "aPd" << id << " chnget \"" << chan << "\"\nkPd" << id << " downsamp aPd" << id << "\n";
                 else o << "kPd" << id << " chnget \"" << chan << "\"\n";
-                o << "if kPbM == 1 then\nfprintks \"" << file << "\", \"D " << name << " %f %f\\n\", kPbT, kPd" << id << "\nendif\n";
+                o << "if kPbM == 1 then\nfprintks \"" << file << "\", \"" << (stream.stream.empty() ? "D " : sig == 4 ? "I " : "N ") << name << " " << prefix
+                  << (stream.stream.empty() ? "%f %f" : "%f %.9g") << "\\n\", kPbT, kPd" << id << "\nendif\n";
             }
         }
         for (const std::string& name : busDeclared) {   // the buses are summed anew in every control period
@@ -1207,7 +1479,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
     if (engine) score << "f 0 86400\n";
     else score << "e\n";
     o << "</CsInstruments>\n<CsScore>\n" << includeDirectives(p, true) << score.str() << "</CsScore>\n</CsoundSynthesizer>\n";
-    return o.str();
+    return orchestraBuffer.str();
 }
 
 

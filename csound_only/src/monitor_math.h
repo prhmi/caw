@@ -39,6 +39,37 @@ inline float triggerStart(const float* left, const float* right, int n) {
     return 0.f;
 }
 
+struct ScopeWindow { float start = 0.f; int samples = 2; bool triggered = false; };
+// Find the first positive zero crossing inside a recent search region, leaving
+// a complete, contiguous window after it. Stereo/mono triggers on mid first,
+// with left and right fallbacks for phase-cancelled or one-sided signals.
+inline ScopeWindow scopeWindow(const float* left, const float* right, int n, int sr,
+                               float ms, bool trigger, int channel) {
+    ScopeWindow out;
+    if (!left || !right || n < 2 || sr <= 0) return out;
+    out.samples = std::max(2, std::min(n, (int)std::lround(ms * sr / 1000.f)));
+    const int latest = n - out.samples;
+    out.start = (float)latest;
+    if (!trigger || latest <= 0) return out;
+    const int first = std::max(0, latest - out.samples);
+    for (int pass = 0; pass < (channel == 0 ? 3 : 1); ++pass) {
+        for (int i = first; i < latest; ++i) {
+            auto val = [&](int j) {
+                if (channel == 1 || (channel == 0 && pass == 1)) return left[j];
+                if (channel == 2 || (channel == 0 && pass == 2)) return right[j];
+                return (left[j] + right[j]) * 0.5f;
+            };
+            const float a = val(i), b = val(i + 1);
+            if (a <= 0.f && b > 0.f && b - a > 1e-6f) {
+                out.start = i - a / (b - a);
+                out.triggered = true;
+                return out;
+            }
+        }
+    }
+    return out;
+}
+
 inline float frequencyAt(float u, float lo, float hi, bool logarithmic) {
     u = clamp01(u);
     lo = std::max(1.f, lo);

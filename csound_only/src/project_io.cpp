@@ -2,6 +2,7 @@
 #include "csd_builder.h"
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -29,7 +30,7 @@ bool readString(std::istream& in, std::string& value) {
 namespace {
 void writeProject(std::ostream& out, const Project& p) {
     const CsoundSettings& s = p.cs;
-    out << "CAW_PROJECT 38\n"
+    out << "CAW_PROJECT 51\n"
         << s.sr << ' ' << s.ksmps << ' ' << s.nchnls << ' ' << s.nchnlsIn << ' '
         << std::setprecision(17) << s.zdbfs << ' ' << s.a4 << ' ' << s.bufSW << ' ' << s.bufHW << ' '
         << s.outDev << ' ' << s.inDev << ' ' << s.renderFormat << ' ' << s.tail << ' '
@@ -57,7 +58,8 @@ void writeProject(std::ostream& out, const Project& p) {
         }
         out << t.midiClips.size() << '\n';
         for (const MidiClip& mc : t.midiClips) {
-            out << mc.id << ' ' << mc.clipId << ' ' << std::setprecision(17) << mc.start << ' ' << mc.dur << ' ' << mc.notes.size() << '\n';
+            out << mc.id << ' ' << mc.clipId << ' ' << std::setprecision(17) << mc.start << ' ' << mc.dur << ' ' << mc.notes.size() << ' ' << (mc.muted ? 1 : 0) << '\n';
+            writeString(out, mc.name);
             for (const MidiNote& note : mc.notes)
                 out << std::setprecision(17) << note.start << ' ' << note.dur << ' ' << note.pitch << ' ' << note.velocity << '\n';
         }
@@ -248,6 +250,39 @@ void writeProject(std::ostream& out, const Project& p) {
     }
     out << "ORCHESTRA1\n";
     writeString(out, p.orchestraCode);
+    out << "CAWSCORE1\n";
+    for (const Track& t : p.tracks) for (const Clip& c : t.clips) {
+        out << c.scoreDataStyle.size() << '\n';
+        for (const auto& entry : c.scoreDataStyle) {
+            writeString(out, entry.first);
+            out << entry.second << '\n';
+        }
+    }
+    // version 42: VSTi / VSTe tracks: plugin file, the 8 picked parameters (index, start value, lane name)
+    out << "VST3\n";
+    for (const Track& t : p.tracks) {
+        out << t.vstPick.size() << ' ' << t.vstMidi << '\n';
+        writeString(out, t.vstPath);
+        writeString(out, t.vstOut);
+        out << (t.vstOutMaster ? 1 : 0) << '\n';
+        for (size_t i = 0; i < t.vstPick.size(); ++i) {
+            out << t.vstPick[i] << ' ' << std::setprecision(10) << (i < t.vstInit.size() ? t.vstInit[i] : 0.5) << '\n';
+            writeString(out, i < t.vstPickName.size() ? t.vstPickName[i] : std::string("P") + std::to_string(i + 1));
+        }
+    }
+    out << "AUTOSAVE1 " << (s.autosaveEnabled ? 1 : 0) << ' ' << s.autosaveMinutes << '\n';
+    out << "MASTER1 " << std::setprecision(9) << s.masterGain << '\n';
+    out << "EXPORT1 " << s.exportChannels << ' ' << s.exportFlacBits << ' ' << s.exportMp3Kbps << '\n';
+    out << "UIFONT1 " << std::setprecision(9) << s.programFontSize << '\n';
+    out << "VSTPARAMS1\n";
+    for (const Track& t : p.tracks) {
+        out << t.vstParameterState.size() << '\n';
+        for (const auto& entry : t.vstParameterState)
+            out << entry.first << ' ' << std::setprecision(17) << entry.second << '\n';
+    }
+    out << "FFMPEG1\n";
+    writeString(out, s.ffmpegExe);
+    out << "LOOP1 " << (p.loopEnabled ? 1 : 0) << ' ' << std::setprecision(17) << p.loopStart << ' ' << p.loopEnd << '\n';
 }
 
 bool readMidiNote(std::istream& in, MidiNote& note) {
@@ -337,7 +372,7 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
     Project candidate;
     std::string magic;
     int version = 0;
-    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 38)) {
+    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 51)) {
         error = "This is not a supported CAW project file.";
         return false;
     }
@@ -435,6 +470,13 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
                 size_t noteCount = 0;
                 if (!(in >> mc.id >> mc.clipId >> mc.start >> mc.dur >> noteCount) || mc.dur <= 0.0 || noteCount > 1000000) {
                     error = "A MIDI clip entry is invalid."; return false;
+                }
+                if (version >= 45) {
+                    int muted = 0;
+                    if (!(in >> muted) || (muted != 0 && muted != 1) || !readString(in, mc.name)) {
+                        error = "A MIDI clip name or mute state is invalid."; return false;
+                    }
+                    mc.muted = muted != 0;
                 }
                 for (size_t ni = 0; ni < noteCount; ++ni) {
                     MidiNote note;
@@ -640,7 +682,7 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
         for (Track& t : candidate.tracks) {
             size_t markCount = 0, shapeCount = 0;
             if (!(in >> t.kind >> t.lang >> t.autoMin >> t.autoMax >> markCount >> shapeCount) || markCount > 100000 || shapeCount > 10000) { error = "A track's kind is invalid."; return false; }
-            t.kind = std::min(2, std::max(0, t.kind));
+            t.kind = std::min(6, std::max(0, t.kind)); // 5/6: empty SuperCollider/Pure Data placeholders
             t.lang = 0;
             if (!(t.autoMax > t.autoMin)) t.autoMax = t.autoMin + 1.0;
             for (size_t i = 0; i < markCount; ++i) {
@@ -887,6 +929,113 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
         if (!(in >> marker) || marker != "ORCHESTRA1" || !readString(in, candidate.orchestraCode)) {
             error = "The orchestra source is invalid."; return false;
         }
+    }
+    if (version >= 39) {
+        std::string marker;
+        if (!(in >> marker) || marker != "CAWSCORE1") { error = "The cawscore settings are invalid."; return false; }
+        for (Track& track : candidate.tracks) for (Clip& clip : track.clips) {
+            size_t n = 0;
+            if (!(in >> n) || n > 10000) { error = "The cawscore stream settings are invalid."; return false; }
+            for (size_t i = 0; i < n; ++i) {
+                std::string name;
+                int style = 0;
+                if (!readString(in, name) || !(in >> style) || style < 0 || style > (version >= 40 ? 4 : 3)) {
+                    error = "A cawscore stream setting is invalid."; return false;
+                }
+                clip.scoreDataStyle[name] = style;
+            }
+        }
+    }
+    if (version == 41) {   // an early test format: only the picks, no clips yet
+        std::string marker;
+        if (!(in >> marker) || marker != "VST1") { error = "The VST track block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            size_t n = 0; int midi = 2;
+            if (!(in >> n >> midi) || n > 8) { error = "A VST track setting is invalid."; return false; }
+            for (size_t i = 0; i < n; ++i) { int idx = 0; double v = 0.5; if (!(in >> idx >> v)) { error = "A VST parameter is invalid."; return false; } }
+            std::string dropped;
+            if (!readString(in, dropped)) { error = "A VST track code is invalid."; return false; }
+        }
+    }
+    if (version >= 42) {
+        std::string marker;
+        if (!(in >> marker) || marker != (version >= 43 ? "VST3" : "VST2")) { error = "The VST track block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            size_t n = 0; int midi = 2;
+            if (!(in >> n >> midi) || n > 8) { error = "A VST track setting is invalid."; return false; }
+            track.vstMidi = std::min(2, std::max(0, midi));
+            if (!readString(in, track.vstPath)) { error = "A VST plugin path is invalid."; return false; }
+            if (version >= 43) {
+                int master = 0;
+                if (!readString(in, track.vstOut) || !(in >> master)) { error = "A VST audio output is invalid."; return false; }
+                track.vstOutMaster = master != 0;
+            }
+            for (size_t i = 0; i < n; ++i) {
+                int idx = 0; double v = 0.5; std::string name;
+                if (!(in >> idx >> v) || !readString(in, name)) { error = "A VST parameter is invalid."; return false; }
+                track.vstPick.push_back(idx); track.vstInit.push_back(std::min(1.0, std::max(0.0, v))); track.vstPickName.push_back(name);
+            }
+        }
+    }
+    if (version >= 46) {
+        std::string marker;
+        int enabled = 0;
+        if (!(in >> marker >> enabled >> s.autosaveMinutes) || marker != "AUTOSAVE1" ||
+            (enabled != 0 && enabled != 1) || s.autosaveMinutes < 1 || s.autosaveMinutes > 120) {
+            error = "The autosave settings are invalid."; return false;
+        }
+        s.autosaveEnabled = enabled != 0;
+    }
+    if (version >= 47) {
+        std::string marker;
+        if (!(in >> marker >> s.masterGain) || marker != "MASTER1" ||
+            !std::isfinite(s.masterGain) || s.masterGain < 0.f || s.masterGain > 2.f) {
+            error = "The master gain setting is invalid."; return false;
+        }
+    }
+    if (version >= 48) {
+        std::string marker;
+        if (!(in >> marker >> s.exportChannels >> s.exportFlacBits >> s.exportMp3Kbps) || marker != "EXPORT1" ||
+            s.exportChannels < 1 || s.exportChannels > 64 || (s.exportFlacBits != 16 && s.exportFlacBits != 24) ||
+            s.exportMp3Kbps < 8 || s.exportMp3Kbps > 320) {
+            error = "The audio export settings are invalid."; return false;
+        }
+    } else s.exportChannels = std::min(64, std::max(1, s.nchnls));
+    if (version >= 49) {
+        std::string marker;
+        if (!(in >> marker >> s.programFontSize) || marker != "UIFONT1" ||
+            !std::isfinite(s.programFontSize) || s.programFontSize < 12.f || s.programFontSize > 26.f) {
+            error = "The interface font setting is invalid."; return false;
+        }
+    }
+    if (version >= 50) {
+        std::string marker;
+        if (!(in >> marker) || marker != "VSTPARAMS1") { error = "The VST parameter block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            size_t count = 0;
+            if (!(in >> count) || count > 65536) { error = "The VST parameter count is invalid."; return false; }
+            for (size_t i = 0; i < count; ++i) {
+                uint32_t id = 0; double value = 0;
+                if (!(in >> id >> value) || !std::isfinite(value) || value < 0. || value > 1. ||
+                    !track.vstParameterState.emplace(id, value).second) {
+                    error = "A saved VST parameter is invalid."; return false;
+                }
+            }
+        }
+        if (!(in >> marker) || marker != "FFMPEG1" || !readString(in, s.ffmpegExe)) {
+            error = "The FFmpeg setting is invalid."; return false;
+        }
+    }
+    if (version >= 51) {
+        std::string marker;
+        int enabled = 0;
+        if (!(in >> marker >> enabled >> candidate.loopStart >> candidate.loopEnd) || marker != "LOOP1" ||
+            (enabled != 0 && enabled != 1) || !std::isfinite(candidate.loopStart) || !std::isfinite(candidate.loopEnd) ||
+            candidate.loopStart < 0.0 || candidate.loopEnd < candidate.loopStart ||
+            (enabled && candidate.loopEnd - candidate.loopStart < 0.01)) {
+            error = "The timeline loop is invalid."; return false;
+        }
+        candidate.loopEnabled = enabled != 0;
     }
     if (version < 37) {
         for (Track& track : candidate.tracks) {

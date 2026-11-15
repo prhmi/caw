@@ -41,10 +41,21 @@ struct ScoreSpectrum {
 bool analyzeScoreWav(const std::string& path, ScoreSpectrum& out, std::string& error);
 
 // What Render audio measured / recorded per clip (file written by the score probe, see scoreProbePath()).
-struct ScoreDataSample { double t = 0.0; double v = 0.0; bool isText = false; std::string text; };
+struct ScoreDataSample {
+    double t = 0.0, v = 0.0, v2 = 0.0;
+    bool isText = false;
+    std::string text, name;
+    int rate = 1; // 1 k-rate, 2 a-rate min/max bucket, 3 string, 4 i-rate snapshot
+};
+struct ScoreSpectralFrame {
+    double t = 0.0;
+    std::string name;
+    std::vector<float> bands; // 48 logarithmic band magnitudes, 50 Hz to min(18 kHz, Nyquist)
+};
 struct ScoreClipProbe {
     std::vector<double> t, rms, cent;        // every 50 ms: loudness (rms) and centroid of the spectrum (Hz) of the clip's own output
     std::vector<ScoreDataSample> data;       // everything the code sent to the channel "score": numbers / signals (v) and strings (text)
+    std::vector<ScoreSpectralFrame> spectra; // sampled a-rate spectrum frames
 };
 typedef std::map<std::string, ScoreClipProbe> ScoreProbeData;   // key = clip (instrument) name
 bool loadScoreProbe(const std::string& path, ScoreProbeData& out);
@@ -64,7 +75,8 @@ std::string scorePageToSvg(const ScorePage& page);
 // Writes the pages as SVG files (+ one .html with all pages inside, to view and print as PDF, for the full score).
 // basePath: path without extension. `files`: written files, the first one is what to open.
 bool writeScoreDocument(const Project& project, const std::string& fallbackTitle, const ScoreRenderOptions& options,
-                        const std::string& basePath, std::vector<std::string>& files, std::string& error);
+                        const std::string& basePath, std::vector<std::string>& files, std::string& error,
+                        bool exactPath = false);
 
 // What the score will contain, lane by lane (for the editor): tracks with the same name are one lane.
 struct ScoreLaneInfo {

@@ -2,9 +2,13 @@
 
 void appSetupStyle(float dpiScale);  // dark theme + DPI scaling
 void appInit();                      // creates the demo project
-void appFrame(float dt);
+void appDrawStartupSplash();         // draw one startup frame before loading
+void appFrame(float dt, bool visible = true);
 struct ImFont;
 void appSetCodeFonts(ImFont* regular, ImFont* bold, ImFont* italic);             // draws the whole UI, call between NewFrame and Render
+void appSetMarkFonts(ImFont* ui, ImFont* code);
+void appPrepareLogo();               // add original-resolution logo to the font texture
+bool appNeedsResponsiveFrames();     // engine/transport/render work still needs full UI cadence
 
 void appOpenProjectPath(const char* path);  // accepts a .caw path from Windows file association or drag/drop
 bool appQuitRequested();

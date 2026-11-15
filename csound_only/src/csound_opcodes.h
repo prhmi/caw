@@ -2,6 +2,7 @@
 // Built-in list of common Csound opcodes for the code editor colors.
 // The app also reads the full list from "csound -z" at startup, so opcodes missing here are still recognized.
 static const char* const kCsoundOpcodes[] = {
+    "cawscore",
     "abs", "active", "adsr", "adsyn", "adsynt", "aftouch", "alpass", "alwayson", "ampdb", "ampdbfs", "ampmidi",
     "anx", "areson", "aresonk", "atone", "atonek", "atonex", "babo", "balance", "balance2", "bamboo", "barmodel",
     "bbcutm", "bbcuts", "betarand", "bexprnd", "bformdec1", "bformenc1", "binit", "biquad", "biquada", "birnd",

@@ -19,7 +19,7 @@ struct ClipAutomationMove {
             ranges[track.id] = track.automationRanges;
             std::map<int, std::set<std::string>> channels;
             for (const Clip& clip : track.clips) if (selected.count(clip.id))
-                for (const CawParam& p : parseClip(clip).params) channels[clip.id].insert(p.chn);
+                for (const CawParam& p : parseClipForTrack(clip, track).params) channels[clip.id].insert(p.chn);
             auto& snapshot = lanes[track.id];
             for (const auto& lane : track.automation) {
                 auto& saved = snapshot[lane.first];
@@ -38,7 +38,7 @@ struct ClipAutomationMove {
         }
     }
 
-    void apply(Project& project, double dt) const {
+    void apply(Project& project, double dt, const std::map<int, double>* individualShifts = nullptr) const {
         std::map<int, Track*> tracks;
         std::map<int, int> clipTracks;
         for (Track& track : project.tracks) {
@@ -54,7 +54,12 @@ struct ClipAutomationMove {
                     AutoPoint point = tagged.point;
                     int target = original.first;
                     if (tagged.clipId && clipTracks.count(tagged.clipId)) {
-                        point.t = std::max(0.0, point.t + dt);
+                        double shift = dt;
+                        if (individualShifts) {
+                            const auto it = individualShifts->find(tagged.clipId);
+                            shift = it == individualShifts->end() ? 0.0 : it->second;
+                        }
+                        point.t = std::max(0.0, point.t + shift);
                         target = clipTracks[tagged.clipId];
                         const auto sourceRanges = ranges.find(original.first);
                         if (target != original.first && sourceRanges != ranges.end() && !tracks[target]->automationRanges.count(lane.first)) {
