@@ -1,0 +1,8 @@
+#N canvas 200 100 500 320 10;
+#X obj 90 75 osc~ 440;
+#X obj 90 120 *~ 0.08;
+#X obj 90 170 dac~ 1 2;
+#X text 60 230 CAW test tone: 440 Hz at low level.;
+#X connect 0 0 1 0;
+#X connect 1 0 2 0;
+#X connect 1 0 2 1;
