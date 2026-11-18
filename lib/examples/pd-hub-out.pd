@@ -1,0 +1,14 @@
+#N canvas 0 0 450 300 10;
+#X text 40 30 CAW hub demo: sends a random tempo into the shared hub
+every 0.5 s. The name is "tempo" - CAW sees [s $0-caws-tempo].;
+#X obj 60 90 loadbang;
+#X obj 60 120 metro 500;
+#X obj 60 150 random 240;
+#X obj 60 180 + 80;
+#X obj 60 220 s \$0-caws-tempo;
+#X obj 120 220 print tempo_sent;
+#X connect 1 0 2 0;
+#X connect 2 0 3 0;
+#X connect 3 0 4 0;
+#X connect 4 0 5 0;
+#X connect 4 0 6 0;
