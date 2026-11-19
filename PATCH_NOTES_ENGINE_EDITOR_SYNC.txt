@@ -1,0 +1,11 @@
+CAW VST3 editor/engine lifecycle synchronization
+
+Based on 42_vste_nocsd_35_kilohearts_connection_fix.zip.
+
+Changes:
+- Added IPlugin::prepareEditor(sampleRate, blockSize), separate from real-time prepare().
+- VST3 editor-side instance now negotiates setupProcessing and activates its component only after Run VST provides a valid engine format. It does not call setProcessing(true) and is never processed by the audio callback.
+- Existing editor instances are prepared when Run VST starts; plugins loaded while the engine is already running are prepared immediately after load.
+- Existing audio instance preparation/routing and plugin selection behavior are unchanged.
+
+This is a targeted lifecycle test for plugins whose editor behavior depends on the host engine format. It is not a confirmed fix until compiled and tested with Kilohearts. ZIP integrity was checked; no Windows build was run here.

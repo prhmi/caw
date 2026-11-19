@@ -123,7 +123,7 @@ public:
                 error="PD clip "+std::to_string(e.clipId)+": outputs: "+error;return false;
             }
             sink_.collectDiagnostics(clip);
-            events.push_back({e.clipId,start,end});
+            events.push_back({e.clipId,start,end,e.muted});
             for(int r=0;r<e.runs;++r) {
                 const auto span=end-start;
                 const auto at=start+(span/e.runs)*r+(span%e.runs)*r/e.runs;

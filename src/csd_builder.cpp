@@ -19,7 +19,6 @@
 #include <unordered_set>
 
 // Which basic math opcodes the user's Csound really has (setCsoundMathOps, see csd_builder.h).
-// Which basic math opcodes the user's Csound really has (setCsoundMathOps, see csd_builder.h).
 // The flag source is a REAL compile probe (csound_api_runner.cpp probeMath: tiny abs / sqrt / pow
 // orchestras compiled through the same API library the engine uses) - NOT the 'csound -z' text list,
 // whose human column format cannot be parsed reliably and once made CAW falsely refuse an installed
@@ -117,6 +116,23 @@ int addMeterTaps(const std::string& instrName, std::string& body, std::vector<in
     body = result;
     if (map) *map = newMap;
     return maxCh;
+}
+
+// The clip's meter tap as a named audio channel too: the VST rack reads these by name every
+// block, so a VSTe input can be re-wired while the engine runs - no CSD rebuild, no stale lines.
+// One channel per output channel, added right after the gaCawT_* tap line (same scope, and the
+// VSTe output gates wrap only the `out` line, so the tap keeps running in replace and mix mode).
+std::string addVstTapChannels(const std::string& body) {
+    static const std::regex tapRe(R"re(^\s*gaCawT_([A-Za-z_]\w*)_([1-8])\s*=\s*gaCawT_[A-Za-z_]\w*_[1-8]\s*\+\s*\((.*)\)\s*$)re");
+    std::istringstream in(body);
+    std::string line, result; std::smatch m;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        result += line + "\n";
+        if (std::regex_match(line, m, tapRe))
+            result += "chnmix (" + m[3].str() + "), \"cawtap_" + m[1].str() + "_" + m[2].str() + "\"\n";
+    }
+    return result;
 }
 
 // "cawMath" / self-scheduling. Legacy cawRun and dawrun remain supported.
@@ -597,13 +613,10 @@ std::vector<LaneMeterInfo> meterLayout(const Project& p) {
         int ch = (vst || t.kind == 6) ? 2 : 0; // VST and the current PD host produce stereo
         if (!vst && t.kind != 6) for (const Clip& c : t.clips) ch = std::max(ch, parseClip(c, true).outChannels);
         if (ch <= 0) continue;
-        bool csoundOnly = false;
-        if (vst && !vstlang::cleanBus(t.vstOut).empty() && !t.vstOutMaster) {
-            bool feedsEffect = false;
-            for (const Track& dest : p.tracks)
-                if (dest.kind == 4 && vstlang::busName(dest) == vstlang::cleanBus(t.vstOut)) { feedsEffect = true; break; }
-            csoundOnly = !feedsEffect;
-        }
+        // A VST track always reaches the master now (master replace or mix), so it keeps its
+        // default meter color. Source tracks whose own output a master-mode VSTe replaces are
+        // grayed in the draw call via trackConsumedByMasterVste, not here.
+        const bool csoundOnly = false;
         out.push_back({t.id, next, ch, csoundOnly});
         next += ch;
     }
@@ -794,6 +807,17 @@ std::vector<std::string> engineClipNames(const Project& p) {
     return out;
 }
 
+// The VSTi note helper instruments (one per VSTi track), project order. The live
+// transport addresses instruments by number; MIDI clips on a VSTi track send their
+// notes straight to "CawVstNote_<id>", so that name must be resolvable too
+// (type 14 rows resolve against gSCawVstNotes, the note-helper twin of gSCawClips).
+std::vector<std::string> engineVstNoteNames(const Project& p) {
+    std::vector<std::string> out;
+    for (const Track& t : p.tracks) if (t.kind == 3)
+        out.push_back("CawVstNote_" + std::to_string(t.id));
+    return out;
+}
+
 std::string engineFilePrefix() {   // the command files: <prefix>serial.txt and <prefix><n>.txt, forward slashes
     std::string s = (workDir() / "caw_cmd_").string();
     for (char& ch : s) if (ch == '\\') ch = '/';
@@ -854,9 +878,22 @@ std::vector<TimelineEvent> timelineEvents(const Project& p, double from, bool in
                     add(false, c.name, c.start + c.dur * (double)r / runs, c.start + c.dur * (double)(r + 1) / runs,
                         (t.kind == 0 && pc.midiEnabled) ? 60.0 : 0.0, (t.kind == 0 && pc.midiEnabled) ? 100.0 : 0.0);
             }
-            // 2. MIDI clips are free in time: they only borrow the instrument (name) of their Csound clip; every note is one start (p4 pitch, p5 velocity)
+            // 2. MIDI clips are free in time. On a VSTi track the notes go STRAIGHT to the plugin's
+            //    note helper (CawVstNote_<id>): no code clip is needed, a muted or deleted clip
+            //    never silences them - the DAW-like path (the instrument is its own 4th engine).
+            //    On a Csound track they borrow the instrument (name) of their clip.
+            //    Every note is one start (p4 pitch, p5 velocity).
             for (const MidiClip& mc : t.midiClips) {
                 if (mc.muted) continue;
+                if (t.kind == 3) {
+                    for (const MidiNote& n : mc.notes) {
+                        if (n.start >= mc.dur) continue;
+                        const double s = mc.start + n.start;
+                        add(false, "CawVstNote_" + std::to_string(t.id), s, std::min(mc.start + mc.dur, s + n.dur),
+                            (double)std::min(127, std::max(0, n.pitch)), (double)std::min(127, std::max(1, n.velocity)));
+                    }
+                    continue;
+                }
                 const Clip* target = findClip(mc.clipId);
                 if (!target || target->muted) continue;
                 for (const MidiNote& n : mc.notes) {
@@ -993,25 +1030,120 @@ std::string resolveCawFiles(const Project& p, const std::string& code) {
 
 // ---- VSTi / VSTe tracks: one always-running instrument holds the track code; the engine thread (vst_rack.h) reads the channels it writes.
 std::string vstBusName(const Track& t) { return vstlang::busName(t); }
+
+// Resolve the 8 VSTe input lines into concrete line ranges (see resolveVstInputRoutes in the header).
+// Every CONFIGURED input gets a range (in slot order) whether it is on or not: the Csound routing is
+// fixed for the run, so a later live on/off toggle just tells the rack to pack or skip that slot's
+// already-routed lines. A track input takes one line per output channel of every clip of that track
+// (in project order, no mixdown, matching the legacy single-input behaviour); a clips input takes the
+// channels of the clip with that name; a master input always takes two (L, R). Lines past 8 are dropped.
+std::vector<VstInputRoute> resolveVstInputRoutes(const Project& p, const Track& vt) {
+    std::vector<VstInputRoute> out;
+    int cursor = 0;
+    for (int s = 0; s < 8; ++s) {
+        const auto& in = vt.vstInputs[s];
+        const bool configured = in.mode == 2 || ((in.mode == 0 || in.mode == 1) && !in.name.empty());
+        if (!configured) continue;
+        if (cursor >= 8) break;
+        VstInputRoute r; r.slot = s; r.mode = in.mode; r.name = in.name; r.lineStart = cursor;
+        // A Pure Data (kind 6) / SuperCollider (kind 5) source renders outside Csound: its whole
+        // stereo mix feeds the slot (engine 1/2, resolved in collectVstJobs), two lines reserved.
+        const bool pdOrScSource = in.mode != 2 && [&]() {
+            for (const Track& o : p.tracks) {
+                if (o.kind != 5 && o.kind != 6) continue;
+                if (in.mode == 0 ? o.name == in.name : std::any_of(o.clips.begin(), o.clips.end(),
+                        [&](const Clip& c) { return c.name == in.name; })) return true;
+            }
+            return false;
+        }();
+        // A VSTi / VSTe source is also rendered outside Csound (the rack adds its audio straight
+        // to the master): the slot gets the source's stereo output, the SAME channels the source
+        // sends to the master (engine 3, srcId = the source track, wired by the rack).
+        const Track* vstSource = nullptr;
+        if (!pdOrScSource && in.mode != 2) {
+            for (const Track& o : p.tracks) {
+                if (o.kind != 3 && o.kind != 4) continue;
+                const bool match = in.mode == 0 ? o.name == in.name : std::any_of(o.clips.begin(), o.clips.end(),
+                        [&](const Clip& c) { return c.name == in.name; });
+                if (match) { vstSource = &o; break; }
+            }
+        }
+        if (pdOrScSource) {
+            r.lineCount = std::min(2, 8 - cursor);
+        } else if (vstSource) {
+            r.lineCount = std::min(2, 8 - cursor);
+        } else if (in.mode == 2) {                            // master: always stereo
+            r.lineCount = std::min(2, 8 - cursor);
+        } else {                                              // Csound track / clips: one tap channel per output channel
+            const int room = 8 - cursor;
+            if (in.mode == 0) {                               // track: every clip of that track, in project order
+                for (const Track& o : p.tracks)
+                    if (o.name == in.name && o.kind != 5 && o.kind != 6 && o.kind != 3 && o.kind != 4)
+                        for (const Clip& c : o.clips) {
+                            const int ch = std::max(1, parseClip(c, true).outChannels);
+                            for (int k = 1; k <= ch && (int)r.chans.size() < room; ++k)
+                                r.chans.push_back("cawtap_" + c.name + "_" + std::to_string(k));
+                        }
+            } else {                                          // clips: the channels of the clip with that name
+                int ch = 0;
+                for (const Track& o : p.tracks)
+                    if (o.kind != 5 && o.kind != 6 && o.kind != 3 && o.kind != 4)
+                        for (const Clip& c : o.clips)
+                            if (c.name == in.name) ch = std::max(ch, parseClip(c, true).outChannels);
+                for (int k = 1; k <= ch && (int)r.chans.size() < room; ++k)
+                    r.chans.push_back("cawtap_" + in.name + "_" + std::to_string(k));
+            }
+            r.lineCount = (int)r.chans.size();
+        }
+        cursor += r.lineCount;
+        out.push_back(r);
+    }
+    return out;
+}
+
+// A track feeds a master-mode (replace) VSTe when any enabled input of that VSTe names this track
+// (mode 0) or one of its clips (mode 1). Used by the UI to gray the source lane meter.
+bool trackConsumedByMasterVste(const Project& p, const Track& sourceTrack) {
+    for (const Track& vt : p.tracks) {
+        if (vt.kind != 4 || vt.vstOutMode != 0) continue;
+        for (const auto& in : vt.vstInputs) {
+            if (!in.on) continue;
+            if (in.mode == 0 && in.name == sourceTrack.name) return true;
+            if (in.mode == 1)
+                for (const Clip& c : sourceTrack.clips)
+                    if (c.name == in.name) return true;
+        }
+    }
+    return false;
+}
+
 // Declarations of a VST track (once): the parameter channels, the MIDI event ring (a table the engine reads), the note helper instrument.
-std::string vstOrchestra(const Track& t) {
-    const std::string id = std::to_string(t.id), bus = vstBusName(t);
+std::string vstOrchestra(const Project& p, const Track& t) {
+    const std::string id = std::to_string(t.id);
     const size_t n = std::min<size_t>(8, t.vstPick.size());
+    // Slots bound in the code (p2 = cawget "lane") may exceed the picked parameters: their value
+    // channels must exist too, or the generated chnset would write an undeclared channel.
+    int boundMax = -1;
+    {
+        static const std::regex bindRe(R"re(^[ \t]*[pP]([1-8])[ \t]*=[ \t]*cawget)re");
+        for (const Clip& c : t.clips)
+            for (std::sregex_iterator it = std::sregex_iterator(c.code.begin(), c.code.end(), bindRe), end; it != end; ++it)
+                boundMax = std::max(boundMax, (*it)[1].str()[0] - '1');
+    }
+    const size_t nCh = std::min<size_t>(8, std::max<size_t>(n, (size_t)std::max(0, boundMax + 1)));
     std::ostringstream o;
     o << "gkCawVstW_" << id << " init 0\n"
       << "giCawVstTab_" << id << " ftgen 0, 0, 4096, 2, 0\n"
       << "chn_k \"cawvst_" << id << "_wr\", 3\nchn_k \"cawvst_" << id << "_tab\", 3\n"
       << "chnset giCawVstTab_" << id << ", \"cawvst_" << id << "_tab\"\n";
-    for (size_t k = 1; k <= n; ++k) {
+    // The VSTe's input audio (`in` / `level(in)` in clip code, cawvstin_<id>_1/2) is NOT declared
+    // here: the engine creates those two audio channels from C before this CSD compiles
+    // (csoundGetChannelPtr), so the generated CSD carries no VST channels.
+    for (size_t k = 1; k <= nCh; ++k) {
         const double saved = k <= t.vstInit.size() && std::isfinite(t.vstInit[k - 1]) ? t.vstInit[k - 1] : 0.5;
         const double initial = std::min(1.0, std::max(0.0, saved));
         o << "chn_k \"cawvst_" << id << "_p" << k << "\", 3\n"
           << "chnset " << std::setprecision(10) << initial << ", \"cawvst_" << id << "_p" << k << "\"\n";
-    }
-    if (t.kind == 4) o << "chn_a \"cawbus_" << bus << "_L\", 3\nchn_a \"cawbus_" << bus << "_R\", 3\n";
-    if (!vstlang::cleanBus(t.vstOut).empty()) {
-        const std::string ob = vstlang::cleanBus(t.vstOut);
-        o << "chn_a \"cawbus_" << ob << "_L\", 3\nchn_a \"cawbus_" << ob << "_R\", 3\n";
     }
     o << "opcode CawVstEv_" << id << ", 0, kkk\n"                      // one MIDI message into the ring: status, data1, data2
       << "kS, kD1, kD2 xin\n"
@@ -1085,6 +1217,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
         arr("gSCawChans", chans);                           // automation ramps (CawAuto) name their channel by number
         if (engine) {
             arr("gSCawClips", engineClipNames(p));            // the commands name clips by number (fixed when Run is pressed)
+            arr("gSCawVstNotes", engineVstNoteNames(p));      // type 14 rows: MIDI notes straight to a VSTi's note helper
             o << "giCawSerial init 0\ngiCawTabA init 0\ngiCawTabB init 0\n";
         }
     }
@@ -1108,7 +1241,17 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
     };
 
     const bool probe = mode == "render" && p.score.analyze;           // Render audio also measures the clips for the score
-    const bool tap = (engine && p.cs.monitorFeed) || probe;           // meter buses (gaCawT_*) are needed by the monitor and by the probe
+    bool vstRouting = false;                                          // VSTe audio input routing reads the clip taps
+    bool anyVste = false;
+    for (const Track& vt : p.tracks) {
+        if (vt.kind == 4) anyVste = true;
+        for (const auto& in : vt.vstInputs)
+            if ((in.mode == 0 || in.mode == 1) && !in.name.empty()) vstRouting = true;   // configured inputs are routed even when off, so a live on/off toggle has audio to unmute
+    }
+    // Meter / route buses (gaCawT_* and their named cawtap_* mirrors) are needed by the monitor, by
+    // the probe and by the VSTe input routing. In the engine they exist whenever a VSTe track does,
+    // so an effect can be wired to any clip while the engine runs.
+    const bool tap = (engine && p.cs.monitorFeed) || probe || vstRouting || (engine && anyVste);
     std::vector<std::string> probeAmp;                                // clips measured (amplitude + frequency)
     struct ProbeStream { std::string clip, stream; int sig; };
     std::vector<ProbeStream> probeData;
@@ -1118,13 +1261,45 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
             for (const Clip& c : t.clips) {
                 const int ch = parseClip(c, true).outChannels;
                 if (!busDeclared.insert(c.name).second) continue;
-                for (int k = 1; k <= ch; ++k) o << "gaCawT_" << c.name << "_" << k << " init 0\n";
+                for (int k = 1; k <= ch; ++k) {
+                    o << "gaCawT_" << c.name << "_" << k << " init 0\n";
+                    o << "chn_a \"cawtap_" << c.name << "_" << k << "\", 3\n";   // the rack reads these by name (live re-wiring)
+                }
+            }
+    }
+    if (tap) {   // the taps accumulate (+=); clear them once per pass so the routed VSTe lines carry exactly the current pass (the monitor clears them again at the end when it runs)
+        o << "instr CawVstTapClear\n";
+        std::set<std::string> tcDone;
+        for (const Track& tc : p.tracks) if (tc.kind != 5 && tc.kind != 6) for (const Clip& tcc : tc.clips)
+            if (tcDone.insert(tcc.name).second) {
+                const int tch = parseClip(tcc, true).outChannels;
+                for (int k = 1; k <= tch; ++k) o << "gaCawT_" << tcc.name << "_" << k << " = 0\n";
+            }
+        o << "endin\n\n";
+        score << "i \"CawVstTapClear\" 0 86400\n";
+    }
+
+    // Every VSTe track gets one live gate per clip: cawvstmix_<clip>_<vstId>. 0 = the source
+    // reaches the master, 1 = this effect REPLACES it. The app owns the values (wiring, AUDIO
+    // OUTPUT, M / S, input on/off) and writes them while the engine plays, so a re-wire works
+    // with no Run: a pair nobody replaces stays 0, and a gate channel that does not exist yet
+    // (a clip added after Run) reads 0 as well - the safe state is "the source sounds".
+    std::vector<int> vstGateIds;
+    for (const Track& vt : p.tracks)
+        if (vt.kind == 4 && !vt.vstPath.empty()) vstGateIds.push_back(vt.id);
+    if (!vstGateIds.empty()) {   // declare the gate channels up front (chn_k default = 0 = source audible)
+        std::set<std::string> gateDecl;
+        for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6)
+            for (const Clip& c : t.clips) {
+                if (!gateDecl.insert(c.name).second) continue;
+                for (int id : vstGateIds)
+                    o << "chn_k \"cawvstmix_" << c.name << "_" << id << "\", 3\n";
             }
     }
 
     for (const Track& t : p.tracks) {
         if (t.kind == 5 || t.kind == 6) continue; // .pd path is not orchestra code
-        if (t.kind == 3 || t.kind == 4) o << vstOrchestra(t);   // then its clips are built like any other clip (CAW code translated first)
+        if (t.kind == 3 || t.kind == 4) o << vstOrchestra(p, t);   // then its clips are built like any other clip (CAW code translated first)
 
         // Every clip is its own instrument: own instr name, own code, own channels, own MIDI.
         for (const Clip& clip : t.clips) {
@@ -1160,7 +1335,32 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                     sp.lineMap = pc.lineMap;
                     spans->push_back(sp);
                 }
-                o << resolveCawFiles(p, pc.body) << "\nendin\n\n";
+                // VSTe source clips: wrap the clip's own `out` lines in one live gate per effect
+                // (cawvstmix_<clip>_<id>, 0 = source audible, 1 = replaced by that effect). The
+                // source plays only when EVERY effect lets it through, exactly like a DAW bus.
+                // The values are written by the app while the engine runs, and the meter taps
+                // after each `out` stay outside the gates, so a VSTe input keeps receiving the
+                // clip signal in both modes.
+                std::string body = resolveCawFiles(p, pc.body);
+                if (tap) body = addVstTapChannels(body);   // the rack reads the clip taps by name (live wiring)
+                if (!vstGateIds.empty()) {
+                    static const std::regex outLineRe(R"re(^(\s*)(outch|outs|outq|outh|outo|outx|outc|out)\b\s*(.*)$)re");
+                    std::string gates, endifs;
+                    for (int gateId : vstGateIds) {
+                        const std::string gateVar = "kCawGate" + std::to_string(gateId);
+                        gates += gateVar + " chnget \"cawvstmix_" + clip.name + "_" + std::to_string(gateId) + "\"\n";
+                        gates += "if " + gateVar + " == 0 then\n";
+                        endifs += "endif\n";
+                    }
+                    std::istringstream in(body); std::string line, rebuilt; std::smatch m;
+                    while (std::getline(in, line)) {
+                        if (!line.empty() && line.back() == '\r') line.pop_back();
+                        if (std::regex_match(line, m, outLineRe)) rebuilt += gates + line + "\n" + endifs;
+                        else rebuilt += line + "\n";
+                    }
+                    body = rebuilt;
+                }
+                o << body << "\nendin\n\n";
             }
         }
     }
@@ -1235,6 +1435,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
           << "iCawTy table iCawO, iCawF\niCawIx table iCawO + 1, iCawF\niCawDl table iCawO + 2, iCawF\niCawDu table iCawO + 3, iCawF\niCawA table iCawO + 4, iCawF\niCawB table iCawO + 5, iCawF\n"
           << "iCawP1 = 0\niCawP6 = 0\n"
           << "if iCawTy == 10 then\nSCawN = gSCawClips[iCawIx - 1]\niCawP1 = nstrnum(SCawN)\n"
+          << "elseif iCawTy == 14 then\nSCawN = gSCawVstNotes[iCawIx - 1]\niCawP1 = nstrnum(SCawN)\n"
           << "elseif iCawTy == 11 then\niCawP1 = nstrnum(\"CawAuto\")\niCawP6 = iCawIx\n"
           << "elseif iCawTy == 12 then\niCawP1 = nstrnum(\"CawStop\")\n"
           << "else\niCawP1 = nstrnum(\"CawStopOne\")\niCawA = iCawIx\nendif\n"
@@ -1568,4 +1769,35 @@ std::string buildClipTestCsd(const Project& p, const Clip& clip, OrcSpan& span) 
     if (pc.midiEnabled) tail << " 60 100";
     tail << "\ne\n</CsScore>\n</CsoundSynthesizer>\n";
     return prefix + tail.str();
+}
+
+// Live code editing: the same generator that writes the Run CSD produces the full text, and the
+// clip's own `instr <name> ... endin` block is cut out of it. Going through buildCsd keeps the live
+// text identical to what Run would compile: VST code translation, VSTe input sends and the live
+// output gates all come from the same place. The block is compiled into the RUNNING engine with
+// csoundCompileOrc; channels, taps, UDOs and helpers already exist there, so they are not repeated.
+std::string buildClipInstrumentCode(const Project& p, const Clip& clip) {
+    if (clip.name.empty()) return std::string();
+    std::string csd;
+    try { csd = buildCsd(p, "engine"); } catch (...) { return std::string(); }
+    const std::string head = "instr " + clip.name;
+    std::istringstream in(csd);
+    std::string line;
+    std::vector<std::string> lines;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(line);
+    }
+    // The clip instruments are emitted after the pool code and before the engine helpers
+    // (CawAuto / CawStop / CawPoll): the LAST match is the clip's own definition.
+    int begin = -1;
+    for (size_t i = 0; i < lines.size(); ++i) if (lines[i] == head) begin = (int)i;
+    if (begin < 0) return std::string();
+    int end = -1;
+    for (size_t i = (size_t)begin + 1; i < lines.size(); ++i)
+        if (lines[i] == "endin") { end = (int)i; break; }
+    if (end < 0) return std::string();
+    std::string out;
+    for (int i = begin; i <= end; ++i) { out += lines[(size_t)i]; out += '\n'; }
+    return out;
 }

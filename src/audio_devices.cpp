@@ -1,4 +1,5 @@
 #include "audio_devices.h"
+#include "caw_audio_host.h"
 #include "process_runner.h"
 #include <portaudio.h>
 
@@ -53,13 +54,14 @@ std::vector<AudioDevice> listCsoundDevices(const std::string& executable,
 void listPortAudioDevicePairs(std::vector<AudioDevice>& outputs, std::vector<AudioDevice>& inputs,
                               std::string& outputError, std::string& inputError) {
     outputs.clear(); inputs.clear(); outputError.clear(); inputError.clear();
-    const PaError init = Pa_Initialize();
-    if (init != paNoError) {
-        outputError = inputError = std::string("PortAudio initialization: ") + Pa_GetErrorText(init); return;
+    std::string initError;
+    caw_audio_host::Ref host(&initError);   // never terminates PortAudio under a running engine stream
+    if (!host.ok) {
+        outputError = inputError = initError; return;
     }
     const int count = Pa_GetDeviceCount();
     if (count < 0) {
-        outputError = inputError = Pa_GetErrorText(count); Pa_Terminate(); return;
+        outputError = inputError = Pa_GetErrorText(count); return;
     }
     for (int i = 0; i < count; ++i) {
         const PaDeviceInfo* d = Pa_GetDeviceInfo(i);
@@ -74,7 +76,6 @@ void listPortAudioDevicePairs(std::vector<AudioDevice>& outputs, std::vector<Aud
         if (d->maxOutputChannels > 0) outputs.push_back(dev);
         if (d->maxInputChannels > 0) inputs.push_back(std::move(dev));
     }
-    Pa_Terminate();
     if (outputs.empty()) outputError = "PortAudio found no output devices.";
     if (inputs.empty()) inputError = "PortAudio found no input devices.";
 }

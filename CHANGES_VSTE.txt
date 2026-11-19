@@ -1156,3 +1156,299 @@ Files: src/vst_rack.h, src/vst_solo.h, src/csound_api_runner.cpp.
 Verified: src/vst_rack.h (with and without -DCAW_VST3), src/vst_solo.h,
        src/csound_api_runner.cpp and src/app.cpp syntax check with -DCAW_VST3 (MinGW g++),
        exit 0. MSVC build + audio behaviour not testable in this environment.
+
+Round 29 - Saved plugin state no longer mutes the VSTi (the "no sound unless I re-create the VSTi" root fix)
+-------------------------------------------------------------------------------
+A) Root cause
+   Loading a project restored every stored parameter value into the plugin TWICE:
+     1. IPlugin::setParam -> IEditController::setParamNormalized, once per saved value, and
+     2. the same values were queued again as IParameterChanges for the FIRST ProcessData block
+        (initialParameters_ replay, so the processor - not just the controller - learns them).
+   A project stores the full parameter list (the reported project: ARP 2600 V3 track = 2360
+   values, kHs Pitch Shifter track = 2087 values), so block 0 carried a few thousand parameter
+   changes at sample offset 0. The ARP 2600 stops producing audio when it receives that many
+   changes in one block; the whole project went silent, and every re-run restored the same state
+   and silenced it again. A VSTi created fresh has no saved state, so it never took that path -
+   which is exactly the reported asymmetry ("works when I create the VSTi after the VSTe, no
+   sound otherwise").
+   Headless check with the real plugins: with the project's saved state every scenario (replace,
+   mix, instrument alone) measured master = 0.0000; with the replay disabled they all sounded
+   again (master 0.37 / 0.52 / 0.40). Bisection showed the trigger is the NUMBER of restored
+   values in one block (287 ok, 288 silent), not any single parameter - every saved value in that
+   project equals the plugin's own default (0 of 2390 differ), so the silence came purely from
+   the restore act.
+B) The fix
+   - Restore only values that actually differ from what the plugin reports after load
+     (fabs(saved - current) > 1e-6), in both restore sites: VstRack's graph build (engine
+     instance) and the VST panel's track-load restore (UI instance). Redundant edits are dropped,
+     so a project whose patch is at the plugin defaults now restores nothing at all.
+   - The initial-value replay is bounded to 128 parameter changes per block and continues on the
+     following blocks (initialParameters_ entries are consumed as they are sent). Automation
+     from the lane ring is still queued after the initials of the same block, so the lane value
+     wins; a parameter that also has a pending initial value gets the initial first and the lane
+     value last. Large custom patches (hundreds of non-default values) therefore load without
+     ever flooding a plugin, verified with 361 and 501 real differences.
+   - Console: "CAW engine build: 40_param_restore_29 ...".
+C) What to look for when testing
+   - Open the reported project (VSTi1 ARP 2600 V3 + VSTe2 Pitch Shifter in replace mode wired to
+     VSTi1) and Run: the VSTi sounds immediately, the VSTe replaces its source with processed
+     audio; no need to delete / re-create a track.
+   - Change a parameter in the plugin's own window, save, reload the project: only that value is
+     restored (the others are left at the plugin's defaults).
+Files: src/vst_rack.h, src/vst_ui.h, src/vst3_host.cpp, src/csound_api_runner.cpp.
+Verified: headless harness with the real ARP 2600 V3 / kHs Pitch Shifter (the reported project):
+          saved-state replace = 0.3687, mix = 0.5185, instrument alone = 0.3984 (was 0.0000);
+          chunked replay with 361 / 501 differing values = 0.3984.
+       src/vst3_host.cpp, src/app.cpp, src/csound_api_runner.cpp syntax check with -DCAW_VST3,
+       src/vst_rack.h also without -DCAW_VST3 (MinGW g++), exit 0.
+       MSVC build + audio behaviour not testable in this environment.
+
+Round 31 - VSTi into VSTe sounds "frozen / flanged feedback" (the picked parameter was pinned to 0)
+   (Minimal fix on top of Round 29. The Round 30 "Run VST is the one host" attempt was rejected -
+    its code was reverted and its notes were dropped from this file.)
+
+A) Root cause
+   - A VSTe clip's code sends P1..P8 to the plugin every block (chnset kP<k>, "cawvst_<id>_p<k>"),
+     and P1..P8 are whichever parameters the user learned into those slots. The default code a new
+     VSTe clip started with was:  P1 = clip(level(in) * 4, 0, 1)
+   - level(in) reads the RMS of the clip's input audio (cawvstin_<id>_1/2), but nothing ever
+     declared or wrote those channels, so the clip's aInL/aInR were silent locals and level(in)
+     was ALWAYS exactly 0. Every block the clip therefore wrote P1 = 0.
+   - In the reported project the first learned parameter is the Pitch Shifter's Pitch, so the
+     effect's pitch was forced to 0 every block. Csound's chnset lands after the rack's own
+     override pass for the block, so the 0 wins over the knob. Pitch = 0 in kHs Pitch Shifter is
+     not a pass-through: it comb-filters / resamples the signal into the smeared metallic
+     "freezing feedback" that was heard (real rack, ksmps 32: correlation 0.845 to the clean
+     path, residual 0.534; same rack with nothing learned: correlation 1.000, residual 0.000).
+   - The rack path itself was never at fault: VSTi -> VSTe at block size 32 through the real
+     graph is bit-exact (correlation 1.0000, residual 0.000).
+
+B) The fix
+   - New default VSTe clip code touches no P slot; it explains that P1..P8 are the picked
+     parameters and that driving one is optional (kVsteClipCode in src/app.cpp).
+   - upgradeVsteDefaultClips() runs at project load and replaces the exact old default text in
+     every VSTe track and clip code, so projects saved before the fix regenerate corrected
+     Csound. Hand-written code never matches and is left untouched; VSTi code is never touched
+     (a VSTi's P1 can be its note pitch).
+   - The CSD declares cawvstin_<id>_1/2 for every VSTe, and the rack writes the packed input
+     block into them every block, so `in` / `level(in)` in clip code carry the real input audio
+     (one ksmps late, which is inaudible for a level follower).
+   - level() is smoothed (port ..., 0.05): one ksmps of RMS is a spike, not a loudness.
+   - Console: "CAW engine build: 41_vste_input_31 ...".
+C) What to look for when testing
+   - Open a project with VSTi1 ARP 2600 V3 + VSTe2 Pitch Shifter (replace, wired to VSTi1) and
+     Run: the VSTe plays the VSTi through the effect cleanly - no frozen / feedback smear.
+   - VSTe2's clips no longer contain "P1 = clip(level(in) * 4, 0, 1)" (upgraded on load); a Pitch
+     learned into P1 can still be driven by hand-written clip code if wanted.
+   - VSTi-only (no language engine) is unchanged: still instruments only.
+Files: src/app.cpp, src/csd_builder.cpp, src/vst_rack.h, src/vst_lang.h,
+       src/csound_api_runner.cpp (build tag).
+Verified: real ARP 2600 V3 / kHs Pitch Shifter through the real rack at block 32: Pitch pinned to
+          0 = corr 0.845 / residual 0.534 (the reported sound); Pitch left at the knob = corr 1.000;
+          nothing picked = clean. New CSD declares cawvstin_* and feeds them signal (rms 0.075 /
+          0.061) with rack output unchanged (corr 1.000 / residual 0.000). The user's vst.caw VSTe
+          code matches the old default exactly (upgraded on load); its VSTi code does not match.
+       src/app.cpp + src/csound_api_runner.cpp and src/csd_builder.cpp syntax check with
+       -DCAW_VST3 (MinGW g++), exit 0. MSVC build + audio not testable in this environment.
+
+Round 32 - CSD and VST separated: the generated CSD contains no VST channels
+-------------------------------------------------------------------------------
+A) Why
+   - Round 31 made `in` / `level(in)` real by printing chn_a "cawvstin_<id>_1/2" into the CSD.
+     That works, but it puts VST-side routing inside the Csound project: the CSD (project text
+     the user sees) declares a dependency on a host buffer it does not own, and WHICH buffer
+     survives depends on declaration order versus the host's own csoundGetChannelPtr call.
+   - Probe result: an audio channel created from C with
+     csoundGetChannelPtr(cs, &p, name, CSOUND_AUDIO_CHANNEL | CSOUND_INPUT_CHANNEL |
+     CSOUND_OUTPUT_CHANNEL) BEFORE csoundCompile returns the SAME pointer before and after the
+     compile, and a Csound clip's chnget of that name reads it (rms converges to 0.496507 for a
+     0.5 constant). The CSD therefore needs no channel declaration at all.
+
+B) The fix
+   - src/csd_builder.cpp no longer emits chn_a cawvstin_*; a comment records that the engine
+     creates them. The CSD still carries chn_k cawvst_<id>_wr/_tab/_p1..8 (control side, shared
+     with the clip code) - only the VST audio channels moved out.
+   - src/csound_api_runner.cpp: ensureVstInChannels() creates cawvstin_<id>_1/2 for every
+     non-instrument VST job from C (flags 2|16|32) before the CSD compiles (right after
+     createMessages) and again when a live graph push adds a VSTe (setVstJobs / setVstWiring set
+     vstInChDirty; the block loop drains it). vstInChMade is per Csound instance (cleared at
+     engine start); a failed creation is logged once. The rack still writes the packed input
+     block into those buffers every block, so `in` / `level(in)` keep working unchanged.
+   - Console: "CAW engine build: 42_vste_nocsd_33 ...".
+
+   Ported from the 43_startup_5_good files:
+   - app.cpp: trackIsVst() (kind 3 OR 4) - an effect's parameters, picks and live values now reach
+     the standalone 4th engine too (trackIsVsti only covered instruments).
+   - vst_rack.h: a pick with no Csound lane (standalone engine) falls back to the pick's start
+     value instead of being skipped; one-shot logs for "VSTe NOT active - skipped, source plays
+     dry", "input names a VST source that is NOT in the rack - press Run once", and a first-run
+     per-VSTe state line (routedIn, packedLines, input peak, output peak, per-source state).
+   - vst_ui.h: picking a VSTe input source turns the row ON and pushes the live input mask.
+
+   NOT ported, deliberately:
+   - "Insert-safety" (put the dry source back when no effect produced finite non-zero output this
+     block). It makes the replace decision depend on audio content, so any effect that is silent
+     at a block boundary (attack, latency, an empty arp step) gets its dry source added on top of
+     the wet path. Measured at block 32 through the real rack: corr(arp) 1.000 / residual 0.000
+     without the block, 0.965 / 0.263 with it, unchanged by the cawvstin rows. An effect that is
+     muted / not soloed already cannot replace its source (it is skipped and says so), and the
+     new first-run diagnostics name a plugin whose output is silent - routing itself stays exact.
+   - The 5_good revert of Round 29's parameter restore (restore EVERY saved value in block 0 and
+     send them all at once): that is what silenced the ARP 2600. Different-only restore and the
+     128-changes-per-block replay are kept.
+
+C) What to look for when testing
+   - Run a project with a VSTe: the console does not need any cawvstin_* channel from the CSD;
+     the effect still hears its wired input and `level(in)` follows the input loudness.
+   - Add a VSTe, wire it, press Run: its two input channels are created by the engine; adding
+     another VSTe while playing creates its channels on the next block (no Run needed for audio).
+   - A muted VSTe prints that it is skipped and its source plays dry; a plugin that outputs
+     nothing prints its input/output peaks once, instead of an unexplained silence.
+Files: src/csd_builder.cpp, src/csound_api_runner.cpp, src/vst_rack.h, src/vst_ui.h, src/app.cpp
+       (build tag).
+Verified: generated CSD contains no chn_a cawvstin_* and the clip's chnget for it is present;
+          that CSD compiles, starts and performs rc 0 with the channels created from C first
+          (pointer identical before/after compile; 0.5 constant reads back rms 0.496507).
+          Rack harness h8 (no cawvstin rows) and h9 (real rows) identical for lane
+          0.25 / 0.5 / 0.75 x pick 0 / 1: corr(arp) 1.000 / residual 0.000 at the neutral
+          setting; the pick-driven differences are identical in both builds.
+       src/app.cpp + src/csound_api_runner.cpp and src/csd_builder.cpp syntax check with
+       -DCAW_VST3 (MinGW g++), exit 0. MSVC build + audio not testable in this environment.
+
+Round 33 - One plugin per VST3 class id: multi-plugin bundles, the Settings VST3 browser, editors
+-------------------------------------------------------------------------------------------------
+A) Why
+   - A .vst3 bundle is a container. Its identity is (file, class id): one file can expose several
+     plugins (Arturia / Kilohearts bundles), and CAW only ever loaded the FIRST audio class it
+     found (it stopped at the first kVstAudioEffectClass in load()). Picking another plugin from
+     the same company therefore reopened the same bundle and loaded the same first class again -
+     it looked like "selecting does nothing"; picking a plugin from another company changed the
+     file, which is why that appeared to "fix" it.
+     The path was also the identity everywhere else: the scanner stored one name per file, the
+     picker rows were keyed by path, the track saved only vstPath, the rack reused instances by
+     path, the solo-engine signature and the live-reload check compared paths.
+   - Kilohearts editors (Phase Plant, Snap Heap - the animated GUIs) and some EQs mis-size or draw
+     broken when IPlugViewContentScaleSupport::setContentScaleFactor arrives AFTER attached();
+     CAW did exactly that (scale was applied in resizeEditor/showEditor after attached). JUCE hit
+     the same plugin behaviour and documented calling the scale first. A second call with the same
+     factor also makes some editors (TBProAudio) apply their display scale twice.
+   - There was no way to point CAW at a VST3 folder that is not one of the four system folders
+     (portable installs, per-user folders), and no visible way to rescan.
+
+B) The fix
+   - Identity = (path, class id) end to end.
+     src/plugin_host.h: IPlugin::load(path, classId, err) + classId() (the class actually loaded);
+     PluginInfo carries classId; vst3ExtraDirs()/setVst3ExtraDirs() persist user folders.
+     src/vst3_host.cpp: cidText()/normCid() (canonical 32 uppercase hex, accepts braces/dashes/
+     lower case); load() picks the class whose CID matches (empty id = first audio class, old
+     projects), refuses a missing class with "this .vst3 does not contain the selected plugin
+     class", and pins classId_. scanVst3Info() cache v3 stores ONE LINE PER CLASS and replays every
+     class of an unchanged bundle. User folders live in <home>/.caw_vst3_dirs.
+     src/model.h vstClassId, src/vst_job.h classId, src/project_io.cpp CAW_PROJECT 54 + a VSTCID1
+     block (one string per track, written/read for all tracks).
+     src/vst_rack.h: reuse only when (track, path, classId) all match; loadSig includes the class.
+     src/vst_solo.h: solo signature includes the class. src/app.cpp: collectVstJobs passes it.
+     src/vst_ui.h: Slot.loadedClassId; niceName(path, classId) names the exact class (a file-level
+     name when no class is chosen); picker rows are keyed by path+class id (one row per plugin,
+     not per file); picking calls loadPlugin(path, classId); the track is pinned to the class the
+     plugin reported; parameter mapping carry-over respects the class too.
+   - Editor attach: setEditorScale(windowDpi(hwnd)) now runs BEFORE attached(), identical factors
+     are skipped (lastScale_), and after attached() an explicit onSize with the final client rect
+     runs (many GUIs start their layout/animation timers there). IPlugin::closeEditor() +
+     a panel button "Reopen editor" destroy and recreate the window without reloading the
+     plugin (the DPI-mode switch uses it too, instead of a full plugin reload).
+   - Settings > Programs > VST3 PLUGINS: "Scan VST3 plugins" (restart the scan), "Add folder..."
+     (plat::chooseFolder, persisted, rescans), the list of added folders with Remove, the number
+     of plugin classes found. The scanner also reads the added folders.
+
+C) What to look for when testing
+   - Two plugins from one bundle (Arturia/Kilohearts): pick the second one - it loads; pick it
+     again after another plugin - it loads the same class; the picker highlights the row of the
+     loaded class only. Reopen the project and the same class comes back. caw_vst_log.txt shows
+     "create provider for <name> [CID]" and "editor: attached, scale ..., size ...".
+   - Kilohearts Phase Plant / Snap Heap and animated EQs: the window opens at the right size and
+     the animation runs; if one still draws wrong, "Reopen editor" reattaches it without losing
+     the patch, and the Windows compatibility scaling box can be switched and applied the same way.
+   - Settings > Programs: Add folder... with a folder holding .vst3 files, then Scan; the plugins
+     appear in the picker; Remove + Scan drops them. Old projects open with their plugin (the
+     class id is pinned on first open and saved).
+Files: src/plugin_host.h, src/vst3_host.cpp, src/vst_job.h, src/model.h, src/project_io.cpp,
+       src/vst_rack.h, src/vst_solo.h, src/app.cpp, src/vst_ui.h, src/csound_api_runner.cpp
+       (build tag 42_vste_nocsd_34).
+Verified: project round trip (serializeProject/deserializeProject): header CAW_PROJECT 54, the
+          class id and path come back, a track without a plugin keeps an empty id (PASS).
+          Arturia DX7 V loaded by its own CID -> classId() identical, 3124 parameters, instrument;
+          empty id -> loads the first class and pins the same CID; a bogus CID is refused with
+          the "does not contain the selected plugin class" error instead of loading another class.
+          Scanner on the Arturia folder: 115 classes with CID/kind, cold scan and warm v3-cache
+          scan produce the identical list, no unknown-kind entries.
+          Rack harness h8 (no cawvstin rows) and h9 (real rows): VSTe replace corr(arp) 1.000 /
+          residual 0.000, identical to Round 32.
+          src/app.cpp, src/project_io.cpp, src/csound_api_runner.cpp, src/csd_builder.cpp and
+          src/vst3_host.cpp compile with -DCAW_VST3 (MinGW g++), exit 0.
+          Editor attach / animation itself needs the real GUI - not testable in this environment.
+
+Round 34 - Changing a plugin no longer inherits the previous plugin's values (same-vendor switch)
+------------------------------------------------------------------------------------------------
+A) Why
+   - Plugins from one vendor reuse one parameter-id space. Measured on the installed plugins:
+     Arturia DX7 V -> Mini V4: 2663 of 2663 ids of B exist in A (100.0%); Kilohearts Slice EQ ->
+     Phase Plant: 2090 of 2174 (96.1%). CAW keyed the saved patch by parameter id
+     (Track::vstParameterState), captured EVERY writable parameter of the outgoing plugin into it,
+     and after loading the next plugin replayed the map id by id - in the editor copy AND, through
+     VstJob::parameterState, in the engine instance.
+     Measured effect (probe h19, DX7 V values replayed into Mini V4): 2605 values applied, 2589 of
+     Mini V4's 2663 controls left their own defaults after the load - the editor opened showing
+     another instrument's settings, and an instrument whose oscillator/filter/envelope ids were
+     overwritten that way makes no sound ("VSTi does not work when changing"). Kilohearts: 2090
+     values replayed into Phase Plant the same way.
+     The known-good 38_bridge_19 build cleared that map whenever the file changed, which is why
+     picking a plugin from another company "fixed" the next pick from the same company. Round 33
+     introduced class ids but kept the replay.
+   - Round 33 also moved IPlugViewContentScaleSupport::setContentScaleFactor BEFORE attached().
+     The build the user pointed at (38_bridge_19_fixed17) sizes the window from getSize() before
+     attached(), applies the scale AFTER attached() and then re-queries getSize() so the plugin's
+     own (scaled) size reaches it as onSize. Kilohearts returns kResultOk to the pre-attach scale
+     call but lays the GUI out on the post-attach size, so the earlier call changed nothing.
+
+B) The fix
+   - src/vst_ui.h: loadPlugin() now decides "this is a different plugin" from (path, class id),
+     not the path alone, and clears Track::vstParameterState BEFORE the load when it is. The
+     restore loop then finds nothing and the plugin opens on its own defaults; the engine's copy
+     gets the same empty map through collectVstJobs, so both sides agree. Re-picking the same
+     (path, class) - and opening an old project, whose class id is empty until first load - still
+     restores the saved patch.
+   - src/vst3_host.cpp: showEditor() follows the reference order - getSize + resizeEditor before
+     attached(), applyEditorScale after attached() (setContentScaleFactor, then the view's own
+     getSize + onSize), plus the explicit onSize with the final client rect. setEditorScale() now
+     records a factor as applied only when the plugin returned kResultOk, so a refused scale is
+     retried by the next resize instead of being deduplicated away.
+
+C) What to look for when testing
+   - VSTi: with one Arturia (or Kilohearts) plugin playing, pick another from the same company -
+     it loads, its editor opens on ITS default patch (sliders/kb at their own positions, not the
+     previous plugin's), and it sounds. Pick the first one again: still works, no reload needed.
+     Switching between companies keeps working. A saved project still reopens its plugin with
+     the patch it was saved with.
+   - Kilohearts Phase Plant / Snap Heap: open the editor right after loading it fresh - the
+     window is sized by the plugin and the animated elements move. If a specific editor still
+     draws wrong, "Reopen editor" reattaches it (size, then scale) without touching the patch;
+     the "Windows compatibility scaling" box + Apply switches DPI mode the same way.
+   - caw_vst_log.txt: every open shows "editor: attach", "editor: client <w>x<h>",
+     "editor: mode=native|windows ... scale <factor> -> <tresult>", "editor: attached, scale ...,
+     size ..." in that order (size first, scale after attach).
+
+Files: src/vst_ui.h, src/vst3_host.cpp, src/csound_api_runner.cpp (build tag 42_vste_nocsd_35).
+Verified: h19 (same-vendor replay): old path 2605 values applied -> 2589 of 2663 Mini V4 controls
+          away from defaults; new path 0 applied -> 0 away from defaults. Kilohearts Slice EQ ->
+          Phase Plant: 2090 applied by id under the old rule, 0 under the new one.
+          h10: DX7 V loads by its own CID (classId() identical, 3124 params, instrument), empty id
+          pins the same CID, bogus CID is refused - unchanged by this round.
+          h20/h18 editor probes with the new attach order: window 1180x664 at 120 dpi, log order
+          "client ... dpi=120" -> "setContentScaleFactor 1.250000 -> 0" -> "client ... dpi=120"
+          -> "attached, scale 1.250000, size 1180x664"; no crash over repeated open/close.
+          src/app.cpp, src/vst3_host.cpp and src/csound_api_runner.cpp compile with -DCAW_VST3
+          (MinGW g++), exit 0.
+          The visible animation itself still needs the real GUI: the headless capture probe gives
+          inconsistent frame checksums (0.00-0.34 of frames change with identical code), so it is
+          not evidence either way.

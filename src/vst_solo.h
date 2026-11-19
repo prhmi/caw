@@ -52,7 +52,7 @@ public:
     // The identity of a set of instrument jobs: a change means the plugins must be (re)loaded.
     static std::string signature(const std::vector<VstJob>& jobs) {
         std::string sig;
-        for (const VstJob& j : jobs) sig += std::to_string(j.id) + "|" + j.path + ";";
+        for (const VstJob& j : jobs) sig += std::to_string(j.id) + "|" + j.path + "|" + j.classId + ";";
         return sig;
     }
     bool sameJobs(const std::vector<VstJob>& jobs) const {   // UI thread
@@ -75,9 +75,10 @@ public:
         const std::string sig = signature(jobs) + "@" + std::to_string(sr_) + "/" + std::to_string(channels_) + "/" + std::to_string(block_);
         if (!(rackReady_ && sig == jobsSig_)) {
             rackReady_ = false;
-            // No rack_.clear(): the rack reuses every instance whose (track, .vst3) still matches,
-            // so picking / changing ONE plugin creates only that plugin - the other instruments
-            // keep their loaded instances and their voices instead of being unloaded and reloaded.
+            // No rack_.clear(): the rack reuses every instance whose (track, .vst3, class id) still
+            // matches, so picking / changing ONE plugin creates only that plugin - the other
+            // instruments keep their loaded instances and their voices instead of being unloaded
+            // and reloaded.
             rack_.clearSoloPeaks();
             { std::lock_guard<std::mutex> mirrorLock(mirror_.mutex); mirror_.values.clear(); }
             rack_.setSoloMode(true);

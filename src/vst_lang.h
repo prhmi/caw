@@ -6,9 +6,13 @@
 //   note 60, 100, 0.4   play a MIDI note (pitch, velocity, length in seconds)             cc 1, 127   MIDI controller
 //   pitch vel dur time  pitch / velocity of the MIDI clip note that started this clip, clip length, seconds since the clip started
 //   lfo(f) tri(f) saw(f) sqr(f) rnd(n) rnd(a,b) smooth(x,t) line(a,b) clip(x,lo,hi) min max abs sin cos int sqrt level(in) mtof(n) uni(x)
+//   p2 = cawget("test1")  bind parameter 2 to the automation lane "test1" (wins over the slot's own lane)
 //   csound: <any Csound line>
 #include <algorithm>
 #include <cctype>
+#include <map>
+#include <map>
+#include <map>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -80,7 +84,7 @@ inline std::string call(Ctx& c, const std::string& fn, const std::vector<std::st
     if (fn == "smooth") { const std::string t = temp(c); c.pre.push_back(t + " port " + arg(0, "0") + ", " + arg(1, "0.1")); return t; }
     if (fn == "line") { const std::string t = temp(c); c.pre.push_back(t + " line " + arg(0, "0") + ", p3, " + arg(1, "1")); return t; }
     if (fn == "clip") { const std::string t = temp(c); c.pre.push_back(t + " limit " + arg(0, "0") + ", " + arg(1, "0") + ", " + arg(2, "1")); return t; }
-    if (fn == "level") { const std::string t = temp(c); c.pre.push_back(t + " rms aInL"); return t; }
+    if (fn == "level") { const std::string raw = temp(c); c.pre.push_back(raw + " rms aInL"); const std::string t = temp(c); c.pre.push_back(t + " port " + raw + ", 0.05"); return t; }   // one ksmps of rms is a spike: follow the loudness smoothly
     if (fn == "min") return "((" + arg(0, "0") + ") < (" + arg(1, "0") + ") ? (" + arg(0, "0") + ") : (" + arg(1, "0") + "))";
     if (fn == "max") return "((" + arg(0, "0") + ") > (" + arg(1, "0") + ") ? (" + arg(0, "0") + ") : (" + arg(1, "0") + "))";
     if (fn == "mtof") return "cpsmidinn(" + arg(0, "60") + ")";
@@ -122,6 +126,7 @@ inline std::string translate(const Track& t, const std::string& code) {
     Ctx c; c.id = t.id; c.fx = t.kind == 4;
     const std::string idStr = std::to_string(t.id);
     const size_t n = std::min<size_t>(8, t.vstPick.size());
+    std::map<int, std::string> pBind;   // parameter slot (0..7) -> automation lane, from p2 = cawget("test1") lines
     // 1. normalise: comments, braces, else
     std::string text;
     {
@@ -179,6 +184,9 @@ inline std::string translate(const Track& t, const std::string& code) {
             const std::string s0 = expr(c, a.size() > 0 ? a[0] : "144"), d1 = expr(c, a.size() > 1 ? a[1] : "0"), d2 = expr(c, a.size() > 2 ? a[2] : "0");
             flush(); body << "CawVstEv_" << idStr << " " << s0 << ", " << d1 << ", " << d2 << "\n"; continue;
         }
+        static const std::regex bindRe(R"re(^([pP][1-8])\s*=\s*cawget\s*(?:\(\s*)?"([^"]*)"(?:\s*\))?\s*$)re");
+        std::smatch bm;
+        if (std::regex_match(seg, bm, bindRe)) { pBind[(int)(bm[1].str()[1] - '1')] = bm[2].str(); continue; }   // p2 = cawget("test1"): the code binds the parameter to an automation lane
         if (std::regex_match(seg, m, assignRe)) {
             const std::string name = varName(c, m[1].str(), true), op = m[2].str();
             const std::string rhs = expr(c, m[3].str()); flush();
@@ -191,15 +199,29 @@ inline std::string translate(const Track& t, const std::string& code) {
     std::ostringstream o;
     o << "; ---- generated from the CAW code of this VST track ----\n";
     for (size_t k = 0; k < 8; ++k) {
-        if (k < n && k < t.vstPickName.size()) o << "kP" << (k + 1) << " cawget \"" << t.vstPickName[k] << "\"\n";
+        const auto b = pBind.find((int)k);
+        if (b != pBind.end()) o << "kP" << (k + 1) << " cawget \"" << b->second << "\"\n";   // the code binding wins over the slot's own lane
+        else if (k < n && k < t.vstPickName.size()) o << "kP" << (k + 1) << " cawget \"" << t.vstPickName[k] << "\"\n";
         else o << "kP" << (k + 1) << " init 0.5\n";
     }
-    if (c.fx) o << "aInL chnget \"cawbus_" << busName(t) << "_L\"\naInR chnget \"cawbus_" << busName(t) << "_R\"\n";
+    if (c.fx) {
+        bool anyIn = false; for (const auto& in : t.vstInputs) if (in.on) { anyIn = true; break; }
+        if (anyIn)   // audio input routing: line 1 / 2 of the routed lines (see the AUDIO INPUT section of the VST window)
+            o << "aInL chnget \"cawvstin_" << idStr << "_1\"\naInR chnget \"cawvstin_" << idStr << "_2\"\n";
+        else o << "aInL = 0\naInR = 0\n";
+    }
     else o << "aInL = 0\naInR = 0\n";
     for (const std::string& v : c.vars) if (!(v.size() == 3 && v[1] == 'P')) o << v << " init 0\n";
     o << "if p4 > 0 then\nevent_i \"i\", \"CawVstNote_" << idStr << "\", 0, p3, p4, p5\nendif\n";
     o << body.str();
-    for (size_t k = 0; k < n; ++k) o << "chnset kP" << (k + 1) << ", \"cawvst_" << idStr << "_p" << (k + 1) << "\"\n";
+    // Send every slot that has a picked parameter AND every code-bound slot (p2 = cawget "lane"),
+    // even when nothing is picked: the channel exists (vstOrchestra declares bound slots too) and
+    // the rack reads it once the slot gets a parameter. A bound slot without a pick is inert but
+    // never breaks the orchestra.
+    int boundMax = -1;
+    for (const auto& b : pBind) boundMax = std::max(boundMax, b.first);
+    const size_t nSend = std::min<size_t>(8, std::max<size_t>(n, (size_t)std::max(0, boundMax + 1)));
+    for (size_t k = 0; k < nSend; ++k) o << "chnset kP" << (k + 1) << ", \"cawvst_" << idStr << "_p" << (k + 1) << "\"\n";
     std::string r = o.str();
     // max_cawsafe(x) = never divide by zero
     r = std::regex_replace(r, std::regex(R"(max_cawsafe\(([^\n]*)\)\n)"), "(($1) < 0.001 ? 0.001 : ($1))\n");

@@ -90,6 +90,7 @@ extern bool g_cawMonitorApi;
 // Run / Play link without port, stdin or tables: numbered command files (caw_cmd_<n>.txt + caw_cmd_serial.txt) that the running Csound reads when the serial changes.
 // Clips and automation channels are referred to by their number in these lists (fixed when Run is pressed).
 std::vector<std::string> engineClipNames(const Project& p);      // unique clip (instrument) names, project order
+std::vector<std::string> engineVstNoteNames(const Project& p);   // the VSTi note helpers "CawVstNote_<id>", project order (type 14 rows)
 std::string engineFilePrefix();                                  // "<temp>/CAW/caw_cmd_": the files are <prefix>serial.txt and <prefix><n>.txt
 std::vector<std::string> engineChannelNames(const Project& p);   // unique automation channel names (clip_channel), project order
 
@@ -102,7 +103,23 @@ std::vector<TimelineEvent> timelineEvents(const Project& p, double from, bool in
 unsigned long long timelineSignature(const Project& p);          // changes when anything Play would start changes
 
 std::string vstBusName(const Track& t);   // audio bus name of a VSTe track: cawsa "<name>", aL, aR
+// The 8 VSTe input lines resolved into concrete line ranges, in slot order. Each enabled input
+// takes as many of the 8 plugin input channels as its source has outputs (a stereo source takes
+// two lines); a master input always takes two (L, R). Lines past 8 are dropped. Master inputs are
+// filled by the rack from the master buffer; VST / PD / SC sources are wired by the rack too;
+// Csound sources name their tap channel per line (cawtap_<clip>_<ch>) so the rack reads them live.
+struct VstInputRoute { int slot = 0; int mode = 0; std::string name; int lineStart = 0; int lineCount = 0; std::vector<std::string> chans; };
+std::vector<VstInputRoute> resolveVstInputRoutes(const Project& p, const Track& vt);
+// True if `sourceTrack` feeds a VSTe whose output mode is "master" (replace): that source's own
+// master output is suppressed, so its lane meter is drawn gray instead of the default color.
+bool trackConsumedByMasterVste(const Project& p, const Track& sourceTrack);
 std::string buildCsd(const Project& p, const std::string& mode, double fromTime = 0.0, std::vector<OrcSpan>* spans = nullptr);
+
+// The instrument definition of one clip exactly as the live engine's CSD holds it (translated VST
+// code, VSTe input sends, output gates). The app compiles this into the RUNNING engine so a code
+// edit is heard without a restart (Csound keeps running instances on their old definition, so a
+// playing clip is restarted by the caller). Empty when no instrument of that name is generated.
+std::string buildClipInstrumentCode(const Project& p, const Clip& clip);
 
 // One-clip test CSD (no audio output).
 std::string buildClipTestCsd(const Project& p, const Clip& clip, OrcSpan& span);

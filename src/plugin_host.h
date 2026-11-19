@@ -13,9 +13,15 @@ struct IPlugin {
     virtual ~IPlugin() = default;
     // Set before load. Windows scaling uses DPI-unaware coordinates for legacy editors.
     virtual void setEditorSystemScaling(bool enabled) = 0;
-    virtual bool load(const std::string& path, std::string& err) = 0;
+    // One .vst3 file can contain SEVERAL plugin classes (Arturia bundles, Kilohearts bundles ...).
+    // classId selects the class (canonical 32-hex CID); empty = the first audio class, as before.
+    virtual bool load(const std::string& path, const std::string& classId, std::string& err) = 0;
+    virtual std::string classId() const = 0;               // the class the plugin actually loaded
     virtual bool isInstrument() const = 0;
     virtual void prepare(double sr, int maxBlock) = 0;
+    // Configure/activate the editor-side component when the host audio engine becomes ready.
+    // This is deliberately separate from prepare(): the editor instance must not start audio processing.
+    virtual void prepareEditor(double sr, int maxBlock) { (void)sr; (void)maxBlock; }
     // in = bus audio (null for instruments), out = result. MIDI and param events are pulled from ep.
     virtual void process(const float* in, float* out, int frames, int channels, Endpoint& ep) = 0;
     virtual const std::vector<PluginParam>& params() const = 0;
@@ -23,16 +29,28 @@ struct IPlugin {
     virtual double getParam(int index) const = 0;
     // The plugin's own window (Windows). Used to look at the plugin and to "learn" a parameter: turn a knob, takeTouchedParam() says which one.
     virtual bool showEditor(const std::string& title, std::string& err) = 0;
+    // Close the plugin's own window; showEditor() opens it again. The plugin keeps its settings
+    // (used to reattach an editor after a DPI mode change, or when its window drew wrong).
+    virtual void closeEditor() {}
     virtual bool editorVisible() const = 0;
     virtual void setLearnEnabled(bool enabled) = 0;
     virtual int takeTouchedParam() = 0;                    // plugin parameter index touched in the editor since the last call, or -1
+    // Live editor edits: the hook is called with (parameter index, normalized value) EVERY time
+    // the plugin's own window changes a parameter. This is how ANY editor knob reaches the
+    // running engine in real time (not just the 8 picked parameters).
+    virtual void setLiveEditHook(std::function<void(int, double)> hook) { (void)hook; }
     virtual std::string getState() const = 0;              // for saving into the project
     virtual void setState(const std::string& blob) = 0;
 };
 std::unique_ptr<IPlugin> makeVst3Plugin();
 std::vector<std::string> scanVst3(const std::vector<std::string>& extraDirs);   // finds *.vst3
-// Name and kind of every plugin file (read from the plugin factory without creating the plugin).
-struct PluginInfo { std::string path, name; int kind = 0; };   // kind: 1 instrument, 2 effect, 0 unknown
+// One plugin CLASS (read from the factory without creating the plugin). A bundle file can appear
+// several times, once per class, with different classId / name / kind.
+struct PluginInfo { std::string path, name, classId; int kind = 0; };   // kind: 1 instrument, 2 effect, 0 unknown
+// Extra folders the user added in Settings > Programs > VST3 (persisted per user). The standard
+// VST3 system folders are always scanned in addition to these.
+std::vector<std::string> vst3ExtraDirs();
+void setVst3ExtraDirs(const std::vector<std::string>& dirs);
 // Publish discovered paths first, then classifications as they arrive.
 std::vector<PluginInfo> scanVst3Info(const std::vector<std::string>& extraDirs,
     const std::function<void(const std::vector<PluginInfo>&)>& publish = {});

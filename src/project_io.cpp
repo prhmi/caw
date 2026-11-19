@@ -30,7 +30,7 @@ bool readString(std::istream& in, std::string& value) {
 namespace {
 void writeProject(std::ostream& out, const Project& p) {
     const CsoundSettings& s = p.cs;
-    out << "CAW_PROJECT 51\n"
+    out << "CAW_PROJECT 54\n"
         << s.sr << ' ' << s.ksmps << ' ' << s.nchnls << ' ' << s.nchnlsIn << ' '
         << std::setprecision(17) << s.zdbfs << ' ' << s.a4 << ' ' << s.bufSW << ' ' << s.bufHW << ' '
         << s.outDev << ' ' << s.inDev << ' ' << s.renderFormat << ' ' << s.tail << ' '
@@ -270,6 +270,16 @@ void writeProject(std::ostream& out, const Project& p) {
             writeString(out, i < t.vstPickName.size() ? t.vstPickName[i] : std::string("P") + std::to_string(i + 1));
         }
     }
+    out << "VSTIN2\n";                              // version 53: 8 VSTe inputs (on / mode / name) + output mode (master / mix)
+    for (const Track& t : p.tracks) {
+        out << (t.vstOutMode == 1 ? 1 : 0) << '\n';
+        for (int i = 0; i < 8; ++i) {
+            out << (t.vstInputs[i].on ? 1 : 0) << ' ' << std::min(2, std::max(0, t.vstInputs[i].mode)) << '\n';
+            writeString(out, t.vstInputs[i].name);
+        }
+    }
+    out << "VSTCID1\n";                             // version 54: the plugin class inside the .vst3 (a bundle can hold several)
+    for (const Track& t : p.tracks) writeString(out, t.vstClassId);
     out << "AUTOSAVE1 " << (s.autosaveEnabled ? 1 : 0) << ' ' << s.autosaveMinutes << '\n';
     out << "MASTER1 " << std::setprecision(9) << s.masterGain << '\n';
     out << "EXPORT1 " << s.exportChannels << ' ' << s.exportFlacBits << ' ' << s.exportMp3Kbps << '\n';
@@ -372,7 +382,7 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
     Project candidate;
     std::string magic;
     int version = 0;
-    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 51)) {
+    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 54)) {
         error = "This is not a supported CAW project file.";
         return false;
     }
@@ -979,6 +989,50 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
                 track.vstPick.push_back(idx); track.vstInit.push_back(std::min(1.0, std::max(0.0, v))); track.vstPickName.push_back(name);
             }
         }
+    }
+    if (version >= 53) {
+        std::string marker;
+        if (!(in >> marker) || marker != "VSTIN2") { error = "The VST input block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            int om = 0;
+            if (!(in >> om)) { error = "A VST output mode is invalid."; return false; }
+            track.vstOutMode = (om == 1) ? 1 : 0;
+            track.vstOutMaster = track.vstOutMode == 1;   // keep the legacy field in sync
+            for (int i = 0; i < 8; ++i) {
+                int on = 0, mode = 0;
+                if (!(in >> on >> mode) || !readString(in, track.vstInputs[i].name)) { error = "A VST input setting is invalid."; return false; }
+                track.vstInputs[i].on = on != 0;
+                track.vstInputs[i].mode = std::min(2, std::max(0, mode));
+            }
+        }
+    } else if (version >= 52) {
+        std::string marker;
+        if (!(in >> marker) || marker != "VSTIN1") { error = "The VST input block is invalid."; return false; }
+        for (;;) {   // projects saved by the doubled-block build contain this block twice: read every copy, the same values repeat
+            for (Track& track : candidate.tracks) {
+                int mode = 0, och = 2;
+                if (!(in >> mode >> och) || !readString(in, track.vstInSource)) { error = "A VST input setting is invalid."; return false; }
+                track.vstInMode = std::min(2, std::max(0, mode));
+                track.vstOutCh = (och == 4 || och == 6 || och == 8) ? och : 2;
+                // Migrate the legacy single input into input slot 1 (legacy 1 = track -> 0, 2 = clips -> 1).
+                if (track.vstInMode > 0 && !track.vstInSource.empty()) {
+                    track.vstInputs[0].on = true;
+                    track.vstInputs[0].mode = std::min(1, std::max(0, track.vstInMode - 1));
+                    track.vstInputs[0].name = track.vstInSource;
+                }
+                // Migrate the legacy output bus / master flag into the new master / mix output mode.
+                track.vstOutMode = track.vstOutMaster ? 1 : 0;
+            }
+            const std::streampos pos = in.tellg();
+            if (!(in >> marker)) { error = "The VST input block is invalid."; return false; }   // AUTOSAVE1 / MASTER1 always follow
+            if (marker != "VSTIN1") { in.clear(); in.seekg(pos); break; }
+        }
+    }
+    if (version >= 54) {
+        std::string marker;
+        if (!(in >> marker) || marker != "VSTCID1") { error = "The VST class block is invalid."; return false; }
+        for (Track& track : candidate.tracks)
+            if (!readString(in, track.vstClassId)) { error = "A VST plugin class id is invalid."; return false; }
     }
     if (version >= 46) {
         std::string marker;

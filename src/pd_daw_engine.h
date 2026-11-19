@@ -11,6 +11,7 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -215,11 +216,13 @@ public:
         Command c;c.frame=frames(time);c.playing=playing;c.loop=loop;c.loopStart=frames(loopStart);c.loopEnd=frames(loopEnd);
         {std::lock_guard<std::mutex> lock(mutex_);command_=c;}
         generation_.fetch_add(1,std::memory_order_release);
+        wake_.notify_all();
     }
     bool replan(const std::vector<pd_timeline::Event>& plan) {
         if(!ready())return false;
-        std::lock_guard<std::mutex> lock(mutex_);
-        pendingPlan_=plan;planGeneration_.fetch_add(1,std::memory_order_release);return true;
+        {std::lock_guard<std::mutex> lock(mutex_);
+        pendingPlan_=plan;planGeneration_.fetch_add(1,std::memory_order_release);}
+        wake_.notify_all();return true;
     }
     std::string takePlanError() {
         std::lock_guard<std::mutex> lock(mutex_);std::string result;result.swap(planError_);return result;
@@ -232,7 +235,7 @@ public:
         auto queue=std::atomic_load(&controlQueue_);return queue?queue->take():std::vector<PdControlOutput>{};
     }
     unsigned takeDroppedControls() {auto q=std::atomic_load(&controlQueue_);return q?q->takeDropped():0;}
-    void stop(){stop_.store(true);if(worker_.joinable())worker_.join();}
+    void stop(){stop_.store(true);wake_.notify_all();if(worker_.joinable())worker_.join();}
     bool active()const{return active_.load();}
     // CAW hub (caws/cawr): set before start; the worker delivers bus values to the instances.
     void setHub(CawHub* hub){hub_=hub;}
@@ -293,7 +296,7 @@ private:
                     setStatus("PD clip "+std::to_string(e.clipId)+": outputs: "+error);active_.store(false);return;
                 }
                 sink.collectDiagnostics(c);
-                events.push_back({e.clipId,start,end});
+                events.push_back({e.clipId,start,end,e.muted});
                 for(int r=0;r<e.runs;++r) {
                     const auto span=end-start;
                     const auto at=start+(span/e.runs)*r+(span%e.runs)*r/e.runs;
@@ -375,7 +378,16 @@ private:
                     seen=gen;
                     continue;
                 }
-                if(!command.playing){std::this_thread::sleep_for(std::chrono::milliseconds(10));continue;}   // stopped: poll 100x/s instead of 500x/s
+                if(!command.playing){
+                    // Parked while the transport is stopped: no polling, no DSP. transport(),
+                    // replan() and stop() wake this thread.
+                    std::unique_lock<std::mutex> parked(wakeMutex_);
+                    wake_.wait_for(parked,std::chrono::milliseconds(250),[&]{
+                        return stop_.load()||generation_.load(std::memory_order_acquire)!=seen||
+                               planGeneration_.load(std::memory_order_acquire)!=seenPlan;
+                    });
+                    continue;
+                }
                 auto begin=scheduler.frame();
                 if(command.loop && command.loopEnd>command.loopStart && begin>=command.loopEnd){
                     scheduler.seek(command.loopStart,sink);begin=scheduler.frame();
@@ -418,6 +430,8 @@ private:
         ready_.store(false);active_.store(false);
     }
     std::thread worker_;
+    std::mutex wakeMutex_;            // the worker parks on this while the transport is stopped
+    std::condition_variable wake_;
     std::atomic<bool> stop_{false},active_{false},ready_{false};
     std::atomic<std::uint64_t> generation_{0},underflows_{0};
     std::atomic<std::uint64_t> planGeneration_{0};

@@ -21,21 +21,32 @@ struct Event {
     int trackId=0;
     std::vector<Automation> automation;
     std::vector<pd_control_syntax::Output> outputs;
+    // Muted by the track / clip M / S state. The clip stays loaded (its instance is
+    // preloaded with the rest), it is simply not ticked - so muting never restarts
+    // the engine or stops the transport while the other engines keep playing.
+    bool muted = false;
 };
 // otherEngineRunning: clips of Csound/VST/SC tracks are only a conflict while
 // that engine really runs. Without a running engine they are silent anyway, so
 // they are skipped and the PD clips still play. badClip receives the id of the
 // clip an error is about (0 = none), so the app can open it.
+// includeMuted: include the clips that M / S silences and mark them `muted` instead of
+// dropping them. The timeline engine loads every clip that way, so a mute is applied
+// live by the scheduler - the engine, its device stream and the transport never restart.
 inline bool makePlan(const Project& p, const std::string& projectPath,
                      std::vector<Event>& events, std::string& error,
-                     bool otherEngineRunning = true, int* badClip = nullptr) {
+                     bool otherEngineRunning = true, int* badClip = nullptr,
+                     bool includeMuted = false) {
     events.clear(); error.clear(); if(badClip)*badClip=0;
     bool anySolo=false; for (const auto& t:p.tracks) if(t.solo && !t.muted) anySolo=true;
     bool otherAudio=false;
+    bool audiblePd=false;   // a PD clip that can actually sound: muted PD clips are not a conflict
     for(const auto& t:p.tracks) {
-        if(t.muted || (anySolo && !t.solo)) continue;
+        const bool trackAudible = !t.muted && !(anySolo && !t.solo);
+        if(!trackAudible && !includeMuted) continue;
         for(const auto& c:t.clips) {
-            if(c.muted) continue;
+            const bool clipAudible = trackAudible && !c.muted;
+            if(!clipAudible && !includeMuted) continue;
             if(t.kind==6) {
                 if(c.id<=0 || !std::isfinite(c.start) || !std::isfinite(c.dur) || c.start<0 || c.dur<=0 || !std::isfinite(c.start+c.dur)) {
                     error="A PD clip has invalid timing or identity.";if(badClip)*badClip=c.id;return false;
@@ -54,6 +65,7 @@ inline bool makePlan(const Project& p, const std::string& projectPath,
                 const auto written=std::filesystem::last_write_time(file,ec);
                 Event ev{c.id,c.start,c.start+c.dur,file.u8string(),ec?0LL:(long long)written.time_since_epoch().count()};
                 ev.runs=std::max(1,std::min(256,c.runs)); ev.pFieldRules=c.pFieldRules; ev.midiEnabled=c.midiEnabled;ev.trackId=t.id;
+                ev.muted=!clipAudible;
                 std::string source,readError;
                 if(!pd_patch_editor::read(file,source,readError)) {
                     error="Cannot read PD patch for clip '"+c.name+"': "+readError;if(badClip)*badClip=c.id;return false;
@@ -78,10 +90,17 @@ inline bool makePlan(const Project& p, const std::string& projectPath,
                         if(end>start)ev.notes.push_back({start,end,std::max(0,std::min(127,n.pitch)),std::max(1,std::min(127,n.velocity))});
                     }
                 events.push_back(std::move(ev));
-            } else if(t.kind==0 || t.kind==3 || t.kind==4 || t.kind==5) otherAudio=true;
+                if(!events.back().muted)audiblePd=true;
+            } else if(trackAudible && (t.kind==0 || t.kind==5)) otherAudio=true;
+            // VST tracks (kind 3 / 4) are NOT other audio: the instruments render in CAW's VST
+            // engine and the effects in the Csound rack, both mixed into the same output stream,
+            // so PD and VST tracks play together like tracks inside one DAW.
         }
     }
-    if(!events.empty() && otherAudio && otherEngineRunning) {error="Mixed PD and Csound/VST/SC clips are not supported yet; mute the other tracks.";return false;}
+    // Only an audible PD clip conflicts. Muting every PD clip (or soloing another
+    // track) leaves the loaded instances in place and silent - it must not fail the
+    // plan, which would stop the PD timeline instead of just silencing it.
+    if(audiblePd && otherAudio && otherEngineRunning) {error="Mixed PD and Csound/VST/SC clips are not supported yet; mute the other tracks.";return false;}
     std::sort(events.begin(),events.end(),[](const auto& a,const auto& b){return a.start<b.start;});
     return true;
 }
@@ -94,7 +113,8 @@ inline bool samePlan(const std::vector<Event>& a,const std::vector<Event>& b){
     for(std::size_t i=0;i<a.size();++i){
         const auto& x=a[i];const auto& y=b[i];
         if(x.clipId!=y.clipId||x.start!=y.start||x.end!=y.end||x.patch!=y.patch||x.stamp!=y.stamp||
-           x.runs!=y.runs||x.pFieldRules!=y.pFieldRules||x.midiEnabled!=y.midiEnabled||x.trackId!=y.trackId||x.notes.size()!=y.notes.size()||x.automation.size()!=y.automation.size())return false;
+           x.runs!=y.runs||x.pFieldRules!=y.pFieldRules||x.midiEnabled!=y.midiEnabled||x.trackId!=y.trackId||
+           x.muted!=y.muted||x.notes.size()!=y.notes.size()||x.automation.size()!=y.automation.size())return false;
         for(std::size_t n=0;n<x.notes.size();++n)
             if(x.notes[n].start!=y.notes[n].start||x.notes[n].end!=y.notes[n].end||
                x.notes[n].pitch!=y.notes[n].pitch||x.notes[n].velocity!=y.notes[n].velocity)return false;

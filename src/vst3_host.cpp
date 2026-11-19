@@ -35,11 +35,26 @@
 #include "public.sdk/source/common/memorystream.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
+#include "pluginterfaces/vst/ivstmessage.h"
 #include "pluginterfaces/vst/ivstevents.h"
 using namespace Steinberg; using namespace Steinberg::Vst;
 namespace fs = std::filesystem;
 
 namespace caw {
+// A VST3 class is identified by its 16-byte CID, not by the bundle file: Arturia / Kilohearts and
+// other bundles put several classes in one .vst3, and "load the first class" made every entry of
+// the same bundle load the same plugin. The canonical text form is 32 uppercase hex digits.
+static std::string cidText(const TUID tuid) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string s; s.reserve(32);
+    for (int i = 0; i < 16; ++i) { const unsigned char b = (unsigned char)tuid[i]; s += hex[b >> 4]; s += hex[b & 15]; }
+    return s;
+}
+static std::string normCid(const std::string& text) {   // accepts {braces}, dashes and lower case
+    std::string s;
+    for (char c : text) if (std::isxdigit((unsigned char)c)) s += (char)std::toupper((unsigned char)c);
+    return s.size() == 32 ? s : std::string();
+}
 // PlugProvider uses this shared context for component/controller initialization.
 // Keep it alive for the entire process, including detached scans and plugin teardown.
 static Steinberg::Vst::HostApplication& hostApp() { static auto* h = new Steinberg::Vst::HostApplication; return *h; }
@@ -72,15 +87,15 @@ public:
     std::mutex touchMutex;
     std::deque<int> touches;
     std::function<int(ParamID)> indexOf;
+    std::function<void(int, double)> onLiveEdit;   // every editor knob turn with its normalized value
     std::function<tresult(IPlugView*, ViewRect*)> resize;
     void clearTouches() { std::lock_guard<std::mutex> lock(touchMutex); touches.clear(); }
     int popTouch() { std::lock_guard<std::mutex> lock(touchMutex); if (touches.empty()) return -1; int i = touches.front(); touches.pop_front(); return i; }
     tresult PLUGIN_API beginEdit(ParamID) override { return kResultOk; }
-    tresult PLUGIN_API performEdit(ParamID id, ParamValue) override {
-        if (learning && indexOf) {
-            int i = indexOf(id);
-            if (i >= 0) { std::lock_guard<std::mutex> lock(touchMutex); if (touches.size() < 256) touches.push_back(i); }
-        }
+    tresult PLUGIN_API performEdit(ParamID id, ParamValue v) override {
+        const int i = indexOf ? indexOf(id) : -1;
+        if (learning && i >= 0) { std::lock_guard<std::mutex> lock(touchMutex); if (touches.size() < 256) touches.push_back(i); }
+        if (i >= 0 && onLiveEdit) onLiveEdit(i, (double)v);   // the editor's value used to be discarded: live sync could never see a knob turn
         return kResultOk;
     }
     tresult PLUGIN_API endEdit(ParamID) override { return kResultOk; }
@@ -97,19 +112,41 @@ public:
 };
 
 class Vst3Plugin : public IPlugin {
+    std::atomic<int> inBusCh_{2}, outBusCh_{2};   // channel count of the plugin's first audio input / output bus (queried at prepare)
+    bool editorComponentActive_ = false;
+    double editorSetupSr_ = 0.0;
+    int editorSetupBlock_ = 0;
+    std::vector<std::vector<float>> inScratch_, outScratch_;   // de-interleaved process scratch for any channel count
 public:
     void setEditorSystemScaling(bool enabled) override { systemScaling_ = enabled; }
+    void closeEditor() override {
+#ifdef _WIN32
+        EditorDpiContext dpi(systemScaling_);
+        if (view_) { view_->setFrame(nullptr); if (viewAttached_) view_->removed(); viewAttached_ = false; view_ = nullptr; }
+        if (hwnd_) { DestroyWindow(hwnd_); hwnd_ = nullptr; }
+        lastScale_ = 0.f; lastWidth_ = lastHeight_ = -1;
+        vstLog("editor: closed (reattach)");
+#endif
+    }
     ~Vst3Plugin() override {
 #ifdef _WIN32
         EditorDpiContext dpi(systemScaling_);
 #endif
+        closeEditor();
+        // VST3 split component/controller pairs communicate through IConnectionPoint.
+        // Several Kilohearts editors rely on this channel for custom UI state and updates.
+        if (comp_ && ctrl_) {
+            FUnknownPtr<IConnectionPoint> componentCP(comp_);
+            FUnknownPtr<IConnectionPoint> controllerCP(ctrl_);
+            if (componentCP && controllerCP) {
+                controllerCP->disconnect(componentCP);
+                componentCP->disconnect(controllerCP);
+                vstLog("controller: connection points disconnected");
+            }
+        }
         if (ctrl_) ctrl_->setComponentHandler(nullptr);
-#ifdef _WIN32
-        if (view_) { view_->setFrame(nullptr); if (viewAttached_) view_->removed(); viewAttached_ = false; view_ = nullptr; }
-        if (hwnd_) DestroyWindow(hwnd_);
-#endif
     }
-    bool load(const std::string& path, std::string& err) override {
+    bool load(const std::string& path, const std::string& classId, std::string& err) override {
 #ifdef _WIN32
         EditorDpiContext dpi(systemScaling_);
 #endif
@@ -117,11 +154,23 @@ public:
         module_ = VST3::Hosting::Module::create(path, err); if (!module_) { vstLog("load failed " + path + ": " + err); return false; }
         auto& fac = module_->getFactory();
         fac.setHostContext(&hostApp());
-        vstLog("load " + path);
-        for (auto& ci : fac.classInfos()) if (ci.category() == kVstAudioEffectClass) {
-            instrument_ = ci.subCategoriesString().find("Instrument") != std::string::npos;
-            vstLog("create provider for " + ci.name());
-            provider_ = Steinberg::owned(new PlugProvider(fac, ci, true)); break; }
+        vstLog("load " + path + (classId.empty() ? std::string() : (" class " + classId)));
+        const std::string wanted = normCid(classId);
+        if (!classId.empty() && wanted.empty()) { err = "the plugin class id is invalid"; return false; }
+        // Select by CID when one is given: one bundle can hold many plugins, and the first class is
+        // not necessarily the one the user picked. Empty = the first audio class (old projects).
+        const VST3::Hosting::ClassInfo* chosen = nullptr;
+        VST3::Hosting::ClassInfo chosenCopy;
+        for (auto& ci : fac.classInfos()) {
+            if (ci.category() != kVstAudioEffectClass) continue;
+            if (!wanted.empty() && cidText(ci.ID().data()) != wanted) continue;
+            chosenCopy = ci; chosen = &chosenCopy; break;
+        }
+        if (!chosen) { err = "this .vst3 does not contain the selected plugin class (was it updated or uninstalled?)"; vstLog("load: class not found: " + classId); return false; }
+        classId_ = cidText(chosen->ID().data());
+        instrument_ = chosen->subCategoriesString().find("Instrument") != std::string::npos;
+        vstLog("create provider for " + chosen->name() + " [" + classId_ + "]");
+        provider_ = Steinberg::owned(new PlugProvider(fac, chosenCopy, true));
         if (!provider_) { err = "no audio class"; return false; }
         vstLog("initialize");
         if (!provider_->initialize()) { err = "the plugin did not start"; return false; }
@@ -132,7 +181,36 @@ public:
         if (!comp_) { err = "no component"; return false; }
         FUnknownPtr<IAudioProcessor> ap(comp_); proc_ = ap; if (!proc_) { err = "no processor"; return false; }
         if (ctrl_) {
+            // A VST3 component and its edit controller are separate objects. The host must
+            // connect their message channels in BOTH directions; setComponentState alone is
+            // not a substitute. Kilohearts uses these messages for custom editor state and
+            // interactive/animated UI updates.
+            FUnknownPtr<IConnectionPoint> componentCP(comp_);
+            FUnknownPtr<IConnectionPoint> controllerCP(ctrl_);
+            if (componentCP && controllerCP) {
+                const tresult c2e = componentCP->connect(controllerCP);
+                const tresult e2c = controllerCP->connect(componentCP);
+                vstLog("controller: connection points component->controller=" +
+                    std::to_string((int)c2e) + " controller->component=" + std::to_string((int)e2c));
+            } else {
+                vstLog(std::string("controller: connection points unavailable component=") +
+                    (componentCP ? "yes" : "no") + " controller=" + (controllerCP ? "yes" : "no"));
+            }
             handler_.indexOf = [this](ParamID id) { for (const PluginParam& p : params_) if (p.id == id) return p.index; return -1; };
+            // The editor's knob turns arrive here as performEdit calls: keep the parameter cache
+            // fresh so the UI live sync (syncLiveParameters) sees every editor edit next frame.
+            handler_.onLiveEdit = [this](int i, double v) {
+                if (i < 0 || i >= (int)params_.size() || params_[(size_t)i].readOnly) return;
+                v = std::min(1.0, std::max(0.0, v));
+                params_[(size_t)i].value = v;
+                // Forward EVERY editor edit to the app: the running engine applies any parameter
+                // on the same block (not just the 8 picked ones). Deduped per parameter.
+                if (lastLive_.size() != params_.size()) lastLive_.assign(params_.size(), -2.0);
+                if (liveHook_ && std::fabs(v - lastLive_[(size_t)i]) > 1e-6) {
+                    lastLive_[(size_t)i] = v;
+                    liveHook_(i, v);
+                }
+            };
             ctrl_->setComponentHandler(&handler_);
             // Newly initialized split controllers need the processor's initial state.
             Steinberg::MemoryStream state;
@@ -158,10 +236,40 @@ public:
         return true;
     }
     bool isInstrument() const override { return instrument_; }
+    std::string classId() const override { return classId_; }
+    void prepareEditor(double sr, int maxBlock) override {
+        if (!proc_ || !comp_ || sr <= 0.0 || maxBlock <= 0) return;
+        if (editorComponentActive_ && std::fabs(editorSetupSr_ - sr) < 0.01 && editorSetupBlock_ == maxBlock) return;
+        // The UI instance is separate from the real-time audio instance. Configure and activate
+        // its component only after the host engine has a real format; do NOT call setProcessing(true)
+        // or process() here, because this instance is not connected to the audio callback.
+        if (editorComponentActive_) comp_->setActive(false);
+        ProcessSetup setup{kRealtime, kSample32, maxBlock, sr};
+        const tresult setupResult = proc_->setupProcessing(setup);
+        if (setupResult != kResultOk) {
+            vstLog("editor: setupProcessing failed, result=" + std::to_string((int)setupResult));
+            editorComponentActive_ = false;
+            return;
+        }
+        const tresult activeResult = comp_->setActive(true);
+        if (activeResult != kResultOk) {
+            vstLog("editor: component activation failed, result=" + std::to_string((int)activeResult));
+            editorComponentActive_ = false;
+            return;
+        }
+        editorComponentActive_ = true;
+        editorSetupSr_ = sr;
+        editorSetupBlock_ = maxBlock;
+        vstLog("editor: component prepared for engine " + std::to_string((int)sr) + " Hz / " + std::to_string(maxBlock) + " frames");
+    }
     void prepare(double sr, int maxBlock) override {
         audioBuffers_.prepare(maxBlock);
         ProcessSetup s{kRealtime, kSample32, maxBlock, sr}; proc_->setupProcessing(s);
-        comp_->setActive(true); proc_->setProcessing(true); maxBlock_ = maxBlock; }
+        comp_->setActive(true); proc_->setProcessing(true); maxBlock_ = maxBlock;
+        BusInfo bi{};   // the real channel counts: the process buffers must match the plugin's buses
+        if (comp_->getBusInfo(kAudio, kInput, 0, bi) == kResultOk && bi.channelCount > 0) inBusCh_.store((int)bi.channelCount, std::memory_order_relaxed); else inBusCh_.store(2, std::memory_order_relaxed);
+        if (comp_->getBusInfo(kAudio, kOutput, 0, bi) == kResultOk && bi.channelCount > 0) outBusCh_.store((int)bi.channelCount, std::memory_order_relaxed); else outBusCh_.store(2, std::memory_order_relaxed);
+        vstLog("audio buses: in " + std::to_string(inBusCh_.load()) + " ch, out " + std::to_string(outBusCh_.load()) + " ch"); }
     void process(const float* in, float* out, int frames, int ch, Endpoint& ep) override {
         // 1. MIDI events from the ring (cawsm, MIDI clips, device)
         events_.clear(); MidiMsg m; int guard = 0;
@@ -175,28 +283,46 @@ public:
         }
         // 2. parameter changes from the ring (cawsp, automation lanes)
         changes_.clearQueue(); ParamMsg pm; int32 qi;
-        // Restore the initial editor values on the first processing block.
-        // Automation below is applied afterwards, so the current lane wins.
-        for (const auto& initial : initialParameters_) {
-            if (initial.first < 0 || initial.first >= (int)params_.size()) continue;
-            auto* q = changes_.addParameterData(params_[initial.first].id, qi); int32 pi;
-            if (q) q->addPoint(0, initial.second, pi);
+        // Initial editor values (restored before the graph went live) reach the processor across the
+        // next blocks, a bounded number per block: a burst of thousands of changes in one block makes
+        // some plugins stop processing (Arturia ARP 2600 goes silent). Automation below is applied
+        // after the initials of the same block, so the current lane always wins.
+        int sentInitial = 0;
+        for (auto it = initialParameters_.begin(); it != initialParameters_.end(); ) {
+            if (sentInitial >= 128) break;
+            if (it->first < 0 || it->first >= (int)params_.size()) { it = initialParameters_.erase(it); continue; }
+            auto* q = changes_.addParameterData(params_[it->first].id, qi); int32 pi;
+            if (q) q->addPoint(0, it->second, pi);
+            it = initialParameters_.erase(it);
+            ++sentInitial;
         }
-        initialParameters_.clear();
         while (ep.paramIn.pop(pm) && pm.paramIndex >= 0 && pm.paramIndex < (int)params_.size()) {
             auto* q = changes_.addParameterData(params_[pm.paramIndex].id, qi); int32 pi;
             if (q) q->addPoint(0, pm.value, pi); params_[pm.paramIndex].value = pm.value;
         }
-        // 3. audio
-        audioBuffers_.begin(in, frames, ch);
-        float* ins[2] = {audioBuffers_.left(), audioBuffers_.right()};
-        float* outs[2] = {audioBuffers_.outLeft(), audioBuffers_.outRight()};
-        AudioBusBuffers ib{}, ob{}; ib.numChannels = 2; ib.channelBuffers32 = ins; ob.numChannels = 2; ob.channelBuffers32 = outs;
+        // 3. audio: de-interleave into per-channel scratch, hand the plugin its real bus sizes, interleave back
+        const int nIn = in ? std::min(ch, inBusCh_.load(std::memory_order_relaxed)) : 0;
+        const int nOut = std::min(ch, outBusCh_.load(std::memory_order_relaxed));
+        if ((int)inScratch_.size() < nIn) inScratch_.resize((size_t)nIn);
+        if ((int)outScratch_.size() < nOut) outScratch_.resize((size_t)nOut);
+        for (int c = 0; c < nIn; ++c) {
+            if ((int)inScratch_[(size_t)c].size() < frames) inScratch_[(size_t)c].resize((size_t)frames);
+            for (int i = 0; i < frames; ++i) inScratch_[(size_t)c][(size_t)i] = in[(size_t)i * ch + c];
+        }
+        for (int c = 0; c < nOut; ++c) {
+            if ((int)outScratch_[(size_t)c].size() < frames) outScratch_[(size_t)c].resize((size_t)frames);
+            std::fill_n(outScratch_[(size_t)c].begin(), (size_t)frames, 0.f);
+        }
+        float* ins[8] = {}; float* outs[8] = {};
+        for (int c = 0; c < nIn; ++c) ins[c] = inScratch_[(size_t)c].data();
+        for (int c = 0; c < nOut; ++c) outs[c] = outScratch_[(size_t)c].data();
+        AudioBusBuffers ib{}, ob{}; ib.numChannels = nIn; ib.channelBuffers32 = ins; ob.numChannels = nOut; ob.channelBuffers32 = outs;
         ProcessData d{}; d.processMode = kRealtime; d.symbolicSampleSize = kSample32; d.numSamples = frames;
-        d.numInputs = in ? 1 : 0; d.inputs = in ? &ib : nullptr; d.numOutputs = 1; d.outputs = &ob;
+        d.numInputs = nIn > 0 ? 1 : 0; d.inputs = nIn > 0 ? &ib : nullptr; d.numOutputs = 1; d.outputs = &ob;
         d.inputEvents = &events_; d.inputParameterChanges = &changes_;
         proc_->process(d);
-        audioBuffers_.finish(out, frames, ch);
+        if (out) for (int c = 0; c < ch; ++c) for (int i = 0; i < frames; ++i)
+            out[(size_t)i * ch + c] = c < nOut ? outScratch_[(size_t)c][(size_t)i] : 0.f;   // channels the plugin does not have stay silent
         // 4. publish the last parameter values so code can read them (cawgp)
         if (ep.paramLast.size() == params_.size()) for (size_t i = 0; i < params_.size(); ++i) ep.paramLast[i].store((float)params_[i].value);
     }
@@ -226,6 +352,7 @@ public:
         return false;
 #endif
     }
+    void setLiveEditHook(std::function<void(int, double)> hook) override { liveHook_ = std::move(hook); }
     void setLearnEnabled(bool enabled) override {
 #ifdef _WIN32
         EditorDpiContext dpi(systemScaling_);
@@ -288,7 +415,13 @@ public:
             vstLog("editor: create window");
             // Resizing is driven by the plugin; this avoids unconstrained host resizing.
             const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-            hwnd_ = CreateWindowExA(0, "CawVstEditor", title.c_str(), style, 100, 100, 400, 300, nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+            // Owned by CAW's main window: an owned window always stays above its owner, so clicking
+            // any CAW surface can no longer bury the plugin window behind the maximized main window
+            // (it used to look "closed"). It also minimizes/restores together with CAW. The main
+            // window is found by its class ("CawWindow", registered in main.cpp) so one plugin editor
+            // never becomes the owner of another (closing an owner destroys its owned windows).
+            const HWND owner = FindWindowA("CawWindow", nullptr) ? FindWindowA("CawWindow", nullptr) : GetActiveWindow();
+            hwnd_ = CreateWindowExA(0, "CawVstEditor", title.c_str(), style, 100, 100, 400, 300, owner, nullptr, GetModuleHandle(nullptr), nullptr);
             if (!hwnd_) { view_ = nullptr; err = "could not create the window"; return false; }
             SetWindowLongPtr(hwnd_, GWLP_USERDATA, (LONG_PTR)this);
             handler_.resize = [this](IPlugView* v, ViewRect* r) -> tresult {
@@ -296,6 +429,10 @@ public:
                 return resizeEditor(*r) ? kResultOk : kResultFalse;
             };
             view_->setFrame(&handler_);
+            // Size the window to the view BEFORE attached(), scale AFTER: the exact order of the
+            // last build where Kilohearts' editors (Phase Plant, Snap Heap) opened and animated
+            // correctly. The post-attach scale path also re-queries getSize and sends onSize with
+            // the plugin's own (scaled) size, which is what their GUIs lay out on.
             ViewRect initial{};
             if (view_->getSize(&initial) == kResultTrue) resizeEditor(initial);
             vstLog("editor: attach");
@@ -305,8 +442,13 @@ public:
                 viewAttached_ = false; view_->setFrame(nullptr); view_ = nullptr;
                 DestroyWindow(hwnd_); hwnd_ = nullptr; err = "the plugin refused to open its window"; return false;
             }
-            vstLog("editor: attached");
             applyEditorScale(windowDpi(hwnd_));
+            // An explicit onSize with the final client rect: some GUIs only create / lay out their
+            // child rendering window here (and animation timers start with it), not in attached().
+            { RECT c{}; GetClientRect(hwnd_, &c);
+              const int w = (int)(c.right - c.left), h = (int)(c.bottom - c.top);
+              if (w > 0 && h > 0) { lastWidth_ = w; lastHeight_ = h; ViewRect r{0, 0, w, h}; view_->onSize(&r); } }
+            vstLog("editor: attached, scale " + std::to_string(lastScale_) + ", size " + std::to_string(lastWidth_) + "x" + std::to_string(lastHeight_));
         }
         SetWindowTextA(hwnd_, title.c_str());
         ShowWindow(hwnd_, SW_SHOW); SetForegroundWindow(hwnd_);
@@ -324,7 +466,9 @@ private:
     EventList events_{}; ParameterChanges changes_{16};
     VstAudioBuffers audioBuffers_;
     std::vector<PluginParam> params_; std::map<int, double> initialParameters_;
-    bool instrument_ = false; int maxBlock_ = 512;
+    std::function<void(int, double)> liveHook_;   // app callback for every editor edit (all parameters)
+    std::vector<double> lastLive_;                // last editor value forwarded per parameter (dedupe)
+    bool instrument_ = false; std::string classId_; int maxBlock_ = 512;
     bool systemScaling_ = false;
     std::vector<double> learnValues_;
     std::chrono::steady_clock::time_point nextLearnPoll_{};
@@ -335,6 +479,7 @@ private:
     bool viewAttached_ = false, resizing_ = false;
     unsigned resizeSerial_ = 0;
     int lastWidth_ = -1, lastHeight_ = -1;
+    float lastScale_ = 0.f;   // last factor sent to IPlugViewContentScaleSupport
     static UINT windowDpi(HWND hwnd) {
         using GetDpi = UINT (WINAPI*)(HWND);
         HMODULE u = GetModuleHandleA("user32.dll");
@@ -369,14 +514,27 @@ private:
         if (ok) ++resizeSerial_;
         return ok != FALSE;
     }
-    void applyEditorScale(UINT dpi) {
+    // Set the view's content scale (before OR after attached). Redundant calls are skipped: a
+    // repeated setContentScaleFactor with the same factor makes some editors apply their display
+    // scale twice and draw at the wrong size.
+    void setEditorScale(UINT dpi) {
         EditorDpiContext context(systemScaling_);
+        if (!view_) return;
+        if (systemScaling_) dpi = 96; // Windows scales the complete DPI-unaware window and mouse coordinates.
+        const float factor = (float)dpi / 96.f;
+        FUnknownPtr<IPlugViewContentScaleSupport> scaler(view_);
+        if (!scaler) { lastScale_ = factor; vstLog(std::string("editor: mode=") + (systemScaling_ ? "windows" : "native") + " dpi=" + std::to_string(dpi) + " (no scale support)"); return; }
+        if (lastScale_ == factor) return;
+        const tresult result = scaler->setContentScaleFactor(factor);
+        // A plugin may refuse scaling until its view is attached; keep lastScale_ unset so the
+        // post-attach call retries instead of being deduped away.
+        if (result == kResultOk) lastScale_ = factor;
+        vstLog(std::string("editor: mode=") + (systemScaling_ ? "windows" : "native") + " dpi=" + std::to_string(dpi) + " setContentScaleFactor " + std::to_string(factor) + " -> " + std::to_string((int)result));
+    }
+    void applyEditorScale(UINT dpi) {
         if (!view_ || !hwnd_ || !viewAttached_) return;
         const unsigned before = resizeSerial_;
-        FUnknownPtr<IPlugViewContentScaleSupport> scaler(view_);
-        if (systemScaling_) dpi = 96; // Windows scales the complete DPI-unaware window and mouse coordinates.
-        vstLog(std::string("editor: mode=") + (systemScaling_ ? "windows" : "native") + " scale dpi=" + std::to_string(dpi) + (scaler ? " supported" : " unsupported"));
-        if (scaler) scaler->setContentScaleFactor((float)dpi / 96.f);
+        setEditorScale(dpi);
         // Plugins may synchronously request a new size while handling the scale change.
         if (before == resizeSerial_) {
             ViewRect size{};
@@ -413,44 +571,91 @@ void vstLog(const std::string& line) {
 std::vector<std::string> scanVst3(const std::vector<std::string>& extra);
 std::vector<PluginInfo> scanVst3Info(const std::vector<std::string>& extra,
     const std::function<void(const std::vector<PluginInfo>&)>& publish) {
-    struct Cached { std::string size, time; PluginInfo info; };
+    // Cache v3: one line PER CLASS (path, file size/time, kind, name, class id). An unchanged file
+    // whose cached classes are all classified needs no module load - and a multi-class bundle
+    // replays every class, not just the first one.
+    struct Cached { std::string size, time; bool complete = true; std::vector<PluginInfo> infos; };
     std::map<std::string, Cached> cache;
-    { std::ifstream in("caw_vst_cache_v2.txt"); std::string line;
+    { std::ifstream in("caw_vst_cache_v3.txt"); std::string line;
       while (std::getline(in, line)) {
           std::vector<std::string> f; std::stringstream ss(line); std::string x; while (std::getline(ss, x, '\t')) f.push_back(x);
-          if (f.size() == 5) cache[f[0]] = {f[1], f[2], {f[0], f[4], std::atoi(f[3].c_str())}};
+          if (f.size() != 6) continue;
+          Cached& c = cache[f[0]];
+          if (c.size.empty()) { c.size = f[1]; c.time = f[2]; }
+          const int kind = std::atoi(f[3].c_str());
+          if (kind == 0) c.complete = false;
+          c.infos.push_back({f[0], f[4], f[5], kind});
       } }
+    const std::vector<std::string> files = scanVst3(extra);
     std::vector<PluginInfo> out;
-    for (const std::string& path : scanVst3(extra)) out.push_back({path, fs::path(path).stem().string(), 0});
-    std::sort(out.begin(), out.end(), [](const PluginInfo& a, const PluginInfo& b) { return a.name < b.name; });
+    for (const std::string& path : files) out.push_back({path, fs::path(path).stem().string(), {}, 0});
+    std::sort(out.begin(), out.end(), [](const PluginInfo& a, const PluginInfo& b) { return a.name < b.name || (a.name == b.name && a.classId < b.classId); });
     if (publish) publish(out);  // A slow plugin must not hide the rest of the discovered files.
-    std::ofstream save("caw_vst_cache_v2.txt", std::ios::trunc);
-    for (PluginInfo& info : out) {
-        const std::string path = info.path;
+    std::ofstream save("caw_vst_cache_v3.txt", std::ios::trunc);
+    std::vector<PluginInfo> classified;
+    classified.reserve(files.size());
+    for (const std::string& path : files) {
         std::error_code ec; const auto sz = fs::is_directory(path, ec) ? std::uintmax_t(0) : fs::file_size(path, ec);
         const auto tm = fs::last_write_time(path, ec).time_since_epoch().count();
         const std::string ssz = std::to_string(sz), stm = std::to_string((long long)tm);
-        auto it = cache.find(path);
-        if (it != cache.end() && it->second.size == ssz && it->second.time == stm && it->second.info.kind != 0) info = it->second.info;
+        std::vector<PluginInfo> entries;
+        const auto it = cache.find(path);
+        if (it != cache.end() && it->second.size == ssz && it->second.time == stm && it->second.complete && !it->second.infos.empty())
+            entries = it->second.infos;
         else {
             try {
                 vstLog("scan " + path);
                 std::string err; auto mod = VST3::Hosting::Module::create(path, err);
-                if (mod) for (auto& ci : mod->getFactory().classInfos()) if (ci.category() == kVstAudioEffectClass) {
-                    info.name = ci.name();
+                if (mod) for (auto& ci : mod->getFactory().classInfos()) {
+                    if (ci.category() != kVstAudioEffectClass) continue;
                     const std::string categories = ci.subCategoriesString();
-                    info.kind = categories.find("Instrument") != std::string::npos ? 1 : (categories.empty() ? 0 : 2);
-                    break;
+                    const std::string cid = cidText(ci.ID().data());
+                    if (std::any_of(entries.begin(), entries.end(), [&](const PluginInfo& e) { return e.classId == cid; })) continue;
+                    entries.push_back({path, ci.name(), cid, categories.find("Instrument") != std::string::npos ? 1 : (categories.empty() ? 0 : 2)});
                 }
                 if (!mod) vstLog("scan failed " + path + ": " + err);
             } catch (...) { vstLog("scan exception " + path); }
         }
-        save << info.path << '\t' << ssz << '\t' << stm << '\t' << info.kind << '\t' << info.name << '\n';
+        if (entries.empty()) entries.push_back({path, fs::path(path).stem().string(), {}, 0});
+        for (const PluginInfo& info : entries) {
+            save << info.path << '\t' << ssz << '\t' << stm << '\t' << info.kind << '\t' << info.name << '\t' << info.classId << '\n';
+            classified.push_back(info);
+        }
         save.flush();
+        out = classified;
         if (publish) publish(out);
     }
-    std::sort(out.begin(), out.end(), [](const PluginInfo& a, const PluginInfo& b) { return a.name < b.name; });
+    std::sort(out.begin(), out.end(), [](const PluginInfo& a, const PluginInfo& b) { return a.name < b.name || (a.name == b.name && a.classId < b.classId); });
     return out;
+}
+// User folders from Settings > Programs > VST3, kept in <home>/.caw_vst3_dirs (one per line).
+static std::string vstDirsFile() {
+    const char* home = std::getenv(_WIN32 ? "USERPROFILE" : "HOME");
+    return home ? (fs::u8path(home) / ".caw_vst3_dirs").u8string() : std::string();
+}
+static std::mutex g_vstDirsMutex;
+static std::vector<std::string> g_vstDirs;
+static bool g_vstDirsLoaded = false;
+std::vector<std::string> vst3ExtraDirs() {
+    std::lock_guard<std::mutex> lock(g_vstDirsMutex);
+    if (!g_vstDirsLoaded) {
+        g_vstDirsLoaded = true;
+        const std::string file = vstDirsFile();
+        if (!file.empty()) {
+            std::ifstream in(file);
+            std::string line;
+            while (std::getline(in, line)) if (!line.empty()) g_vstDirs.push_back(line);
+        }
+    }
+    return g_vstDirs;
+}
+void setVst3ExtraDirs(const std::vector<std::string>& dirs) {
+    std::lock_guard<std::mutex> lock(g_vstDirsMutex);
+    g_vstDirs = dirs; g_vstDirsLoaded = true;
+    const std::string file = vstDirsFile();
+    if (file.empty()) return;
+    std::ofstream out(file, std::ios::trunc);
+    for (const std::string& d : dirs) out << d << '\n';
 }
 std::vector<std::string> scanVst3(const std::vector<std::string>& extra) {
     std::vector<std::string> dirs = extra, out;

@@ -165,9 +165,28 @@ struct Track {
     std::vector<int> vstPick;                        // plugin parameter indexes of kP1..kP8 (up to 8)
     std::vector<double> vstInit;                     // value of each picked parameter when it was picked (start value of kP1..kP8)
     std::string vstPath;                             // the .vst3 file
+    std::string vstClassId;                          // the plugin class inside it (32 hex); empty = first audio class
     std::map<uint32_t, double> vstParameterState;     // writable parameter IDs and normalized values
-    std::string vstOut;                              // audio out: empty = master, else a bus name (a VSTe track name, or a free name Csound reads with cawra)
-    bool vstOutMaster = false;                       // with a bus: also to the master
+    // VSTe audio output (replaces the legacy vstOut / vstOutMaster pair for the UI):
+    //   0 = master (replace): the VSTe output goes to the master, the source tracks' own master
+    //       output is suppressed and their meters are drawn gray.
+    //   1 = mix: the VSTe output goes to the master AND the source tracks keep sounding to the
+    //       master; every meter keeps its default color.
+    int vstOutMode = 0;
+    // The 8 VSTe input lines. Each line is an independent source with its own on/off switch:
+    //   mode 0 = track (name = a track name), 1 = clips (name = a clip name), 2 = master (no name).
+    // A source fills as many of the 8 plugin input channels as it has outputs (a stereo source
+    // takes two lines), in slot order. Lines past 8 are dropped.
+    struct VstInput { bool on = false; int mode = 0; std::string name; };
+    VstInput vstInputs[8];
+    // Legacy fields, kept only so older project files (CAW_PROJECT < 53) still load. New code
+    // reads vstOutMode / vstInputs instead; these are migrated on load and written back as the
+    // same values for backward compatibility with older builds.
+    std::string vstOut;                              // legacy: audio out bus name (empty = master)
+    bool vstOutMaster = false;                       // legacy: with a bus, also send to master
+    int vstInMode = 0;                               // legacy: 0 = bus sends, 1 = track, 2 = clips
+    std::string vstInSource;                         // legacy: the track name (mode 1) or clip name (mode 2)
+    int vstOutCh = 2;                                // legacy: output channel count 2 / 4 / 6 / 8 (now always 2)
     std::vector<std::string> vstPickName;            // automation lane name of each picked parameter (the clips of the track get one lane per name)
     int vstMidi = 2;                                 // VSTi: 0 = CAW MIDI clips, 1 = device MIDI, 2 = both
 };

@@ -16,7 +16,7 @@ inline bool build(const std::vector<pd_timeline::Event>& plan,int rate,
         std::int64_t start=0,end=0;
         if(e.clipId<=0||e.runs<1||e.runs>256||!toFrame(e.start,rate,start)||
            !toFrame(e.end,rate,end)||end<=start) {error="PD clip has invalid timing.";return false;}
-        events.push_back({e.clipId,start,end});
+        events.push_back({e.clipId,start,end,e.muted});
         for(int r=0;r<e.runs;++r) {
             const auto span=end-start;
             const auto at=start+(span/e.runs)*r+(span%e.runs)*r/e.runs;

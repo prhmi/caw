@@ -14,6 +14,7 @@ struct Event {
     int id = 0;
     std::int64_t start = 0;  // inclusive audio frame
     std::int64_t end = 0;    // exclusive audio frame
+    bool muted = false;      // loaded, but not started / ticked (live M / S)
 };
 struct Control { std::int64_t frame=0; int id=0; int kind=0; int a=0; int b=0; };
 
@@ -81,24 +82,34 @@ public:
         std::vector<Control> nextControls;
         next.reserve(events.size()*2);
         for(const auto& e:events) {
-            const Voice* active=nullptr;
+            // The voice already loaded for this clip (started or waiting); keep exactly one so a
+            // muted clip does not accumulate voices on every refresh.
+            const Voice* current=nullptr;
             if(keepActive)for(const auto& old:voices_)
-                if(old.started && old.event.id==e.id){active=&old;break;}
-            const bool moved=active && (active->event.start!=e.start || active->event.end!=e.end);
-            if(active) next.push_back(*active);
-            const bool scheduleNew=!active ? (!keepActive || e.start>=frame_) :
-                (moved && e.start>=active->event.end);
+                if(old.event.id==e.id){current=&old;break;}
+            const bool started=current && current->started;
+            const bool moved=started && (current->event.start!=e.start || current->event.end!=e.end);
+            if(current) {
+                next.push_back(*current);
+                // Live M / S: the instance stays loaded; a muted voice is not ticked, an unmuted
+                // one that covers the playhead starts right away (cursor reset, render starts it).
+                next.back().event=e;
+                if(!started)next.back().cursor=64;
+            }
+            // A voice is created only for a clip that has none yet. Moving / trimming an already
+            // loaded clip updates its window in place: no second voice, no restart of the instance.
+            const bool scheduleNew=!current;
             if(scheduleNew) {
                 Voice v;v.event=e;v.tick.resize(static_cast<std::size_t>(64*channels_));
                 next.push_back(std::move(v));
             }
             if(moved) {
                 for(const auto& c:controls_)
-                    if(c.id==e.id && c.frame>=frame_ && c.frame<active->event.end)nextControls.push_back(c);
+                    if(c.id==e.id && c.frame>=frame_ && c.frame<current->event.end)nextControls.push_back(c);
             }
             if(!moved || scheduleNew)
                 for(const auto& c:controls)
-                    if(c.id==e.id && c.frame>=frame_ && (active || scheduleNew))nextControls.push_back(c);
+                    if(c.id==e.id && c.frame>=frame_ && (started || scheduleNew))nextControls.push_back(c);
         }
         std::stable_sort(nextControls.begin(),nextControls.end(),
             [](const auto& a,const auto& b){return a.frame<b.frame;});
@@ -122,6 +133,10 @@ public:
         controlCursor_=static_cast<std::size_t>(std::lower_bound(controls_.begin(),controls_.end(),frame_,
             [](const Control& c,std::int64_t f){return c.frame<f;})-controls_.begin());
     }
+    bool mutedClip(int id) const {
+        for (const auto& v : voices_) if (v.event.id == id) return v.event.muted;
+        return false;
+    }
     // Render contiguous frames. Caller supplies a correctly sized buffer.
     // Clip boundaries are gated on exact sample frames, even within a PD
     // 64-frame DSP tick. Host/device and queue latency remain separate.
@@ -129,9 +144,14 @@ public:
         if (!out || channels_ <= 0 || frames > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max() - frame_))
             return false;
         std::fill(out, out + frames * static_cast<std::size_t>(channels_), 0.f);
+        // Muting is live: a clip that was just muted releases its instance (caw-gate 0)
+        // and is not ticked again until it is unmuted.
+        for (auto& v : voices_)
+            if (v.event.muted && v.started) { sink.stop(v.event.id); v.started = false; v.cursor = 64; }
         for (std::size_t n = 0; n < frames; ++n) {
             const std::int64_t at = frame_ + static_cast<std::int64_t>(n);
             for (auto& v : voices_) {
+                if (v.event.muted) continue;
                 if (v.started && at >= v.event.end) { sink.stop(v.event.id); v.started = false; v.cursor = 64; }
                 if (at < v.event.start || at >= v.event.end) continue;
                 if (!v.started) {
@@ -140,10 +160,13 @@ public:
                 }
             }
             while(controlCursor_<controls_.size() && controls_[controlCursor_].frame<=at) {
-                if(!sink.control(controls_[controlCursor_])){frame_=at;return false;}
+                const Control ctrl=controls_[controlCursor_];
                 ++controlCursor_;
+                if(mutedClip(ctrl.id))continue;   // a muted clip receives no runs / notes
+                if(!sink.control(ctrl)){frame_=at;return false;}
             }
             for (auto& v : voices_) {
+                if (v.event.muted) continue;
                 if (at < v.event.start || at >= v.event.end) continue;
                 if (v.cursor == 64) {
                     sink.setFrame(v.event.id,at);

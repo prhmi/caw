@@ -104,7 +104,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int) {
     wc.lpszClassName = "CawWindow";
     RegisterClassExA(&wc);
 
-    HWND hwnd = CreateWindowA(wc.lpszClassName, "CAW - Code Audio Workstation (build 15)", WS_OVERLAPPEDWINDOW, 100, 100,
+    HWND hwnd = CreateWindowA(wc.lpszClassName, "CAW - Code Audio Workstation (build 19)", WS_OVERLAPPEDWINDOW, 100, 100,
                               (int)(1400 * dpi), (int)(800 * dpi), nullptr, nullptr, hInst, nullptr);
 
     if (!createDevice(hwnd)) {
