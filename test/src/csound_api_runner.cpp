@@ -1,6 +1,5 @@
 #include "csound_api_runner.h"
 #include "vst_rack.h"
-#include "vst_solo.h"
 #include "wav_writer.h"
 #include "audio_channels.h"
 #include "platform.h"
@@ -164,7 +163,6 @@ struct CsoundApiRunner::Impl {
     std::map<std::string, void*> hubChans;
     std::atomic<std::uint64_t> hubSeen{0};
     unsigned hubResolveCountdown = 0;
-    bool fwdNoteLogged = false;   // logs once when the first clip-code note crosses to the VSTi engine
     // Live VSTE state, all guarded by vstMutex and read once per render block.
     // vstActive / vstActiveSet: which loaded VST tracks still sound (live M / S).
     // vstParamOverrides: one-shot writes into named Csound control channels (the VSTE panel sliders,
@@ -176,15 +174,6 @@ struct CsoundApiRunner::Impl {
     std::map<int, unsigned> vstInputMasks;   // bit i = input slot i feeds the plugin (live on/off)
     std::map<std::string, double> vstParamOverrides;
     std::map<std::string, void*> vstParamChans;
-    // Instrument tracks the 4th engine owns: this engine only forwards what Csound
-    // writes for them (the note ring + the kP1..kP8 parameter channels).
-    struct VstInstFwd {
-        VstJob job;
-        void* wr = nullptr; void* tab = nullptr; void* p[8] = {};
-        long lastW = 0; double lastP[8] = {};   // change-detection so the engine is not flooded
-        bool needPrime = false;                 // attached while Csound already runs: skip the notes already in the ring
-    };
-    std::vector<VstInstFwd> vstInstJobs;
     VstParamMirror vstMirror;                // engine -> UI: the kP1..kP8 values the rack is using
     VstRack* vstRackPtr = nullptr;           // valid only while the worker's render loop runs (vstMutex)
     VstEngineAudio vstEa;                    // realtime mixes the rack can consume (PD / SC)
@@ -193,6 +182,19 @@ struct CsoundApiRunner::Impl {
     CawScRing* scRing = nullptr;             // CAW's audio callback fills this (set by the app)
     std::atomic<bool>* scRawSuppress = nullptr;   // true while a master-mode VSTe replaces the SC mix
 
+    // Which master-mode VSTe tracks consume the Pure Data / SuperCollider mix? Their processed
+    // output REPLACES the raw mix in the master, so the raw mixes are suppressed while they run.
+    // The inputs are live now, so this is recomputed on every graph push. Call with vstMutex held.
+    void rebuildVstMasters() {
+        vstPdMaster.clear(); vstScMaster.clear();
+        for (const VstJob& j : vstJobs) {
+            if (j.instrument || j.outMode != 0) continue;
+            for (const auto& in : j.inputs)
+                if (in.on && in.engine == 1) { vstPdMaster.insert(j.id); break; }
+            for (const auto& in : j.inputs)
+                if (in.on && in.engine == 2) { vstScMaster.insert(j.id); break; }
+        }
+    }
     template<class T> bool get(T& fn, const char* name) {
         fn = reinterpret_cast<T>(symbol(lib, name));
         return fn != nullptr;
@@ -325,25 +327,42 @@ struct CsoundApiRunner::Impl {
                 }
             }
         }
+        // The rack loads live plugin changes on its own loader thread, which can log while this
+        // thread logs too. The console queue has ONE producer, so the rack's lines come through a
+        // relay that this (engine) thread drains every block.
+        std::mutex vstRackLogMutex;
+        std::vector<std::string> vstRackLog;
+        auto drainRackLog = [&]() {
+            std::vector<std::string> lines;
+            { std::lock_guard<std::mutex> lock(vstRackLogMutex); lines.swap(vstRackLog); }
+            for (const std::string& s : lines) logs.push(s.c_str());
+        };
         VstRack vstRack;
         vstEa.pdMix = &pdMixPtr;   // the rack reads the latest PD render through this (set below)
         vstEa.pdMixChannels = (int)nchan;   // the PD mixer renders interleaved at the engine channel count (prepare above)
-        if (status == 0 && !stopRequested.load() && !vstJobs.empty() && nchan > 0 && blockSize > 0) {
+        std::vector<VstJob> rackJobs;
+        { std::lock_guard<std::mutex> lock(vstMutex); rackJobs = vstJobs; }
+        // The rack exists even with no VST track: a track added while the engine runs is loaded
+        // live (setVstWiring), and that needs the sample rate / block size the init stores.
+        if (status == 0 && !stopRequested.load() && nchan > 0 && blockSize > 0) {
 #ifdef _WIN32
             CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);   // VST3 plugins expect COM on the thread that loads them
 #endif
             bool ok = false;
             try {
-                ok = vstRack.init(vstJobs, vstSampleRate, (int)blockSize, (int)nchan, sampleBytes,
+                ok = vstRack.init(rackJobs, vstSampleRate, (int)blockSize, (int)nchan, sampleBytes,
                     [&](const std::string& n, int flags) -> void* { void* p = nullptr; return channelPtr(cs, &p, n.c_str(), flags) == 0 ? p : nullptr; },
                     [&](int number) -> const void* { void* t = nullptr; return (getTable && number > 0 && getTable(cs, &t, number) > 0) ? t : nullptr; },
-                    [&](const std::string& s) { logs.push(s.c_str()); }, offline, &vstMirror, &vstEa);
+                    [&](const std::string& s) { std::lock_guard<std::mutex> lock(vstRackLogMutex); if (vstRackLog.size() < 256) vstRackLog.push_back(s); },
+                    offline, &vstMirror, &vstEa);
             } catch (...) { logs.push("[caw] VST initialization threw an exception.\n"); }
+            drainRackLog();
             if (!ok) { logs.push("[caw] VST initialization failed; export stopped.\n"); status = -1; }
         }
         {   // the UI can push manual parameter overrides from now until the worker ends
             std::lock_guard<std::mutex> lock(vstMutex);
-            vstRackPtr = &vstRack;
+            vstRackPtr = &vstRack;   // the score drives the notes: it writes the MIDI clip notes into the ring
+            vstRack.queueJobs(vstJobs);   // a wiring push that landed during the init window is applied on the first block (identical = no-op)
         }
         if (status == 0 && !stopRequested.load()) {
 #ifdef _WIN32
@@ -358,7 +377,7 @@ struct CsoundApiRunner::Impl {
                 }
             }
 #endif
-            logs.push("[caw] CAW engine build: 38_bridge_19_fixed17 (separate VST engine).\n");
+            logs.push("[caw] CAW engine build: 39_one_rack_28 (one VST graph in the engine; plugin changes load off the audio thread).\n");
             if (compileOrcSym) logs.push("[caw] Live code: VSTi / VSTe / Csound clip code is recompiled into this engine while it runs.\n");
 #ifndef CAW_VST3
             logs.push("[caw] NOTE: this build has NO VST3 host (CAW_VST3 undefined) - VST / VSTe tracks cannot load, run or edit live.\n");
@@ -369,6 +388,7 @@ struct CsoundApiRunner::Impl {
             std::vector<double> convertedD;
             std::vector<float> convertedF;
             while (!stopRequested.load(std::memory_order_relaxed)) {
+                drainRackLog();   // live plugin loads report from the rack's loader thread
                 // Live code: recompile queued clip instruments BETWEEN audio blocks (never inside
                 // perform). Csound keeps running instances on their old definition and replaces it
                 // for the next start; the console says what happened. Messages of the previous block
@@ -447,63 +467,14 @@ struct CsoundApiRunner::Impl {
                     }
                 }
                 const void* buffer = (hostOutput || captureEnabled || offline) ? spout(cs) : nullptr;
-                if (buffer) {
-                    try { vstRack.process(const_cast<void*>(buffer), captureEnabled ? capture.get() : nullptr, audioSettings.fullScale, vstActiveValid ? &vstActiveNow : nullptr, vstActiveValid, &vstMasksNow); }
-                    catch (...) { logs.push("[caw] VST processing failed.\n"); status = -1; break; }
-                }
                 if ((hostOutput || captureEnabled || offline) && !buffer) {
                     logs.push("[caw] Csound did not provide an audio output buffer.\n");
                     status = -1;
                     break;
                 }
-                // Forward what Csound wrote for the INSTRUMENT tracks to CAW's 4th engine, which
-                // owns the plugins: the note ring (clip code note / cc / msg) and the kP1..kP8
-                // parameter channels. The live rack no longer renders instruments, so this is the
-                // only reader of their ring - no double notes, no double audio.
-                if (!offline) {
-                    std::lock_guard<std::mutex> fwdLock(vstMutex);   // setVstInstrumentJobs may change the list live
-                    for (VstInstFwd& f : vstInstJobs) {
-                        const std::string base = "cawvst_" + std::to_string(f.job.id) + "_";
-                        if (!f.wr) { void* p = nullptr; if (channelPtr(cs, &p, (base + "wr").c_str(), 1 | 32) == 0 && p) f.wr = p; }
-                        if (!f.tab) {
-                            void* p = nullptr;
-                            if (channelPtr(cs, &p, (base + "tab").c_str(), 1 | 32) == 0 && p) {
-                                const double no = sampleBytes == 8 ? *static_cast<const double*>(p) : (double)*static_cast<const float*>(p);
-                                void* t = nullptr;
-                                if (no > 0 && getTable && getTable(cs, &t, (int)std::lround(no)) > 0 && t) f.tab = t;
-                            }
-                        }
-                        if (f.wr) {
-                            const long w = sampleBytes == 8 ? (long)std::lround(*static_cast<const double*>(f.wr))
-                                                            : (long)std::lround(*static_cast<const float*>(f.wr));
-                            if (f.needPrime) { f.lastW = w; f.needPrime = false; }   // live attach: only NEW notes
-                            if (w - f.lastW > 1024) f.lastW = w - 1024;
-                            if (f.tab && w > f.lastW) {
-                                for (long n = f.lastW + 1; n <= w; ++n) {
-                                    const size_t idx = (size_t)(n % 1024) * 4;
-                                    const int st = sampleBytes == 8 ? (int)std::lround(static_cast<const double*>(f.tab)[idx])
-                                                                    : (int)std::lround(static_cast<const float*>(f.tab)[idx]);
-                                    if (st < 0x80 || st > 0xFF) continue;
-                                    const double d1 = sampleBytes == 8 ? static_cast<const double*>(f.tab)[idx + 1] : (double)static_cast<const float*>(f.tab)[idx + 1];
-                                    const double d2 = sampleBytes == 8 ? static_cast<const double*>(f.tab)[idx + 2] : (double)static_cast<const float*>(f.tab)[idx + 2];
-                                    vstSolo().stageMidi(f.job.id, st, (int)std::max(0L, std::lround(d1)), (int)std::max(0L, std::lround(d2)));
-                                    if (!fwdNoteLogged) { fwdNoteLogged = true; logs.push("[caw] Forwarding clip-code notes to the VSTi engine.\n"); }
-                                }
-                            }
-                            if (w > f.lastW) f.lastW = w;
-                        }
-                        for (int k = 0; k < 8 && k < (int)f.job.pick.size(); ++k) {
-                            if (!f.p[k]) { void* p = nullptr; if (channelPtr(cs, &p, (base + "p" + std::to_string(k + 1)).c_str(), 1 | 32) == 0 && p) f.p[k] = p; }
-                            if (f.p[k]) {
-                                const double v = sampleBytes == 8 ? *static_cast<const double*>(f.p[k]) : (double)*static_cast<const float*>(f.p[k]);
-                                if (std::isfinite(v) && std::fabs(v - f.lastP[k]) > 1e-6) {
-                                    f.lastP[k] = v;
-                                    vstSolo().pushParamOverride(f.job.id, k, std::min(1.0, std::max(0.0, v)));
-                                }
-                            }
-                        }
-                    }
-                }
+                // Pure Data renders BEFORE the rack: a VSTe wired to "PureData" hears the mix of the
+                // very same block, and the raw mix is added to the master right here (suppressed
+                // while a master-mode VSTe replaces it with its processed output).
                 if (pd && hostOutput) {
                     const float* pdAudio=nullptr;
                     std::string error;
@@ -522,7 +493,7 @@ struct CsoundApiRunner::Impl {
                     }
                     for(const auto& warning:pd->takeAuditionErrors())
                         logs.push(("[caw] "+warning+"\n").c_str());
-                    pdMixPtr.store(pdAudio, std::memory_order_release);   // VSTe "PureData" inputs read this (next block)
+                    pdMixPtr.store(pdAudio, std::memory_order_release);   // VSTe "PureData" inputs read this (this block)
                     if (!pdRawSuppressed) {   // a master-mode VSTe consuming the PD mix replaces it instead
                         const size_t count=(size_t)blockSize*nchan;
                         if(sampleBytes==8) {
@@ -533,6 +504,16 @@ struct CsoundApiRunner::Impl {
                             for(size_t i=0;i<count;++i)data[i]+=pdAudio[i]*audioSettings.fullScale;
                         }
                     }
+                }
+                // One graph, one block: the rack runs after Csound performed (the clip channels and
+                // the MIDI clip notes in the VSTi note rings are current) and after PD. Its
+                // instruments play what the score's CawVstNote_<id> helpers wrote into the rings -
+                // the same transport the Csound clips use; a VSTi feeds a VSTe in the same block,
+                // and a master-mode VSTe replaces its source right here - no second rack, no rings
+                // between engines.
+                if (buffer) {
+                    try { vstRack.process(const_cast<void*>(buffer), captureEnabled ? capture.get() : nullptr, audioSettings.fullScale, vstActiveValid ? &vstActiveNow : nullptr, vstActiveValid, &vstMasksNow); }
+                    catch (...) { logs.push("[caw] VST processing failed.\n"); status = -1; break; }
                 }
                 if (hub) {
                     // CAW hub (caws/cawr): poll the "caws/<name>" channels Csound clips wrote with
@@ -887,32 +868,25 @@ void CsoundApiRunner::setMasterGain(float linear) {
     if (std::isfinite(linear)) d->masterGain.store(std::max(0.f, std::min(2.f, linear)), std::memory_order_relaxed);
 }
 void CsoundApiRunner::setVstJobs(const std::vector<VstJob>& jobs) {
-    d->vstJobs = jobs;
     // A new job set means a fresh Csound instance: cached channel pointers and the live M / S state
     // of the previous run are stale. The UI re-publishes the active set right after start.
     std::lock_guard<std::mutex> lock(d->vstMutex);
+    d->vstJobs = jobs;
     d->vstParamChans.clear();
     d->vstParamOverrides.clear();
     d->vstActiveSet = false;
     d->vstInputMasks.clear();
     std::lock_guard<std::mutex> mirrorLock(d->vstMirror.mutex);
     d->vstMirror.values.clear();
-    // Which master-mode VSTe tracks consume the Pure Data / SuperCollider mix? Their processed
-    // output REPLACES the raw mix in the master, so the raw mixes are suppressed while they run.
-    d->vstPdMaster.clear(); d->vstScMaster.clear();
-    for (const VstJob& j : jobs) {
-        if (j.instrument || j.outMode != 0) continue;
-        for (const auto& in : j.inputs)
-            if (in.on && in.engine == 1) { d->vstPdMaster.insert(j.id); break; }
-        for (const auto& in : j.inputs)
-            if (in.on && in.engine == 2) { d->vstScMaster.insert(j.id); break; }
-    }
+    d->rebuildVstMasters();
 }
-void CsoundApiRunner::setVstInstrumentJobs(const std::vector<VstJob>& jobs) {
+void CsoundApiRunner::setVstWiring(const std::vector<VstJob>& jobs) {
     std::lock_guard<std::mutex> lock(d->vstMutex);
-    d->vstInstJobs.clear();
-    for (const VstJob& j : jobs)
-        if (j.instrument && !j.path.empty()) { Impl::VstInstFwd f; f.job = j; f.needPrime = d->vstRackPtr != nullptr; d->vstInstJobs.push_back(std::move(f)); }
+    d->vstJobs = jobs;
+    // The rack decides: reload the plugins when a track / .vst3 changed, otherwise re-point the
+    // effect inputs in place. Queued, so it is applied between two audio blocks.
+    if (d->vstRackPtr) d->vstRackPtr->queueJobs(jobs);
+    d->rebuildVstMasters();
 }
 void CsoundApiRunner::setVstActiveTracks(const std::set<int>& ids) {
     std::lock_guard<std::mutex> lock(d->vstMutex);
@@ -942,21 +916,16 @@ void CsoundApiRunner::pushLiveInstrument(const std::string& label, std::string c
 }
 void CsoundApiRunner::setVstOutModeLive(int trackId, int mode) {
     std::lock_guard<std::mutex> lock(d->vstMutex);
-    // The CSD gates every source clip of this VSTe behind chnget:k("cawvstmix_<id>"):
-    // 0 = replace (source silent in the master), 1 = mix (source + VSTe). The queued one-shot
-    // write reaches the running Csound on the next block.
-    d->vstParamOverrides["cawvstmix_" + std::to_string(trackId)] = mode == 1 ? 1.0 : 0.0;
-    // The raw PD / SC mix is only suppressed while a MASTER-mode VSTe consumes it: update the
-    // membership for this track so the pump reflects the switch immediately.
-    for (const VstJob& j : d->vstJobs) {
+    // The rack decides live whether this effect replaces the VST sources it consumes (master) or
+    // lets them sound alongside it (mix) - its out-mode table is updated on the next block.
+    if (d->vstRackPtr) d->vstRackPtr->setOutMode(trackId, mode);
+    for (VstJob& j : d->vstJobs) {
         if (j.id != trackId || j.instrument) continue;
-        d->vstPdMaster.erase(j.id); d->vstScMaster.erase(j.id);
-        if (mode == 0) {
-            for (const auto& in : j.inputs) if (in.on && in.engine == 1) { d->vstPdMaster.insert(j.id); break; }
-            for (const auto& in : j.inputs) if (in.on && in.engine == 2) { d->vstScMaster.insert(j.id); break; }
-        }
+        j.outMode = mode == 1 ? 1 : 0;
         break;
     }
+    // The raw PD / SC mix is only suppressed while a MASTER-mode VSTe consumes it.
+    d->rebuildVstMasters();
 }
 void CsoundApiRunner::setScAudioRing(CawScRing* ring) {
     std::lock_guard<std::mutex> lock(d->vstMutex);
@@ -973,6 +942,16 @@ bool CsoundApiRunner::vstEngineParams(int trackId, double out[8]) const {
     if (it == d->vstMirror.values.end()) return false;
     for (int k = 0; k < 8; ++k) out[k] = it->second[(size_t)k];
     return true;
+}
+std::vector<CsoundApiRunner::VstTrackPeak> CsoundApiRunner::takeVstPeaks() {
+    std::vector<VstTrackPeak> result;
+    std::lock_guard<std::mutex> lock(d->vstMutex);
+    if (!d->vstRackPtr) return result;
+    std::vector<VstRack::SoloPeak> peaks;
+    d->vstRackPtr->takeSoloPeaks(peaks);
+    result.reserve(peaks.size());
+    for (const auto& p : peaks) result.push_back({p.trackId, p.l, p.r});
+    return result;
 }
 void CsoundApiRunner::setControlChannels(const std::vector<std::pair<std::string, double>>& values) {
     if (values.empty()) return;

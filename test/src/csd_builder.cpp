@@ -118,6 +118,23 @@ int addMeterTaps(const std::string& instrName, std::string& body, std::vector<in
     return maxCh;
 }
 
+// The clip's meter tap as a named audio channel too: the VST rack reads these by name every
+// block, so a VSTe input can be re-wired while the engine runs - no CSD rebuild, no stale lines.
+// One channel per output channel, added right after the gaCawT_* tap line (same scope, and the
+// VSTe output gates wrap only the `out` line, so the tap keeps running in replace and mix mode).
+std::string addVstTapChannels(const std::string& body) {
+    static const std::regex tapRe(R"re(^\s*gaCawT_([A-Za-z_]\w*)_([1-8])\s*=\s*gaCawT_[A-Za-z_]\w*_[1-8]\s*\+\s*\((.*)\)\s*$)re");
+    std::istringstream in(body);
+    std::string line, result; std::smatch m;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        result += line + "\n";
+        if (std::regex_match(line, m, tapRe))
+            result += "chnmix (" + m[3].str() + "), \"cawtap_" + m[1].str() + "_" + m[2].str() + "\"\n";
+    }
+    return result;
+}
+
 // "cawMath" / self-scheduling. Legacy cawRun and dawrun remain supported.
 // In a clip's code you can write
 //     (cawRun is the short form: cawRun <p4 maths>, <p5 maths>, <p6 start step inc>, ...  with iRun = copies, indx = copy number)
@@ -1057,19 +1074,26 @@ std::vector<VstInputRoute> resolveVstInputRoutes(const Project& p, const Track& 
             r.lineCount = std::min(2, 8 - cursor);
         } else if (in.mode == 2) {                            // master: always stereo
             r.lineCount = std::min(2, 8 - cursor);
-        } else if (in.mode == 0) {                            // track: sum of every clip's output channels
-            int ch = 0;
-            for (const Track& o : p.tracks)
-                if (o.name == in.name && o.kind != 5 && o.kind != 6 && o.kind != 3 && o.kind != 4)
-                    for (const Clip& c : o.clips) ch += std::max(1, parseClip(c, true).outChannels);
-            r.lineCount = std::min(std::max(1, ch), 8 - cursor);
-        } else {                                              // clips: the channels of the clip with that name
-            int ch = 0;
-            for (const Track& o : p.tracks)
-                if (o.kind != 5 && o.kind != 6 && o.kind != 3 && o.kind != 4)
-                    for (const Clip& c : o.clips)
-                        if (c.name == in.name) ch = std::max(ch, parseClip(c, true).outChannels);
-            r.lineCount = std::min(std::max(1, ch), 8 - cursor);
+        } else {                                              // Csound track / clips: one tap channel per output channel
+            const int room = 8 - cursor;
+            if (in.mode == 0) {                               // track: every clip of that track, in project order
+                for (const Track& o : p.tracks)
+                    if (o.name == in.name && o.kind != 5 && o.kind != 6 && o.kind != 3 && o.kind != 4)
+                        for (const Clip& c : o.clips) {
+                            const int ch = std::max(1, parseClip(c, true).outChannels);
+                            for (int k = 1; k <= ch && (int)r.chans.size() < room; ++k)
+                                r.chans.push_back("cawtap_" + c.name + "_" + std::to_string(k));
+                        }
+            } else {                                          // clips: the channels of the clip with that name
+                int ch = 0;
+                for (const Track& o : p.tracks)
+                    if (o.kind != 5 && o.kind != 6 && o.kind != 3 && o.kind != 4)
+                        for (const Clip& c : o.clips)
+                            if (c.name == in.name) ch = std::max(ch, parseClip(c, true).outChannels);
+                for (int k = 1; k <= ch && (int)r.chans.size() < room; ++k)
+                    r.chans.push_back("cawtap_" + in.name + "_" + std::to_string(k));
+            }
+            r.lineCount = (int)r.chans.size();
         }
         cursor += r.lineCount;
         out.push_back(r);
@@ -1117,13 +1141,6 @@ std::string vstOrchestra(const Project& p, const Track& t) {
         const double initial = std::min(1.0, std::max(0.0, saved));
         o << "chn_k \"cawvst_" << id << "_p" << k << "\", 3\n"
           << "chnset " << std::setprecision(10) << initial << ", \"cawvst_" << id << "_p" << k << "\"\n";
-    }
-    if (t.kind == 4) {   // the input lines the routed clips send into (one signal per channel); master lines have no Csound channel, the rack fills them from the master buffer
-        const auto routes = resolveVstInputRoutes(p, t);
-        for (const VstInputRoute& r : routes)
-            if (r.mode != 2)   // track / clips: Csound writes these via chnmix; master lines are read from the spout by the rack
-                for (int k = 0; k < r.lineCount; ++k)
-                    o << "chn_a \"cawvstin_" << id << "_" << (r.lineStart + k + 1) << "\", 3\n";
     }
     o << "opcode CawVstEv_" << id << ", 0, kkk\n"                      // one MIDI message into the ring: status, data1, data2
       << "kS, kD1, kD2 xin\n"
@@ -1221,11 +1238,17 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
     };
 
     const bool probe = mode == "render" && p.score.analyze;           // Render audio also measures the clips for the score
-    bool vstRouting = false;                                          // VSTe audio input routing reads the clip taps (gaCawT_*)
-    for (const Track& vt : p.tracks) if (vt.kind == 4)
+    bool vstRouting = false;                                          // VSTe audio input routing reads the clip taps
+    bool anyVste = false;
+    for (const Track& vt : p.tracks) {
+        if (vt.kind == 4) anyVste = true;
         for (const auto& in : vt.vstInputs)
-            if ((in.mode == 0 || in.mode == 1) && !in.name.empty()) { vstRouting = true; break; }   // configured inputs are routed even when off, so a live on/off toggle has audio to unmute
-    const bool tap = (engine && p.cs.monitorFeed) || probe || vstRouting;   // meter buses (gaCawT_*) are needed by the monitor, by the probe and by the VSTe input routing
+            if ((in.mode == 0 || in.mode == 1) && !in.name.empty()) vstRouting = true;   // configured inputs are routed even when off, so a live on/off toggle has audio to unmute
+    }
+    // Meter / route buses (gaCawT_* and their named cawtap_* mirrors) are needed by the monitor, by
+    // the probe and by the VSTe input routing. In the engine they exist whenever a VSTe track does,
+    // so an effect can be wired to any clip while the engine runs.
+    const bool tap = (engine && p.cs.monitorFeed) || probe || vstRouting || (engine && anyVste);
     std::vector<std::string> probeAmp;                                // clips measured (amplitude + frequency)
     struct ProbeStream { std::string clip, stream; int sig; };
     std::vector<ProbeStream> probeData;
@@ -1235,10 +1258,13 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
             for (const Clip& c : t.clips) {
                 const int ch = parseClip(c, true).outChannels;
                 if (!busDeclared.insert(c.name).second) continue;
-                for (int k = 1; k <= ch; ++k) o << "gaCawT_" << c.name << "_" << k << " init 0\n";
+                for (int k = 1; k <= ch; ++k) {
+                    o << "gaCawT_" << c.name << "_" << k << " init 0\n";
+                    o << "chn_a \"cawtap_" << c.name << "_" << k << "\", 3\n";   // the rack reads these by name (live re-wiring)
+                }
             }
     }
-    if (vstRouting) {   // the taps accumulate (+=); clear them once per pass so the routed VSTe lines carry exactly the current pass (the monitor clears them again at the end when it runs)
+    if (tap) {   // the taps accumulate (+=); clear them once per pass so the routed VSTe lines carry exactly the current pass (the monitor clears them again at the end when it runs)
         o << "instr CawVstTapClear\n";
         std::set<std::string> tcDone;
         for (const Track& tc : p.tracks) if (tc.kind != 5 && tc.kind != 6) for (const Clip& tcc : tc.clips)
@@ -1250,30 +1276,23 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
         score << "i \"CawVstTapClear\" 0 86400\n";
     }
 
-    // Per VSTe input route (slot -> line range), and a per-(VSTe,slot) cursor that advances as the
-    // matching clips are emitted in project order. A track input matches every clip of that track;
-    // a clips input matches the clip with that name; a master input is filled by the rack, not here.
-    std::map<int, std::vector<VstInputRoute>> vstRoutes;
-    for (const Track& vt : p.tracks) if (vt.kind == 4) vstRoutes[vt.id] = resolveVstInputRoutes(p, vt);
-    std::map<std::pair<int,int>, int> vstInputCursor;   // (VSTe id, slot) -> next offset inside the route's line range
-    // Which VSTe tracks consume this clip (a track input names the track, a clips input the
-    // clip)? The clip's own `out` lines are emitted behind a live gate channel per consuming
-    // VSTe: gate 0 = replace the source in the master (the default), gate 1 = mix (source +
-    // VSTe both sound). The VST panel's AUDIO OUTPUT combo flips the gate while playing, no
-    // Run needed; the app writes the initial value at Run and for audio export.
-    auto vsteConsumersOf = [&](const Track& t, const Clip& clip, std::vector<int>& consumers) {
-        consumers.clear();
-        for (const Track& vt : p.tracks) {
-            if (vt.kind != 4) continue;
-            for (const auto& in : vt.vstInputs) {
-                if (!in.on) continue;
-                if ((in.mode == 0 && in.name == t.name) || (in.mode == 1 && in.name == clip.name)) {
-                    consumers.push_back(vt.id);
-                    break;
-                }
+    // Every VSTe track gets one live gate per clip: cawvstmix_<clip>_<vstId>. 0 = the source
+    // reaches the master, 1 = this effect REPLACES it. The app owns the values (wiring, AUDIO
+    // OUTPUT, M / S, input on/off) and writes them while the engine plays, so a re-wire works
+    // with no Run: a pair nobody replaces stays 0, and a gate channel that does not exist yet
+    // (a clip added after Run) reads 0 as well - the safe state is "the source sounds".
+    std::vector<int> vstGateIds;
+    for (const Track& vt : p.tracks)
+        if (vt.kind == 4 && !vt.vstPath.empty()) vstGateIds.push_back(vt.id);
+    if (!vstGateIds.empty()) {   // declare the gate channels up front (chn_k default = 0 = source audible)
+        std::set<std::string> gateDecl;
+        for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6)
+            for (const Clip& c : t.clips) {
+                if (!gateDecl.insert(c.name).second) continue;
+                for (int id : vstGateIds)
+                    o << "chn_k \"cawvstmix_" << c.name << "_" << id << "\", 3\n";
             }
-        }
-    };
+    }
 
     for (const Track& t : p.tracks) {
         if (t.kind == 5 || t.kind == 6) continue; // .pd path is not orchestra code
@@ -1313,35 +1332,21 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                     sp.lineMap = pc.lineMap;
                     spans->push_back(sp);
                 }
-                std::string vstSends;   // VSTe audio input routing: every output channel of this clip onto its own line (no mixdown)
-                for (const auto& entry : vstRoutes) {
-                    for (const VstInputRoute& r : entry.second) {
-                        if (r.mode == 2) continue;   // master: filled by the rack from the spout
-                        const bool match = r.mode == 0 ? t.name == r.name : clip.name == r.name;
-                        if (!match) continue;
-                        if (t.kind == 3 || t.kind == 4) continue;   // VST source: the rack wires the source plugin's stereo output directly (no Csound tap exists)
-                        int& off = vstInputCursor[{entry.first, r.slot}];
-                        for (int c = 1; c <= pc.outChannels && off < r.lineCount; ++c, ++off) {
-                            const int line = r.lineStart + off + 1;   // 1-based channel index
-                            vstSends += "chnmix gaCawT_" + clip.name + "_" + std::to_string(c) + ", \"cawvstin_" + std::to_string(entry.first) + "_" + std::to_string(line) + "\"\n";
-                        }
-                    }
-                }
-                // VSTe source clips: wrap the clip's own `out` lines in live gates (one level per
-                // consuming VSTe). Gate 0 (default) skips them so only the VSTe output reaches the
-                // master; gate 1 lets the source through (mix). The meter taps after each `out`
-                // stay outside the gates (they only read the expression), so the VSTe input keeps
-                // receiving the clip signal in both modes.
+                // VSTe source clips: wrap the clip's own `out` lines in one live gate per effect
+                // (cawvstmix_<clip>_<id>, 0 = source audible, 1 = replaced by that effect). The
+                // source plays only when EVERY effect lets it through, exactly like a DAW bus.
+                // The values are written by the app while the engine runs, and the meter taps
+                // after each `out` stay outside the gates, so a VSTe input keeps receiving the
+                // clip signal in both modes.
                 std::string body = resolveCawFiles(p, pc.body);
-                std::vector<int> vsteConsumers;
-                vsteConsumersOf(t, clip, vsteConsumers);
-                if (!vsteConsumers.empty()) {
+                if (tap) body = addVstTapChannels(body);   // the rack reads the clip taps by name (live wiring)
+                if (!vstGateIds.empty()) {
                     static const std::regex outLineRe(R"re(^(\s*)(outch|outs|outq|outh|outo|outx|outc|out)\b\s*(.*)$)re");
                     std::string gates, endifs;
-                    for (int consumerId : vsteConsumers) {
-                        const std::string gateVar = "kCawGate" + std::to_string(consumerId);
-                        gates += gateVar + " chnget \"cawvstmix_" + std::to_string(consumerId) + "\"\n";
-                        gates += "if " + gateVar + " == 1 then\n";
+                    for (int gateId : vstGateIds) {
+                        const std::string gateVar = "kCawGate" + std::to_string(gateId);
+                        gates += gateVar + " chnget \"cawvstmix_" + clip.name + "_" + std::to_string(gateId) + "\"\n";
+                        gates += "if " + gateVar + " == 0 then\n";
                         endifs += "endif\n";
                     }
                     std::istringstream in(body); std::string line, rebuilt; std::smatch m;
@@ -1352,7 +1357,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                     }
                     body = rebuilt;
                 }
-                o << body << (vstSends.empty() ? "" : "\n" + vstSends) << "\nendin\n\n";
+                o << body << "\nendin\n\n";
             }
         }
     }

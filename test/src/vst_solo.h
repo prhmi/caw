@@ -1,21 +1,22 @@
 #pragma once
-// CAW's 4th engine: the independent VSTi rack.
+// CAW's 4th engine: the independent VST rack.
 //
-// The instrument tracks render HERE, in the app, the way a DAW plays a VST:
-//   - notes are scheduled by CAW itself from the MIDI clips (audio-rate accurate,
-//     loop-aware), with no Csound instrument, no score and no transport rows;
-//   - when Csound IS running, the notes fired by clip code (note / cc / msg) and
-//     the parameter channels arrive through a small forwarder (see the runner)
-//     and are staged into the same plugins;
-//   - the plugins render into a small FIFO and the sound is mixed into whatever
-//     output stream CAW has open, through the same realtime hook the
-//     SuperCollider engine uses. No Csound engine needed at all.
+// When Csound runs, the VST graph lives in the Csound engine's rack (see vst_rack.h): the same
+// class, the same rules - instruments, effects and the replacement of a source by a master-mode
+// VSTe all in one rack on one block clock. This engine is the host when Csound is NOT running:
+//   - notes are scheduled by CAW itself from the MIDI clips (loop-aware), with no Csound
+//     instrument, no score and no transport rows;
+//   - the clip code (note / cc / msg, P1..P8) is interpreted here too (vst_script.h), so Run VST
+//     plays a VSTi track on its own;
+//   - the plugins render into a small FIFO and the sound is mixed into whatever output stream
+//     CAW has open, through the same realtime hook the SuperCollider engine uses.
 //   - It is its own engine with its own button (Run VST / Stop VST): start() loads the
-//     plugins, setEngineOn(true) keeps it rendering, stop() unloads everything.
+//     plugins, setEngineOn(true) keeps it rendering, stop() stops the sound but keeps the
+//     loaded plugins (Run VST resumes them), unload() frees them (new project / exit).
 //
 // Threading: one audio-callback thread runs renderMix/renderBlock and is the
-// only thread that touches the rack's MIDI ring. Everyone else (UI, Csound
-// forwarder) goes through stageMidi(), which the callback drains.
+// only thread that touches the rack's MIDI ring. Everyone else (UI) goes through
+// stageMidi(), which the callback drains.
 #include "vst_rack.h"
 #include "vst_script.h"
 #include <algorithm>
@@ -31,12 +32,7 @@
 #include <vector>
 
 // One scheduled note of the app-side transport (built by the app from the MIDI clips).
-struct VstSoloNote {
-    double start = 0.0;   // seconds on the timeline
-    double dur = 0.0;
-    int pitch = 60, velocity = 100;
-    int trackId = 0;
-};
+using VstSoloNote = VstPlayNote;
 
 // One clip-code program of a VSTi track (see vst_script.h): the engine evaluates it on the
 // transport clock while Csound is OFF, so Run VST plays `note / cc / msg` code by itself.
@@ -67,7 +63,10 @@ public:
     // did not change is reused. sr / channels / block come from the audio settings;
     // the engine renders block-sized chunks into a FIFO so any callback size works.
     // The audio callback skips its mix (never blocks) while the plugins load here.
-    bool start(const std::vector<VstJob>& jobs, int sr, int channels, int block) {
+    // Real-time mixes the effects can consume here: pass CAW's SuperCollider ring so a VSTe
+    // wired to "SuperCollider" hears it in this engine too (the Csound rack gets the same).
+    bool start(const std::vector<VstJob>& jobs, int sr, int channels, int block,
+               const VstEngineAudio* engineAudio = nullptr) {
         std::lock_guard<std::mutex> render(renderMutex_);
         std::lock_guard<std::mutex> lock(control_);
         sr_ = sr < 1000 ? 48000 : sr;
@@ -76,16 +75,17 @@ public:
         const std::string sig = signature(jobs) + "@" + std::to_string(sr_) + "/" + std::to_string(channels_) + "/" + std::to_string(block_);
         if (!(rackReady_ && sig == jobsSig_)) {
             rackReady_ = false;
-            rack_.clear();
+            // No rack_.clear(): the rack reuses every instance whose (track, .vst3) still matches,
+            // so picking / changing ONE plugin creates only that plugin - the other instruments
+            // keep their loaded instances and their voices instead of being unloaded and reloaded.
             rack_.clearSoloPeaks();
-            { std::lock_guard<std::mutex> busLock(cawVstSoloOutBus().mutex); cawVstSoloOutBus().outs.clear(); }
             { std::lock_guard<std::mutex> mirrorLock(mirror_.mutex); mirror_.values.clear(); }
             rack_.setSoloMode(true);
             const bool ok = rack_.init(jobs, sr_, block_, channels_, 4,
                 [](const std::string&, int) -> void* { return nullptr; },          // no Csound channels in the 4th engine
                 [](int) -> const void* { return nullptr; },                        // no Csound tables either
                 [this](const std::string& s) { if (log_) log_(s); },
-                false, &mirror_, nullptr);
+                false, &mirror_, engineAudio);
             jobsSig_ = sig;
             activeIds_.clear();
             for (const VstJob& j : jobs) activeIds_.insert(j.id);
@@ -95,21 +95,51 @@ public:
             notesA_.clear(); notesB_.clear(); notesIndex_.store(0);
             cursor_.store(0);
             active_.clear();
+            idle_ = false;
             firstNoteLogged_ = false;
             { std::lock_guard<std::mutex> sl(stageMutex_); staged_.clear(); liveActive_ = activeIds_; }
             const size_t loadedNow = rack_.loaded();
             rackReady_ = ok && loadedNow > 0;
             if (log_) {
-                if (jobs.empty()) log_("[caw] VST engine: no instrument tracks.\n");
+                if (jobs.empty()) log_("[caw] VST engine: no VST tracks.\n");
                 else if (loadedNow == 0) log_("[caw] VST engine: NO plugin could be loaded - see the lines above (is a .vst3 chosen in the instrument panel?).\n");
-                else log_("[caw] VST engine: " + std::to_string(loadedNow) + " of " + std::to_string(jobs.size()) + " instrument(s) loaded and running.\n");
+                else log_("[caw] VST engine: " + std::to_string(loadedNow) + " of " + std::to_string(jobs.size()) + " plugin(s) loaded and running.\n");
             }
+        } else {
+            // The rack stayed loaded across Stop / Run VST (stop() keeps the plugins): the P1..P8
+            // mapping may have been edited while the engine was off, so bring each running
+            // instance in line with its job. Queued like a live re-pick, applied on the next block.
+            for (const VstJob& j : jobs) if (j.instrument) rack_.pushPickUpdate(j.id, j.pick);
         }
         return rackReady_;
     }
 
-    // Unload every plugin and stop rendering (the Stop VST button).
+    // Stop VST: the engine stops sounding and releases its notes, but the plugin instances STAY
+    // LOADED - Run VST resumes exactly what was playing. Destroying and re-creating the same
+    // VST3 instance in one process is how an instrument came back loaded but silent after a
+    // Stop / Run VST cycle (the factory is already initialized; the new component starts mute
+    // until a plugin is picked again, which recreates it through another path).
     void stop() {
+        std::lock_guard<std::mutex> render(renderMutex_);
+        std::lock_guard<std::mutex> lock(control_);
+        playing_.store(false, std::memory_order_release);
+        engineOn_.store(false, std::memory_order_release);
+        rack_.sendAllNotesOff();   // held voices are released by the first block after the next Run VST
+        rack_.clearSoloPeaks();
+        { std::lock_guard<std::mutex> mirrorLock(mirror_.mutex); mirror_.values.clear(); }
+        { std::lock_guard<std::mutex> sl(stageMutex_); staged_.clear(); }
+        { std::lock_guard<std::mutex> sl(scriptMutex_); scripts_.clear(); scriptsSig_ = 0; }
+        notesA_.clear(); notesB_.clear(); notesIndex_.store(0); cursor_.store(0);
+        active_.clear();
+        idle_ = false;
+        fifoRead_ = 0; fifoFrames_ = 0;
+        // jobsSig_ / activeIds_ / the rack itself stay: start() with the same instruments reuses
+        // the loaded plugins. No DSP meanwhile - renderDue() is false and the stream is closed.
+    }
+
+    // Unload every plugin and free the rack. Only for a real teardown: a new project, the app
+    // exiting, or the last instrument plugin went away. NOT the Stop VST button (see stop()).
+    void unload() {
         std::lock_guard<std::mutex> render(renderMutex_);
         std::lock_guard<std::mutex> lock(control_);
         rackReady_ = false;
@@ -117,13 +147,13 @@ public:
         engineOn_.store(false, std::memory_order_release);
         rack_.clear();
         rack_.clearSoloPeaks();
-        { std::lock_guard<std::mutex> busLock(cawVstSoloOutBus().mutex); cawVstSoloOutBus().outs.clear(); }
         { std::lock_guard<std::mutex> mirrorLock(mirror_.mutex); mirror_.values.clear(); }
         { std::lock_guard<std::mutex> sl(stageMutex_); staged_.clear(); liveActive_.clear(); }
         { std::lock_guard<std::mutex> sl(scriptMutex_); scripts_.clear(); scriptsSig_ = 0; }
         jobsSig_.clear(); activeIds_.clear();
         notesA_.clear(); notesB_.clear(); notesIndex_.store(0); cursor_.store(0);
         active_.clear();
+        idle_ = false;
         fifoRead_ = 0; fifoFrames_ = 0;
     }
 
@@ -133,13 +163,18 @@ public:
     bool engineOn() const { return engineOn_.load(std::memory_order_acquire); }
     size_t loadedCount() const { return rack_.loaded(); }
 
-    // Live M / S: only these instrument ids sound (the others are skipped by the rack).
+    // Ids of the tracks this engine processes (live M / S).
     void setActive(const std::set<int>& ids) {
         std::lock_guard<std::mutex> lock(stageMutex_);
         liveActive_ = ids;
         touch();
     }
     void pushPickUpdate(int trackId, const std::vector<int>& pick) { rack_.pushPickUpdate(trackId, pick); touch(); }
+
+    // Live VSTe input on/off and AUDIO OUTPUT (replace / mix) while the effects run in this engine.
+    void setInputMasks(const std::map<int, unsigned>& masks) { rack_.setInputMasks(masks); }
+    void setOutMode(int trackId, int mode) { rack_.setOutMode(trackId, mode); }
+    void setWiring(const std::vector<VstJob>& jobs) { rack_.setWiring(jobs); }
 
     // Clip code for the VST-only path (no Csound engine): compiled here, evaluated between
     // audio blocks on the transport clock. An empty list disables it - the app passes one only
@@ -166,6 +201,7 @@ public:
         }
         std::lock_guard<std::mutex> lock(scriptMutex_);
         if (sig == scriptsSig_) return;
+        touch();
         std::map<int, ScriptEntry*> old;
         for (ScriptEntry& e : scripts_) old[e.s.clipId] = &e;
         std::vector<ScriptEntry> next;
@@ -284,7 +320,11 @@ public:
         if (!render.owns_lock() || !rackReady_) return;
         const size_t cap = fifo_.size() / (size_t)std::max(1, channels_);
         int guard = 0;
-        while ((size_t)fifoFrames_ < (size_t)frames && ++guard < 64) renderBlock(cap);
+        while ((size_t)fifoFrames_ < (size_t)frames && ++guard < 64) {
+            const size_t before = fifoFrames_;
+            renderBlock(cap);
+            if (fifoFrames_ == before) break;   // idle block: nothing to mix
+        }
         const int ch = std::min(channels, channels_);
         for (int i = 0; i < frames; ++i) {
             if ((size_t)i >= (size_t)fifoFrames_) break;
@@ -297,8 +337,8 @@ public:
     }
 
     bool playing() const { return playing_.load(std::memory_order_acquire); }
-    // The engine is audible while it plays and for a short tail after the last
-    // note activity (so note-offs delivered on stop still render).
+    // The engine is on (loaded) and either plays or is still delivering the tail of the
+    // notes it stopped (so note-offs are rendered before the plugins fall silent).
     bool audible() const {
         return rackReady_ && (engineOn_.load(std::memory_order_acquire) || playing_.load(std::memory_order_acquire)
               || nowMs() - lastActivityMs_.load(std::memory_order_acquire) < 2500);
@@ -324,7 +364,14 @@ private:
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
     void touch() { lastActivityMs_.store(nowMs(), std::memory_order_release); }
-    bool renderDue() const { return audible(); }
+    // The plugins render only while something can sound: the transport plays (with notes
+    // or clip code), a note is held, or a stop / live edit is still inside the tail window.
+    // A stopped or muted project costs no DSP at all - no hidden process.
+    bool renderDue() const {
+        if (!rackReady_) return false;
+        if (playing_.load(std::memory_order_acquire)) return true;
+        return nowMs() - lastActivityMs_.load(std::memory_order_acquire) < 2500;
+    }
 
     size_t seekCursorLocked(double t) const {
         const std::vector<VstSoloNote>& notes = notesIndex_.load(std::memory_order_relaxed) == 0 ? notesA_ : notesB_;
@@ -338,6 +385,7 @@ private:
     void fireNote(int trackId, int status, int pitch, int d2) {
         caw::MidiMsg m; m.status = (uint8_t)status; m.d1 = (uint8_t)pitch; m.d2 = (uint8_t)d2;
         rack_.pushMidi(trackId, m);
+        touch();   // keeps the plugins rendering while the note (and its release) sounds
         if (!firstNoteLogged_ && status >= 0x80) {
             firstNoteLogged_ = true;
             if (log_) log_("[caw] VSTi engine: notes are reaching the plugins.\n");
@@ -348,6 +396,7 @@ private:
     // Notes go straight to the rack (this is the rack thread); note-offs ride the same active_
     // list as the scheduled MIDI notes. P1..P8 written by the code become live plugin overrides.
     void tickScripts(double t0, double dt) noexcept {
+        scriptActive_ = false;
         std::lock_guard<std::mutex> lock(scriptMutex_);
         if (scriptsReset_.exchange(false, std::memory_order_acq_rel)) {
             for (ScriptEntry& e : scripts_) {
@@ -360,6 +409,7 @@ private:
         for (ScriptEntry& e : scripts_) {
             const VstScript& s = e.s;
             if (t0 + 1e-9 < s.start || t0 >= s.start + s.dur - 1e-9) continue;
+            scriptActive_ = true;
             bool first = false;
             if (!e.started) {
                 e.started = true;
@@ -401,6 +451,7 @@ private:
     // One rack block: drain staged MIDI, schedule notes, render, publish.
     void renderBlock(size_t fifoCap) noexcept {
         const double dt = (double)block_ / (double)sr_;
+        scriptActive_ = false;   // set again below only while a clip-code program runs this block
         {   // staged MIDI from the UI and the Csound forwarder
             std::vector<Staged> now;
             { std::lock_guard<std::mutex> lock(stageMutex_); now.swap(staged_); }
@@ -447,6 +498,13 @@ private:
         } else {
             active_.clear();   // nothing scheduled while stopped
         }
+        // No held notes, no clip code running, no note activity in the tail window: nothing
+        // can sound, so the plugins are not rendered at all (no hidden DSP when all is silent).
+        if (active_.empty() && !scriptActive_ && nowMs() - lastActivityMs_.load(std::memory_order_acquire) >= 2500) {
+            if (!idle_) { idle_ = true; rack_.clearSoloPeaks(); }   // muted / idle tracks drop their meters now
+            return;
+        }
+        idle_ = false;
         // render the plugins into the spout and append to the FIFO
         std::fill(spout_.begin(), spout_.end(), 0.f);
         {   // live mute / solo
@@ -488,6 +546,8 @@ private:
     std::atomic<long long> lastActivityMs_{0};
     bool loop_ = false; double loopStart_ = 0.0, loopEnd_ = 0.0;   // control_ guarded
     std::vector<ActiveNote> active_;    // audio thread only
+    bool scriptActive_ = false;         // audio thread only: a clip-code program is running now
+    bool idle_ = false;                 // audio thread only: the plugins are not rendering
     bool firstNoteLogged_ = false;      // audio thread only
 
     std::mutex stageMutex_;             // UI / forwarder -> audio thread

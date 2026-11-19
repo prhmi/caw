@@ -1,6 +1,7 @@
 #pragma once
 #include "test_tone_samples.h"
 #include "audio_device_match.h"
+#include "caw_audio_host.h"
 #include <portaudio.h>
 #include <algorithm>
 #include <atomic>
@@ -77,9 +78,9 @@ private:
         return data.cursor == data.pcm.size() ? paComplete : paContinue;
     }
     void play(const std::string& selected, int rate, int channels, int buffer, int hardwareBuffer) {
-        PaError error = Pa_Initialize();
-        if (error != paNoError) { setMessage(std::string("PortAudio initialization failed: ") + Pa_GetErrorText(error)); return; }
-        struct Terminate { ~Terminate() { Pa_Terminate(); } } terminate;
+        std::string initError;
+        caw_audio_host::Ref paHost(&initError);
+        if (!paHost.ok) { setMessage(std::string("PortAudio initialization failed: ") + initError); return; }
         const int count = Pa_GetDeviceCount();
         if (count < 0) { setMessage(std::string("Device enumeration failed: ") + Pa_GetErrorText(count)); return; }
         int chosen = paNoDevice, matches = 0;
@@ -122,7 +123,7 @@ private:
         output.sampleFormat = paInt16;
         output.suggestedLatency = std::max(0.001, (double)hardwareBuffer / rate);
         PaStream* stream = nullptr;
-        error = Pa_OpenStream(&stream, nullptr, &output, rate,
+        PaError error = Pa_OpenStream(&stream, nullptr, &output, rate,
                               (unsigned long)std::max(1, buffer), paNoFlag, callback, &data);
         if (error != paNoError) {
             setMessage(std::string("Could not open selected output: ") + Pa_GetErrorText(error) +

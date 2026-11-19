@@ -1,5 +1,6 @@
 #pragma once
 #include "audio_device_match.h"
+#include "caw_audio_host.h"
 #include "monitor_capture.h"
 #include <portaudio.h>
 #include <algorithm>
@@ -49,9 +50,8 @@ public:
             !std::isfinite(s.fullScale) || s.fullScale <= 0.f) {
             error = "Unsupported audio format."; return false;
         }
-        PaError e = Pa_Initialize();
-        if (e != paNoError) { error = std::string("PortAudio initialization: ") + Pa_GetErrorText(e); return false; }
-        initialized_ = true;
+        if (!caw_audio_host::begin(&error)) return false;
+        hostRef_ = true;
         const int count = Pa_GetDeviceCount();
         if (count < 0) { error = Pa_GetErrorText(count); close(); return false; }
         int selected = paNoDevice, matches = 0;
@@ -106,7 +106,7 @@ public:
         output.suggestedLatency = std::max(0.001, (double)s.hardwareBuffer / s.sampleRate);
         unsigned long callbackFrames = static_cast<unsigned long>(std::max(1, s.softwareBuffer));
         if (realtimeSource_) callbackFrames = ((callbackFrames + 63UL) / 64UL) * 64UL;
-        e = Pa_OpenStream(&stream_, nullptr, &output, s.sampleRate,
+        PaError e = Pa_OpenStream(&stream_, nullptr, &output, s.sampleRate,
                           callbackFrames, paNoFlag, callback, this);
         if (e != paNoError) { error = std::string("Open output: ") + Pa_GetErrorText(e); close(); return false; }
         e = Pa_StartStream(stream_);
@@ -183,7 +183,7 @@ public:
 #ifdef _WIN32
         if (spaceEvent_) { CloseHandle(spaceEvent_); spaceEvent_ = nullptr; }
 #endif
-        if (initialized_) { Pa_Terminate(); initialized_ = false; }
+        if (hostRef_) { caw_audio_host::end(); hostRef_ = false; }
     }
 private:
     static std::string lower(std::string s) {
@@ -254,7 +254,7 @@ private:
 #ifdef _WIN32
     HANDLE spaceEvent_ = nullptr;
 #endif
-    bool initialized_ = false;
+    bool hostRef_ = false;
     int channels_ = 0;
     float scale_ = 1.f;
     size_t capacity_ = 0;

@@ -106,8 +106,9 @@ std::string vstBusName(const Track& t);   // audio bus name of a VSTe track: caw
 // The 8 VSTe input lines resolved into concrete line ranges, in slot order. Each enabled input
 // takes as many of the 8 plugin input channels as its source has outputs (a stereo source takes
 // two lines); a master input always takes two (L, R). Lines past 8 are dropped. Master inputs are
-// filled by the rack from the master buffer; track / clips inputs are filled by Csound clip taps.
-struct VstInputRoute { int slot = 0; int mode = 0; std::string name; int lineStart = 0; int lineCount = 0; };
+// filled by the rack from the master buffer; VST / PD / SC sources are wired by the rack too;
+// Csound sources name their tap channel per line (cawtap_<clip>_<ch>) so the rack reads them live.
+struct VstInputRoute { int slot = 0; int mode = 0; std::string name; int lineStart = 0; int lineCount = 0; std::vector<std::string> chans; };
 std::vector<VstInputRoute> resolveVstInputRoutes(const Project& p, const Track& vt);
 // True if `sourceTrack` feeds a VSTe whose output mode is "master" (replace): that source's own
 // master output is suppressed, so its lane meter is drawn gray instead of the default color.

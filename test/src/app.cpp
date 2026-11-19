@@ -99,8 +99,11 @@ namespace {
 
 // ---------------------------------------------------------------- state
 Project g_proj;
-// Session-only interface choices, not project data and not engine activation.
+// Session-only choices: what this session loads and what the combined Run button starts.
+// Unchecked means "do not load / run it" - tracks of every kind can still be added and edited.
 bool g_langCsound = true, g_langPd = false, g_langSc = false;
+bool g_langVst = true;      // VST3 instruments (VSTi, the VST engine) and effects (VSTe, Csound rack)
+bool g_langAudio = false;   // audio tracks (planned: nothing to load yet - kept so the choice round-trips)
 bool g_chooseLanguages = true, g_languageChoiceMade = false;
 bool g_pdEngineOn = false;
 bool g_mixedPd = false; // Csound host owns the one device for both sources
@@ -116,7 +119,11 @@ std::unique_ptr<CawAudioOutput> g_vstSoloOutput;
 std::unique_ptr<MonitorCapture> g_vstSoloCapture;
 uint64_t g_vstSoloSnapshotSeq = 0;
 bool g_vstEngineOn = false;            // the "Run VST" button: CAW's own instrument engine is running
+bool g_vstHostedInCsound = false;      // true while the Csound engine's rack owns the VST graph (the 4th engine stays silent)
 double g_vstRetryT = 0.0;              // seconds until the dedicated output may be retried
+std::string g_vstFailedSig;            // the instrument set that failed to load; cleared by a re-pick / a new set
+double g_vstFailedRetryT = 0.0;        // seconds until a failed instrument load is tried again
+double g_vstJobsT = 0.0;               // 0.5 s timers: the job diff and the clip-code mode check
 std::mutex g_vstLogMutex;              // the engine logs from the audio thread: queue, drain on the UI thread
 std::vector<std::string> g_vstLogQueue;
 bool g_scEngineOn = false, g_scReady = false;
@@ -142,7 +149,8 @@ void scRealtimeSource(void* context, float* output, unsigned long frames, int ch
         if (g_scRawSuppress.load(std::memory_order_acquire))
             std::fill(output, output + (size_t)frames * (size_t)channels, 0.f);   // a master-mode VSTe replaces the raw mix
     }
-    vstSolo().renderMix(output, (int)frames, channels);   // the 4th engine: the instrument tracks, mixed into every stream
+    if (!g_vstHostedInCsound)
+        vstSolo().renderMix(output, (int)frames, channels);   // the 4th engine: only while it owns the VST graph
 }
 void attachScRealtimeSource(CawAudioSettings& settings) {
     settings.realtimeSource = &scRealtimeSource;
@@ -156,6 +164,7 @@ PdPreview g_pdPreview;
 PdDawEngine g_pdTimelineEngine;
 CawHub g_cawHub;                         // shared caws/cawr message bus (see collectCawHubNames / pollCawHub)
 bool g_pdTimelineMode = false;
+bool g_pdResumeAfterReload = false;   // the PD engine is being rebuilt: rejoin the running transport when it is ready
 int g_pdPlayingClip = 0;
 double g_pdPreviousTime = -1.0;
 unsigned long long g_pdTransportEpoch = 0;
@@ -1629,8 +1638,12 @@ void stopScEngine();
 void closeScSoloOutput();
 void restoreScSoloOutput();
 void ensureVstSoloOutput();
-void stopVstEngine();
+void stopVstEngine(bool unloadPlugins = false);
+void startVstEngine();
+void vstEngineCheckJobs(float dt);
 bool engineIsUp();
+std::map<int, unsigned> collectVstInputMasks(const Project& project);
+std::set<int> collectVstActiveTracks(const Project& project);
 void playNotice(const std::string& text, const std::string& shortText);
 void splitCaw(const std::string& code, std::string& patch, std::string& caw);
 std::string csoundExePath();
@@ -1644,13 +1657,13 @@ void adoptProject(Project&& project, const std::string& path) {
     g_pdPreview.stop();
     g_pdTimelineEngine.stop();
     stopScEngine();
-    stopVstEngine();   // the instruments belong to the old project
+    stopVstEngine(true);   // the instruments belong to the old project: unload them
     g_pdEngineOn = false;
     g_pdNeedsReload = false;
     g_pdScoreData.clear();
     g_pdMeterDb.clear();
     g_pdTransportEpoch = 0;
-    g_pdTimelineMode = false; g_pdPlayingClip = 0; g_pdTimelineEvents.clear();
+    g_pdTimelineMode = false; g_pdResumeAfterReload = false; g_pdPlayingClip = 0; g_pdTimelineEvents.clear();
     g_timelineRun = false;
     if (g_playing) stopPlayback();
     vstui::slots().clear();
@@ -2137,7 +2150,8 @@ void stopScEngine() {
         g_playNotice.clear();
         g_playNoticeT = 0.0;
     }
-    if (g_timelineRun && !engineIsUp() && !g_pdTimelineMode) g_timelineRun = false;
+    if (g_timelineRun && !engineIsUp() && !g_pdTimelineMode && !vstSolo().audible()) g_timelineRun = false;
+    ensureVstSoloOutput();   // the VST engine gets its own stream back; PD / Csound keep theirs
     logLine("[caw] SuperCollider stopped.");
 }
 
@@ -2438,7 +2452,8 @@ void pollScEngine(float /*dt*/) {
         g_scEngine.setRendering(false);
         g_scEngineOn = false; g_scReady = false; g_scPendingClipId = 0;
         g_scActiveInstances.clear();
-        if (g_timelineRun && !engineIsUp()) g_timelineRun = false;
+        if (g_timelineRun && !engineIsUp() && !g_pdTimelineMode && !vstSolo().audible()) g_timelineRun = false;
+        ensureVstSoloOutput();   // the VST engine carries the session now
         logLine(code == 0 ? "[caw] SuperCollider ended." : "[caw] SuperCollider ended with exit code " + std::to_string(code) + ". See its messages above.");
     }
 }
@@ -3327,22 +3342,25 @@ void drawMainMenuBar() {
     ImGui::EndMenuBar();
     if (g_chooseLanguages) { ImGui::OpenPopup("Choose languages###caw_languages"); g_chooseLanguages = false; }
     if (ImGui::BeginPopupModal("Choose languages###caw_languages", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextColored(ImVec4(0.93f, 0.50f, 0.15f, 1.f), "Choose your languages");
-        ImGui::TextUnformatted("Select one or more for this session. Change them in Settings.");
+        ImGui::TextColored(ImVec4(0.93f, 0.50f, 0.15f, 1.f), "What does this session use?");
         ImGui::Separator();
+        ImGui::TextDisabled("Programming languages");
         ImGui::Checkbox("Csound", &g_langCsound);
-        ImGui::Checkbox("Pure Data - experimental timeline playback", &g_langPd);
-        ImGui::Checkbox("SuperCollider - live playback", &g_langSc);
+        ImGui::Checkbox("Pure Data", &g_langPd);
+        ImGui::Checkbox("SuperCollider", &g_langSc);
         ImGui::Spacing();
-        ImGui::TextWrapped("Existing projects are not changed. SuperCollider needs sclang plus its audio server; CAW can find the build in its dependency cache or you can set it in Settings > Programs.");
-        const bool any = g_langCsound || g_langPd || g_langSc;
-        if (!any) ImGui::BeginDisabled();
+        ImGui::TextDisabled("Engines and media");
+        ImGui::Checkbox("VST", &g_langVst);
+        ImGui::Checkbox("Audio", &g_langAudio);
+        ImGui::Spacing();
+        if (!g_langCsound && !g_langPd && !g_langSc && !g_langVst && !g_langAudio)
+            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.30f, 1.f), "Nothing selected: score only.");
         if (ImGui::Button("Continue", ImVec2(S(110), 0))) {
             if (!g_langSc && g_scEngineOn) stopScEngine();
+            if (!g_langVst && g_vstEngineOn) stopVstEngine();   // unchecked: stop the sound, keep the plugins loaded
             g_languageChoiceMade = true;
             ImGui::CloseCurrentPopup();
         }
-        if (!any) ImGui::EndDisabled();
         ImGui::EndPopup();
     }
     if (g_welcomeOpen) { ImGui::OpenPopup("Welcome to CAW###welcome_caw"); g_welcomeOpen = false; }
@@ -3872,9 +3890,10 @@ void updateMeters(float dt) {
         for(float& db:entry.second)db=std::max(-100.f,db-36.f*dt);
     for(auto& entry:g_vstMeterDb)
         for(float& db:entry.second)db=std::max(-100.f,db-36.f*dt);
-    if(g_vstEngineOn) {
+    if (g_vstEngineOn || g_vstHostedInCsound) {   // the rack of whichever engine hosts the VST graph
         std::vector<VstRack::SoloPeak> peaks;
         vstSolo().takePeaks(peaks);
+        for (const auto& p : g_apiProc.takeVstPeaks()) peaks.push_back({p.trackId, p.l, p.r});
         for(const auto& track:peaks) {
             auto it=g_vstMeterDb.find(track.trackId);
             if(it==g_vstMeterDb.end())it=g_vstMeterDb.emplace(track.trackId,std::array<float,2>{-100.f,-100.f}).first;
@@ -4024,6 +4043,7 @@ std::vector<VstJob> collectVstJobs(const Project& project, const std::vector<Lan
                 j.inputs[r.slot].lineStart = r.lineStart;
                 j.inputs[r.slot].lineCount = r.lineCount;
                 if (r.mode != 2) j.inputs[r.slot].engine = engineOf(r.name, r.name, r.mode, j.inputs[r.slot].srcId);
+                if (j.inputs[r.slot].engine == 0) j.inputs[r.slot].csChans = r.chans;   // the per-clip tap channels the CSD publishes
             }
         }
         for (const LaneMeterInfo& lm : meters) if (lm.trackId == t.id) { j.meterFirst = lm.first; break; }
@@ -4032,15 +4052,15 @@ std::vector<VstJob> collectVstJobs(const Project& project, const std::vector<Lan
     return jobs;
 }
 
-// ---------------------------------------------------------------- CAW's 4th engine: the independent VSTi rack
+// ---------------------------------------------------------------- CAW's 4th engine: the independent VST rack
 // The instrument tracks render in the app (see vst_solo.h) - like a DAW playing a VST while
 // sharing the soundcard. Notes from MIDI clips are scheduled by CAW itself (no Csound needed);
 // when Csound runs, its note ring (clip code) and parameter channels are forwarded in.
-std::vector<VstJob> collectVstInstrumentJobs() {
-    std::vector<VstJob> all = collectVstJobs(g_proj, {}, true);   // every instrument, muted or not: M / S are applied live
-    std::vector<VstJob> out;
-    for (VstJob& j : all) if (j.instrument) out.push_back(std::move(j));
-    return out;
+// What the VST engine loads: instruments AND effects, whatever Csound is doing - so a Csound
+// start / stop never changes the plugin set (destroying and re-creating instances is what left a
+// plugin mute).
+std::vector<VstJob> collectVstEngineJobs() {
+    return collectVstJobs(g_proj, {}, true);   // muted or not: M / S are applied live
 }
 
 // The MIDI-clip notes of the instrument tracks as one absolute-time schedule. A VSTi track's
@@ -4110,7 +4130,7 @@ std::vector<VstScript> buildVstScripts() {
 // A dedicated output stream only when NO other stream is carrying audio (the engine's, PD's,
 // SC's all get the mix through the realtime hook instead). Only while the VST engine runs.
 void ensureVstSoloOutput() {
-    if (!g_vstEngineOn || g_vstSoloOutput || g_vstRetryT > 0.0) return;
+    if (!g_vstEngineOn || !vstSolo().ready() || g_vstSoloOutput || g_vstRetryT > 0.0) return;   // no plugin: no stream
     if (scHasSharedAudioOwner() || g_scSoloOutput || g_playing || g_testSound.running() || g_renderActive) return;
     if (!g_audioDevicesReady) refreshAudioDevices(false);
     if (g_proj.cs.outDev == -2) return;   // no output chosen: Settings already asks for one
@@ -4148,26 +4168,72 @@ std::set<int> collectVstActiveTracks(const Project& project) {
     return ids;
 }
 
-// Live M / S: the Csound rack (effects) and the VST engine (instruments) both follow it.
+// What the 4th engine processes: live M / S. Effects take part too - it is the effect rack while
+// Csound is off (with Csound on, g_vstHostedInCsound keeps this engine silent).
+std::set<int> vstSoloActiveIds() {
+    return collectVstActiveTracks(g_proj);
+}
+
+// The live "may this Csound clip reach the master" gates of the CSD: one channel per (clip,
+// VSTe track), cawvstmix_<clip>_<vstId>. 0 = audible, 1 = that effect replaces the source. A
+// master-mode effect REPLACES every clip its enabled inputs name, and only while it is active;
+// everything else stays 0, so an unused channel can never mute anything. Called at Run, for the
+// render, and live whenever the wiring / AUDIO OUTPUT / M / S / input on/off changes.
+std::vector<std::pair<std::string, double>> vstGateValues() {
+    std::vector<std::pair<std::string, double>> out;
+    if (!g_langVst) return out;   // VST off for the session: nothing processes, so nothing may replace a source
+    bool anySolo = false;
+    for (const Track& t : g_proj.tracks) if (t.solo && !t.muted) anySolo = true;
+    for (const Track& vt : g_proj.tracks) {
+        if (vt.kind != 4 || vt.vstPath.empty()) continue;
+        const bool vtActive = !vt.muted && !(anySolo && !vt.solo);
+        for (const Track& t : g_proj.tracks) {
+            if (t.kind == 5 || t.kind == 6) continue;
+            for (const Clip& c : t.clips) {
+                bool mute = false;
+                if (vtActive && vt.vstOutMode == 0)
+                    for (const auto& in : vt.vstInputs) {
+                        if (!in.on) continue;
+                        if ((in.mode == 0 && in.name == t.name) || (in.mode == 1 && in.name == c.name)) { mute = true; break; }
+                    }
+                out.push_back({"cawvstmix_" + c.name + "_" + std::to_string(vt.id), mute ? 1.0 : 0.0});
+            }
+        }
+    }
+    return out;
+}
+
+// Live M / S: the rack of whichever engine hosts the VST graph follows it (both get the same set;
+// the idle engine does nothing with it).
 void pushVstActiveLive() {
     if (g_liveCsound && g_useCsoundApi) g_apiProc.setVstActiveTracks(collectVstActiveTracks(g_proj));
-    if (g_vstEngineOn) vstSolo().setActive(collectVstActiveTracks(g_proj));
+    if (g_vstEngineOn) vstSolo().setActive(vstSoloActiveIds());
 }
 
 bool anyVstiTrack() {
     for (const Track& t : g_proj.tracks) if (t.kind == 3 && !t.vstPath.empty() && !t.muted) return true;
     return false;
 }
+bool anyVsteTrack() {
+    for (const Track& t : g_proj.tracks) if (t.kind == 4 && !t.vstPath.empty() && !t.muted) return true;
+    return false;
+}
+bool anyVstTrack() { return anyVstiTrack() || anyVsteTrack(); }
 
-// The panel's live-edit hooks (parameters, M / S, picks). Wired once; they serve the Csound rack
-// (effects) and the VST engine (instruments), so they must exist even if Csound never ran.
+// The panel's live-edit hooks (parameters, M / S, picks). Wired once; they serve whichever rack
+// hosts the VST graph - Csound's while it runs, the 4th engine while it does (both get the calls;
+// the idle engine simply has no such track loaded).
 void wireVstUiHooks() {
     if (vstui::pushControlChannels) return;
     vstui::pushControlChannels = [](const std::vector<std::pair<std::string, double>>& values) { g_apiProc.setControlChannels(values); };
-    vstui::pushVstActive = [](const std::set<int>& ids) { g_apiProc.setVstActiveTracks(ids); if (g_vstEngineOn) vstSolo().setActive(ids); };
+    vstui::pushVstActive = [](const std::set<int>& ids) {
+        g_apiProc.setVstActiveTracks(ids);
+        if (g_vstEngineOn) vstSolo().setActive(ids);
+        if (g_liveCsound && g_useCsoundApi) g_apiProc.setControlChannels(vstGateValues());   // an inactive effect no longer replaces its source
+    };
     vstui::pushVstParamOverride = [](int trackId, int slot, double value) {
         g_apiProc.pushVstParamOverride(trackId, slot, value);
-        if (g_vstEngineOn && trackIsVsti(trackId)) vstSolo().pushParamOverride(trackId, slot, value);   // the VST engine owns the instrument plugins
+        if (g_vstEngineOn && trackIsVsti(trackId)) vstSolo().pushParamOverride(trackId, slot, value);   // the 4th engine's own copy of the instrument
     };
     vstui::pushVstPickRefresh = [](int trackId, const std::vector<int>& pick) {
         g_apiProc.refreshVstPicks(trackId, pick);
@@ -4177,7 +4243,39 @@ void wireVstUiHooks() {
         g_apiProc.pushVstParamValue(trackId, paramIndex, value);
         if (g_vstEngineOn && trackIsVsti(trackId)) vstSolo().pushParamValue(trackId, paramIndex, value);
     };
-    vstui::pushVstOutModeLive = [](int trackId, int mode) { g_apiProc.setVstOutModeLive(trackId, mode); };
+    vstui::pushVstOutModeLive = [](int trackId, int mode) {
+        g_apiProc.setVstOutModeLive(trackId, mode);
+        if (g_vstEngineOn) vstSolo().setOutMode(trackId, mode);   // the effect may run in the VST engine
+        if (g_liveCsound && g_useCsoundApi) g_apiProc.setControlChannels(vstGateValues());   // replace <-> mix, now
+    };
+    vstui::pushVstInputMasks = [](const std::map<int, unsigned>& masks) {
+        g_apiProc.setVstInputMasks(masks);
+        if (g_vstEngineOn) vstSolo().setInputMasks(masks);
+        // The checkbox also changes the slot's configured state, so the jobs are re-pointed too:
+        // an input that was off at Run can be switched ON live and start feeding at once.
+        if (g_langVst && g_liveCsound && g_useCsoundApi) g_apiProc.setVstWiring(collectVstJobs(g_proj, g_engineMeters, true));
+        if (g_vstEngineOn) vstSolo().setWiring(collectVstEngineJobs());
+        if (g_liveCsound && g_useCsoundApi) g_apiProc.setControlChannels(vstGateValues());   // an input switched off stops replacing
+    };
+    vstui::pushVstWiring = []() {   // an input mode / name changed: re-route the effect now, no Run
+        if (g_langVst && g_liveCsound && g_useCsoundApi) g_apiProc.setVstWiring(collectVstJobs(g_proj, g_engineMeters, true));
+        if (g_vstEngineOn) vstSolo().setWiring(collectVstEngineJobs());
+        if (g_liveCsound && g_useCsoundApi) g_apiProc.setControlChannels(vstGateValues());
+    };
+    // A .vst3 finished loading into the editor: the engine applies it NOW (not up to 0.5 s later),
+    // and when the transport is already playing it comes up by itself - a VSTi track plays in
+    // every situation, also when Run VST was never pressed. A re-picked plugin also gets a new
+    // attempt after a failed load.
+    vstui::notifyPluginLoaded = [](int trackId) {
+        const Track* t = nullptr;
+        for (const Track& o : g_proj.tracks) if (o.id == trackId && (o.kind == 3 || o.kind == 4)) { t = &o; break; }
+        if (!t) return;
+        g_vstFailedSig.clear(); g_vstFailedRetryT = 0.0;
+        if (g_langVst && g_liveCsound && g_useCsoundApi)
+            g_apiProc.setVstWiring(collectVstJobs(g_proj, g_engineMeters, true));   // the Csound rack reloads the new .vst3 live, no Run and no delete / re-create
+        if (t->kind == 3 && !g_vstEngineOn) { if (g_timelineRun && g_langVst) startVstEngine(); return; }   // VST not enabled for the session: do not auto-run
+        vstEngineCheckJobs(10.0f);   // past the 0.5 s gate: the changed plugin set is applied on this frame
+    };
     // Values the engine's plugins are actually using: the Csound rack first, then the 4th engine
     // (clip code writes P1..P8 there too, so the P sliders and the plugin GUI must follow it).
     vstui::takeVstEngineParams = [](int trackId, double out[8]) {
@@ -4193,8 +4291,11 @@ void wireVstUiHooks() {
 // whatever stream is open (or opens its own). It does not need Csound; when Csound runs too, the
 // notes written by clip code (note / cc / msg) and the P1..P8 channels are forwarded into it.
 void vstEngineJoinTransport() {   // notes + loop + position, from the current playhead
+    // The Csound rack needs nothing here: its own score plays the MIDI clips into every VSTi's note
+    // ring on the Csound clock. Only CAW's own VST engine (Csound off) gets the schedule pushed.
+    const std::vector<VstSoloNote> notes = buildVstSoloNotes();
     if (!g_vstEngineOn) return;
-    vstSolo().setNotes(buildVstSoloNotes());
+    vstSolo().setNotes(notes);
     vstSolo().setLoop(timeline_loop::valid(g_proj), g_proj.loopStart, g_proj.loopEnd);
     vstSolo().play(g_play);
 }
@@ -4205,73 +4306,142 @@ bool applyVstInstrumentJobs(const std::vector<VstJob>& jobs) {   // (re)load the
     static bool com = false; if (!com) { OleInitialize(nullptr); com = true; }   // plugins expect COM on the thread that loads them
 #endif
     const CawAudioSettings audio = pdAudioSettings();
-    if (!vstSolo().start(jobs, audio.sampleRate, 2, 512)) return false;
-    vstSolo().setActive(collectVstActiveTracks(g_proj));
-    g_apiProc.setVstInstrumentJobs(jobs);   // clip-code notes of a running Csound reach the plugins
+    static VstEngineAudio soloAudio;   // the SuperCollider mix is captured by CAW's callback (g_scRing)
+    soloAudio.scRing = &g_scRing;
+    soloAudio.pdMix = nullptr;         // the Pure Data mix has no app-side ring: a PD input needs Csound
+    if (!vstSolo().start(jobs, audio.sampleRate, 2, 512, &soloAudio)) return false;
+    vstSolo().setActive(vstSoloActiveIds());
+    vstSolo().setInputMasks(collectVstInputMasks(g_proj));
+    if (!g_liveCsound && !g_playing) {   // the effects run in THIS engine: say what each one can hear here
+        for (const VstJob& j : jobs) {
+            if (j.instrument) continue;
+            std::string sum;
+            bool csInput = false;
+            for (int s = 0; s < 8; ++s) {
+                const auto& src = j.inputs[s];
+                if (!src.on || src.lineCount <= 0) continue;
+                if (!sum.empty()) sum += ", ";
+                sum += "in" + std::to_string(s + 1) + ": ";
+                if (src.mode == 2) sum += "master";
+                else if (src.engine == 1) { sum += "\"" + src.name + "\" (PureData - needs Csound)"; csInput = true; }
+                else if (src.engine == 2) sum += "\"" + src.name + "\" (SuperCollider mix)";
+                else if (src.engine == 3) sum += "\"" + src.name + "\" (VST output)";
+                else { sum += "\"" + src.name + "\" (Csound track - needs Csound)"; csInput = true; }
+            }
+            logLine("[caw] VSTe \"" + j.name + "\" runs in the VST engine; inputs: " +
+                    (sum.empty() ? std::string("(none enabled - nothing to process)") : sum) + ".");
+            if (csInput)
+                logLine("[caw] VSTe \"" + j.name + "\": a Csound / PD track only sounds while Csound runs. "
+                        "With the VST engine alone, wire the effect to a VSTi track, the master, or the SuperCollider mix.");
+        }
+    }
     return true;
+}
+
+// Everything that must follow a successful load: the clip code, the schedule and the output
+// stream. ONE function for every path (Run VST, a plugin picked later, a retry), so the order in
+// which the user does things can never leave the engine half-started.
+void vstEngineAfterLoad() {
+    vstSolo().setScripts(engineIsUp() ? std::vector<VstScript>() : buildVstScripts());   // clip code runs in this engine when Csound is off
+    vstSolo().setWiring(collectVstEngineJobs());   // the effect inputs / output modes as configured now
+    if (g_timelineRun) vstEngineJoinTransport();   // Play was already running: join it from the playhead
+    else { vstSolo().setNotes(buildVstSoloNotes()); vstSolo().setLoop(timeline_loop::valid(g_proj), g_proj.loopStart, g_proj.loopEnd); }
+    ensureVstSoloOutput();   // its own stream, unless Csound / PD / SC already carry the audio
+}
+
+// Load / reload the instruments and make them play. A failed load is retried every 5 s (and at
+// once when the plugin is picked again) instead of leaving the engine silent until Run VST is
+// pressed once more.
+bool vstEngineLoadJobs(const std::vector<VstJob>& jobs) {
+    if (applyVstInstrumentJobs(jobs)) {
+        g_vstFailedSig.clear(); g_vstFailedRetryT = 0.0;
+        vstEngineAfterLoad();
+        return true;
+    }
+    g_vstFailedSig = VstSoloEngine::signature(jobs);
+    g_vstFailedRetryT = 5.0;
+    return false;
 }
 
 void startVstEngine() {
     if (g_vstEngineOn) return;
+    if (!g_langVst) {   // the session list says "do not load VST": tracks and their code still work
+        playNotice("VST is not enabled for this session - enable it in Settings > Languages.", "VST is disabled");
+        logLine("[caw] VST is not enabled (Settings > Languages): Run VST does nothing, the plugins are not loaded.");
+        return;
+    }
     if (g_renderActive) { playNotice("An export is running - wait for it or cancel it first.", "Export running"); return; }
     if (!g_audioDevicesReady) refreshAudioDevices(false);
     if (g_proj.cs.outDev == -2) { playNotice("Select an audio output in Settings > Audio.", "Select an audio output"); return; }
-    const std::vector<VstJob> jobs = collectVstInstrumentJobs();
+    const std::vector<VstJob> jobs = collectVstEngineJobs();
     wireVstUiHooks();
     vstSolo().setLog([](const std::string& line) {   // called from the audio thread too
         std::lock_guard<std::mutex> lock(g_vstLogMutex);
         if (g_vstLogQueue.size() < 200) g_vstLogQueue.push_back(line);
     });
     // The engine runs even with no plugin yet: choosing / changing a .vst3 later loads it
-    // automatically (vstEngineTick) without a Stop / Run VST cycle - and the P1..P8 mapping stays.
+    // automatically (notifyPluginLoaded + vstEngineCheckJobs) without a Stop / Run VST cycle -
+    // and the P1..P8 mapping is carried over to the new plugin.
     g_vstEngineOn = true;
     g_vstRetryT = 0.0;
+    g_vstFailedSig.clear();
+    g_vstFailedRetryT = 0.0;
+    g_vstJobsT = 0.0;
     g_vstMeterDb.clear();
+    const bool kept = vstSolo().ready();   // Stop VST keeps the plugins loaded: this Run resumes them
+    if (kept && jobs.empty()) vstSolo().unload();   // the plugin was removed while stopped: free its instances
     vstSolo().setEngineOn(true);
-    if (!jobs.empty() && !applyVstInstrumentJobs(jobs))
-        playNotice("The VST engine is on, but the instrument plugin did not load - see the log. Fix the plugin (or pick another one); it loads by itself.",
+    if (jobs.empty()) {
+        playNotice("The VST engine is on. Load a .vst3 into a VST track (right-click the track) - it starts by itself.",
+                   "Run VST: waiting for a plugin");
+        vstEngineAfterLoad();
+    } else if (!vstEngineLoadJobs(jobs)) {
+        playNotice("The VST engine is on, but the plugin did not load - see the log. It is retried every 5 s (picking the plugin again retries at once).",
                    "VST engine: no plugin loaded - see the log");
-    else if (jobs.empty())
-        playNotice("The VST engine is on. Load a .vst3 into a VSTi track (right-click the track) - it starts playing by itself.",
-                   "Run VST: waiting for an instrument plugin");
-    vstSolo().setScripts(engineIsUp() ? std::vector<VstScript>() : buildVstScripts());   // clip code runs in this engine when Csound is off
-    if (g_timelineRun) vstEngineJoinTransport();   // Play was already running: join it from the playhead
-    else { vstSolo().setNotes(buildVstSoloNotes()); vstSolo().setLoop(timeline_loop::valid(g_proj), g_proj.loopStart, g_proj.loopEnd); }
-    ensureVstSoloOutput();   // its own stream, unless Csound / PD / SC already carry the audio
-    logLine("[caw] VST engine on: instruments play from their MIDI clips and from clip code (note / cc / msg). Press Play.");
+    } else if (kept) {
+        logLine("[caw] VST engine: the plugins stayed loaded - the same instances play again (no reload).");
+    }
+    logLine("[caw] VST engine on: VSTi play from their MIDI clips and clip code; VSTe effects run here while Csound is off. Press Play.");
 }
 
-void stopVstEngine() {
-    if (!g_vstEngineOn && !vstSolo().ready()) return;
+void stopVstEngine(bool unloadPlugins) {
+    if (!g_vstEngineOn) {
+        if (unloadPlugins && vstSolo().ready()) {   // stopped earlier with the plugins kept: free them now
+            vstSolo().unload();
+            logLine("[caw] VST engine stopped, plugins unloaded.");
+        }
+        return;
+    }
     g_vstEngineOn = false;
-    g_apiProc.setVstInstrumentJobs({});
+    g_vstFailedSig.clear();
+    g_vstFailedRetryT = 0.0;
+    g_vstJobsT = 0.0;
     vstSolo().setEngineOn(false);
     if (g_vstSoloOutput) { g_vstSoloOutput->close(); g_vstSoloOutput.reset(); }
     g_vstSoloCapture.reset();
     g_vstSoloSnapshotSeq = 0;
     g_vstMeterDb.clear();
-    vstSolo().stop();   // unloads the plugins (waits for a callback that is mixing right now)
-    logLine("[caw] VST engine stopped.");
+    if (unloadPlugins) {
+        vstSolo().unload();   // a new project / exit: the plugins go away with it
+        logLine("[caw] VST engine stopped, plugins unloaded.");
+    } else {
+        // Stop VST only stops the sound: the plugin instances stay loaded so Run VST resumes
+        // exactly what was playing. Unloading and re-creating them here is what left an
+        // instrument silent until its .vst3 was picked again.
+        vstSolo().stop();
+        logLine("[caw] VST engine stopped (the plugins stay loaded - Run VST resumes them).");
+    }
 }
 
-// Every frame: the engine's log, the dedicated stream, and a reload when a plugin was loaded / removed.
-void vstEngineTick(float dt) {
-    {
-        std::vector<std::string> queued;
-        { std::lock_guard<std::mutex> lock(g_vstLogMutex); queued.swap(g_vstLogQueue); }
-        for (std::string& line : queued) {
-            while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
-            if (!line.empty()) logLine(line);
-        }
-    }
+// The 0.5 s check: the clip-code mode and the instrument set. It runs from vstEngineTick (per
+// frame, gated) and at once from notifyPluginLoaded (dt >= 0.5), so a plugin picked in the panel
+// is loaded on the very frame - and a plugin picked BEFORE Run VST behaves exactly like one
+// picked after it.
+void vstEngineCheckJobs(float dt) {
     if (!g_vstEngineOn) return;
-    if (g_vstRetryT > 0.0) g_vstRetryT -= dt;
-    if (!g_vstSoloOutput) ensureVstSoloOutput();
-    static double check = 0.0;
-    static std::string failedSig;
-    check += dt;
-    if (check < 0.5) return;
-    check = 0.0;
+    g_vstJobsT += dt;
+    if (g_vstJobsT < 0.5) return;
+    g_vstJobsT = 0.0;
     {   // Clip code: this engine interprets it only while Csound is off. A running Csound translates
         // the same code and forwards its notes, so the scripts are empty then (no double notes).
         static int scriptsMode = -1;
@@ -4286,28 +4456,42 @@ void vstEngineTick(float dt) {
             else logLine("[caw] VST engine: Csound is on again - it translates the clip code and forwards its notes.");
         }
     }
-    const std::vector<VstJob> jobs = collectVstInstrumentJobs();
-    if (vstSolo().sameJobs(jobs)) { failedSig.clear(); return; }
+    pushVstActiveLive();   // whichever engine hosts the VST graph follows the live M / S state
+    const std::vector<VstJob> jobs = collectVstEngineJobs();
+    vstSolo().setWiring(jobs);   // effect inputs / output modes as configured now (no plugin reload)
+    if (vstSolo().sameJobs(jobs)) { g_vstFailedSig.clear(); return; }
     if (jobs.empty()) {
-        failedSig.clear();
-        if (vstSolo().ready()) {   // the last instrument track / plugin went away: unload, keep the button on and wait
-            vstSolo().stop();
+        g_vstFailedSig.clear();
+        if (vstSolo().ready()) {   // the last VST track / plugin went away: unload, keep the button on and wait
+            vstSolo().unload();
             vstSolo().setEngineOn(true);   // Run VST stays on: a plugin loaded later starts playing by itself
             g_vstMeterDb.clear();
-            logLine("[caw] VST engine: no instrument plugin now - waiting (Run VST stays on).");
+            logLine("[caw] VST engine: no plugin now - waiting (Run VST stays on).");
         }
         return;
     }
     const std::string sig = VstSoloEngine::signature(jobs);
-    if (sig == failedSig) return;   // this set already failed to load: wait for a change
-    logLine("[caw] VST engine: the instrument plugins changed - reloading.");
-    if (applyVstInstrumentJobs(jobs)) {
-        failedSig.clear();
-        vstSolo().setScripts(engineIsUp() ? std::vector<VstScript>() : buildVstScripts());
-        if (g_timelineRun) vstEngineJoinTransport();
-        else { vstSolo().setNotes(buildVstSoloNotes()); vstSolo().setLoop(timeline_loop::valid(g_proj), g_proj.loopStart, g_proj.loopEnd); }
+    if (sig == g_vstFailedSig && g_vstFailedRetryT > 0.0) return;   // this set already failed: retried when the timer runs out
+    logLine("[caw] VST engine: the plugins changed - reloading.");
+    if (!vstEngineLoadJobs(jobs))
+        logLine("[caw] VST engine: the plugin could not be loaded - retrying every 5 s (see the lines above).");
+}
+
+// Every frame: the engine's log, the dedicated stream, and a reload when a plugin was loaded / removed.
+void vstEngineTick(float dt) {
+    {
+        std::vector<std::string> queued;
+        { std::lock_guard<std::mutex> lock(g_vstLogMutex); queued.swap(g_vstLogQueue); }
+        for (std::string& line : queued) {
+            while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+            if (!line.empty()) logLine(line);
+        }
     }
-    else failedSig = sig;
+    if (!g_vstEngineOn) return;
+    if (g_vstRetryT > 0.0) g_vstRetryT -= dt;
+    if (g_vstFailedRetryT > 0.0) g_vstFailedRetryT -= dt;
+    if (!g_vstSoloOutput) ensureVstSoloOutput();
+    vstEngineCheckJobs(dt);
 }
 
 // Live VSTE input on/off: one bitmask per VSTe track, bit i = input slot i feeds the plugin.
@@ -4346,14 +4530,21 @@ void commandPlayFrom(double t, bool stopFirst) {
     const double remaining = looping ? std::max(0.0, g_proj.loopEnd - t) : 0.0;
     for (TimelineEvent ev : timelineEvents(g_proj, t, stopFirst)) {
         if (looping && !timeline_loop::trim(ev, remaining)) continue;
-        // MIDI-clip notes of the VSTi tracks are NOT sent to Csound any more: CAW's 4th engine
-        // (the app-side VSTi rack) schedules them itself, audio-rate and loop-aware. The offline
-        // export keeps the score events, and code notes (note / cc / msg) still flow through
-        // Csound and are forwarded to the plugins by the engine.
-        if (!ev.automation && ev.name.rfind("CawVstNote_", 0) == 0) continue;
-        const int ix = ev.automation ? numberOf(g_engChans, ev.name) : numberOf(g_engClips, ev.name);
+        int type = ev.automation ? 11 : 10;
+        int ix = 0;
+        if (!ev.automation && ev.name.rfind("CawVstNote_", 0) == 0) {
+            // MIDI-clip notes of the VSTi tracks. While Csound hosts the VST graph, its score fires
+            // the note helper (CawVstNote_<id>), which writes the note into the plugin's ring - the
+            // same transport and clock as the Csound clips. Without Csound hosting, CAW's 4th
+            // engine schedules them itself (audio-rate, loop-aware), so they are not sent here.
+            if (!g_vstHostedInCsound) continue;
+            type = 14;
+            ix = numberOf(g_engVstNotes, ev.name);
+        } else {
+            ix = ev.automation ? numberOf(g_engChans, ev.name) : numberOf(g_engClips, ev.name);
+        }
         if (!ix) { warnAddedAfterRun(); continue; }
-        rows += row(ev.automation ? 11 : 10, ix, ev.start, ev.dur, ev.a, ev.b);
+        rows += row(type, ix, ev.start, ev.dur, ev.a, ev.b);
         ++count; ++sent;
     }
     if (looping) {
@@ -4386,6 +4577,7 @@ void stopPlayback() {
     g_monHeld.clear();
     g_playing = false;
     g_liveCsound = false;
+    g_vstHostedInCsound = false;   // the Csound rack is gone: the 4th engine is the VST host again
     g_playWaiting = false;
     g_runLeft = 0.0;
     g_mixedPd = false;
@@ -4398,6 +4590,7 @@ void startEngine() {
         logLine("[caw] Stopping the separate PD engine; Csound + PD will run together on one engine.");
         if (g_scEngineOn) stopScEngine();
         if (g_pdTimelineMode && g_timelineRun) { pdTransport(false); g_timelineRun = false; }
+        g_pdResumeAfterReload = false;
         g_pdPreview.stop();
         g_pdTimelineEngine.stop();
         g_pdPlayingClip = 0; g_pdEngineOn = false; g_pdTimelineMode = false; g_pdTimelineEvents.clear();
@@ -4444,7 +4637,9 @@ void startEngine() {
         if (g_pdLibraryPath.empty()) g_pdLibraryPath = plat::bundledLibpd();
         if (g_pdLibraryPath.empty()) { logLine("[caw] libpd was not found. Select it in Settings > Programs, or copy libpd.dll (+ libwinpthread-1.dll) into <CAW folder>\\PureData\\."); return; }
         int bad=0;
-        if (!pd_timeline::makePlan(g_proj,g_projectPath,mixedPlan,apiError,false,&bad)) {
+        // Include muted clips, flagged: M / S inside the shared engine is a live replan, never
+        // a "clips changed" restart of Csound + PD + the device.
+        if (!pd_timeline::makePlan(g_proj,g_projectPath,mixedPlan,apiError,false,&bad,true)) {
             logLine("[caw] PD clip problem: "+apiError);
             if(bad>0)for(Track& t:g_proj.tracks)for(Clip& c:t.clips)if(c.id==bad)c.editorOpen=true;
             return;
@@ -4548,30 +4743,24 @@ void startEngine() {
             for (const auto& device : g_outDevs)
                 if (device.id == selected) { audio.deviceLabel = device.name; break; }
         }
-        {   // VST tracks: effects AND instruments render inside the engine next to Csound (the v24
-            // sound path): the rack reads each track's note ring (cawvst_<id>_wr/tab) and parameter
-            // channels, renders the plugins on the engine thread and mixes their output straight
-            // into the Csound output - the same space the effects and the PD mix use.
+        {   // The whole VST graph lives in the engine while Csound runs: instruments AND effects in
+            // ONE rack, on Csound's block clock. The rack reads each track's note ring
+            // (cawvst_<id>_wr/tab - the score's CawVstNote_<id> writes the MIDI clip notes there)
+            // and parameter channels for clip code, renders instruments first so a VSTi feeds a
+            // VSTe in the same block, and mixes straight into the Csound output - the 4th engine's
+            // rules, on this engine. It goes silent while this one runs (g_vstHostedInCsound).
+            wireVstUiHooks();   // the panel edits reach THIS rack too (wiring, output mode, plugin change)
             vstui::captureAllParameters(g_proj);   // Run bakes exactly what the plugin GUIs show right now
-            {   // The Csound rack runs the EFFECTS only. Instruments belong to the VST engine (Run VST): it
-                // plays the MIDI clips itself, and the notes that clip code writes (note / cc / msg) are
-                // forwarded to it from here.
-                std::vector<VstJob> rackJobs = collectVstJobs(g_proj, g_engineMeters);
-                rackJobs.erase(std::remove_if(rackJobs.begin(), rackJobs.end(), [](const VstJob& j) { return j.instrument; }), rackJobs.end());
-                g_apiProc.setVstJobs(rackJobs);
-                g_apiProc.setVstInstrumentJobs(g_vstEngineOn ? collectVstInstrumentJobs() : std::vector<VstJob>());
-                if (!g_vstEngineOn && anyVstiTrack())
-                    playNotice("VSTi tracks play in the VST engine: press Play (or Run VST) to start it.", "Play starts the VST engine for the VSTi tracks");
-            }
+            // Every VST track is loaded whatever its M / S state: mute / solo are applied live, so a
+            // muted track must still be in the rack to come back without a Run.
+            std::vector<VstJob> rackJobs = collectVstJobs(g_proj, g_engineMeters, true);
+            if (!g_langVst) rackJobs.clear();   // VST unchecked for the session: no VST plugin is loaded either
+            g_apiProc.setVstJobs(rackJobs);
             g_apiProc.setVstActiveTracks(collectVstActiveTracks(g_proj));   // initial live M / S state
             g_apiProc.setVstInputMasks(collectVstInputMasks(g_proj));       // initial live input on/off state
-            {   // AUDIO OUTPUT gates: the CSD wraps every VSTe source clip's out lines behind
-                // cawvstmix_<id> (0 = replace, 1 = mix); the combo flips them live, this is the start value.
-                std::vector<std::pair<std::string, double>> mixGates;
-                for (const Track& vt : g_proj.tracks)
-                    if (vt.kind == 4) mixGates.push_back({"cawvstmix_" + std::to_string(vt.id), vt.vstOutMode == 1 ? 1.0 : 0.0});
-                g_apiProc.setControlChannels(mixGates);
-            }
+            // Source gates (cawvstmix_<clip>_<id>): 1 = that master-mode effect replaces the clip,
+            // 0 = the clip reaches the master. The app keeps them current while the engine runs.
+            g_apiProc.setControlChannels(vstGateValues());
             g_apiProc.setMasterGain(g_proj.cs.masterGain);
             g_apiProc.setPdSource(mixedRequested ? g_pdLibraryPath : std::string(),mixedPlan);
             // CAW hub (caws/cawr): the shared bus + the hub channel names found in the clip code.
@@ -4596,6 +4785,7 @@ void startEngine() {
     }
     g_playing = true;
     g_liveCsound = true;
+    g_vstHostedInCsound = g_useCsoundApi;   // the engine's rack owns the VST graph now; the 4th engine must not render
     g_mixedPd = mixedRequested;
     if(g_mixedPd){g_pdTimelineEvents=std::move(mixedPlan);g_pdNeedsReload=false;g_pdPlanUpdateFailed=false;g_pdPlanT=0.0;}
     g_playWaiting = true;
@@ -4691,13 +4881,8 @@ void startRenderNow() {
         return;
     }
     vstui::captureAllParameters(g_proj);   // the export renders exactly what the plugin GUIs show
-    g_offlineProc.setVstJobs(collectVstJobs(g_proj, {}));
-    {   // the AUDIO OUTPUT gates for the render too (mix = the sources sound alongside the VSTe)
-        std::vector<std::pair<std::string, double>> mixGates;
-        for (const Track& vt : g_proj.tracks)
-            if (vt.kind == 4) mixGates.push_back({"cawvstmix_" + std::to_string(vt.id), vt.vstOutMode == 1 ? 1.0 : 0.0});
-        g_offlineProc.setControlChannels(mixGates);
-    }
+    g_offlineProc.setVstJobs(g_langVst ? collectVstJobs(g_proj, {}) : std::vector<VstJob>{});   // VST unchecked: not loaded in the render either
+    g_offlineProc.setControlChannels(vstGateValues());   // the source gates for the render too
     const int wavFormat = format >= 3 ? 2 : format;
     if (!g_offlineProc.startOffline(csdPath, g_proj.cs.sr, masterChannels(g_proj.cs),
                                     (float)g_proj.cs.zdbfs, g_proj.cs.masterGain,
@@ -4973,7 +5158,8 @@ void tickTimeline(float dt) {
         if (sig != g_sig) {
             g_sig = sig;
             if (engineIsUp()) commandPlayFrom(g_play, false);
-            if (g_vstEngineOn) vstSolo().setNotes(buildVstSoloNotes());   // MIDI clips / mute / solo edited while playing
+            const std::vector<VstSoloNote> notes = buildVstSoloNotes();   // MIDI clips / mute / solo edited while playing
+            if (g_vstEngineOn) vstSolo().setNotes(notes);
         }
     }
     if (scUp) {
@@ -4994,9 +5180,11 @@ void playNotice(const std::string& text, const std::string& shortText = std::str
     g_playNotice = shortText.empty() ? text : shortText; g_playNoticeT = 10.0;
 }
 // One plan for Play and for live editing. Csound clips only count while the Csound engine runs.
-bool makePdPlan(std::vector<pd_timeline::Event>& events, std::string& error) {
+// includeMuted builds the plan the PD engine loads: every clip, with the muted ones flagged, so
+// M / S is applied live instead of rebuilding the engine (and its device stream) on every mute.
+bool makePdPlan(std::vector<pd_timeline::Event>& events, std::string& error, bool includeMuted = false) {
     int bad = 0;
-    const bool ok = pd_timeline::makePlan(g_proj, g_projectPath, events, error, g_playing || engineIsUp(), &bad);
+    const bool ok = pd_timeline::makePlan(g_proj, g_projectPath, events, error, g_playing || engineIsUp(), &bad, includeMuted);
     if (!ok && bad > 0)   // open the clip that needs attention
         for (Track& t : g_proj.tracks) for (Clip& c : t.clips) if (c.id == bad) c.editorOpen = true;
     return ok;
@@ -5016,7 +5204,8 @@ void refreshMixedPdPlan(float dt) {
     if(g_pdPlanT<.25)return;
     g_pdPlanT=0;
     std::vector<pd_timeline::Event> next;std::string error;int bad=0;
-    const bool valid=pd_timeline::makePlan(g_proj,g_projectPath,next,error,false,&bad);
+    // Same plan shape as the engine holds (muted clips flagged), so M / S is a live replan.
+    const bool valid=pd_timeline::makePlan(g_proj,g_projectPath,next,error,false,&bad,true);
     if(valid && !pd_timeline::samePlan(next,g_pdTimelineEvents) &&
        pd_timeline::sameInstances(next,g_pdTimelineEvents) && g_apiProc.replanPd(next)) {
         g_pdTimelineEvents=std::move(next);g_pdNeedsReload=false;return;
@@ -5049,8 +5238,10 @@ void refreshPdPlan(float dt) {
     if (g_pdPlanT < 0.25) return;
     g_pdPlanT = 0.0;
     std::vector<pd_timeline::Event> next; std::string error;
-    if (!makePdPlan(next,error)) {
-        if(g_timelineRun){pdTransport(false);g_timelineRun=false;g_pdTimelineMode=false;g_pdPlayingClip=0;stopAllScClips();}
+    if (!makePdPlan(next,error,true)) {
+        // A PD clip cannot be planned: PD goes quiet, nothing else does. The transport keeps
+        // running on the VST / SC clock and the other engines are not touched.
+        if (g_pdTimelineMode) { pdTransport(false); g_pdTimelineMode=false; g_pdPlayingClip=0; g_pdResumeAfterReload=false; g_resync=1; }
         if(error!=g_pdLastPlanError){g_pdLastPlanError=error;playNotice("PD clip problem: "+error,"PD clip problem: see the log");}
         g_pdNeedsReload=true;
         return;
@@ -5058,19 +5249,27 @@ void refreshPdPlan(float dt) {
     g_pdLastPlanError.clear();
     if (!pd_timeline::samePlan(next,g_pdTimelineEvents)) {
         if(pd_timeline::sameInstances(next,g_pdTimelineEvents) && g_pdTimelineEngine.replan(next)) {
+            // Timing, notes, x-fields or a mute changed: applied live. No restart, no device
+            // close, no transport stop - muting PD must not touch the rest of the project.
             g_pdTimelineEvents=std::move(next);g_pdNeedsReload=false;return;
         }
-        if(g_timelineRun){pdTransport(false);g_timelineRun=false;g_pdTimelineMode=false;g_pdPlayingClip=0;stopAllScClips();
-            playNotice("PD clips changed. Playback stopped while they reload.","PD changed: reloading clips");}
+        // A different set of PD clips: rebuild the PD engine only. The transport keeps going
+        // (the VST engine takes the clock) and PD rejoins as soon as its new stream is ready.
+        g_pdResumeAfterReload = g_timelineRun;
+        if (g_pdTimelineMode) { pdTransport(false); g_pdTimelineMode=false; g_pdPlayingClip=0; g_resync=1; }
         g_pdTimelineEngine.stop();
         g_pdTimelineEngine.setHub(&g_cawHub);   // CAW hub: PD-only mode shares the same caws/cawr bus
         if(!g_pdTimelineEngine.start(g_pdLibraryPath,next,pdAudioSettings())){
-            g_pdEngineOn=false;g_pdNeedsReload=true;playNotice("PD reload failed: "+g_pdTimelineEngine.status());
+            g_pdEngineOn=false;g_pdNeedsReload=true;g_pdResumeAfterReload=false;
+            playNotice("PD reload failed: "+g_pdTimelineEngine.status());
             restoreScSoloOutput();
             return;
         }
         g_pdSnapshotSeq=0;
         g_pdTimelineEvents=std::move(next);
+        if (g_pdResumeAfterReload)
+            playNotice("PD clips reloaded - PD rejoins when it is ready; the other engines keep playing.",
+                       "PD reloading: the other engines keep playing");
     }
     g_pdNeedsReload=false;
 }
@@ -5090,11 +5289,23 @@ void tickPdTimeline(float dt = 0.f) {
     if(pos>=0)g_play=static_cast<double>(pos)/std::max(1000,g_proj.cs.sr);
     if (g_vstEngineOn) vstSolo().followClock(g_play);   // the VST engine stays in time with PD
     const auto* event = pd_timeline::at(g_pdTimelineEvents, g_play);
-    g_pdPlayingClip=event?event->clipId:0;
+    g_pdPlayingClip=(event && !event->muted)?event->clipId:0;   // a muted clip is loaded, not playing
+    // MIDI edits / live M / S of the instrument tracks while PD drives the clock: the VST
+    // engine gets its new schedule here instead of on the Csound path.
+    g_sigT += dt;
+    if (g_sigT >= 0.25) {
+        g_sigT = 0.0;
+        const unsigned long long sig = timelineSignature(g_proj);
+        if (sig != g_sig) {
+            g_sig = sig;
+            if (g_vstEngineOn) vstSolo().setNotes(buildVstSoloNotes());
+        }
+    }
     if (g_scReady) {
         const auto sig = scTimelineSignature(g_proj);
         if (g_scTimelineSig != sig || (g_scLastPDTimelineTime >= 0.0 && g_play + 0.05 < g_scLastPDTimelineTime))
             scheduleScTimeline(g_play);
+        pollScAutomation();   // SC automation lanes follow the PD playhead too
     }
     g_scLastPDTimelineTime = g_play;
 }
@@ -5447,10 +5658,29 @@ void pollProcesses(float dt) {
         playNotice("PD engine stopped: " + status, "PD stopped: see the log");
         if (g_scReady) stopAllScClips();
         g_pdEngineOn = false; g_pdTimelineMode = false; g_pdPlayingClip = 0;
+        g_pdResumeAfterReload = false;
+        if (g_timelineRun) g_resync = 1;   // the VST / SC clock takes over from this position
         g_pdTimelineEvents.clear();
         restoreScSoloOutput();
     }
     vstEngineTick(dt);   // VST engine: log, own stream, plugin changes
+    // The PD engine was rebuilt while the transport kept running (a different set of PD
+    // clips). Rejoin as soon as its new stream is ready; PD then drives the clock again
+    // and the VST engine re-anchors on it.
+    if (g_timelineRun && g_pdResumeAfterReload && !g_pdTimelineMode && g_pdEngineOn &&
+        g_pdTimelineEngine.ready() && !g_renderActive) {
+        std::vector<pd_timeline::Event> plan; std::string err;
+        if (!makePdPlan(plan, err, true) || !pd_timeline::samePlan(plan, g_pdTimelineEvents)) {
+            g_pdResumeAfterReload = false;
+        } else {
+            g_pdResumeAfterReload = false;
+            g_pdTimelineMode = true;
+            g_pdPreviousTime = -1.0;
+            vstEngineJoinTransport();
+            pdTransport(true);
+            logLine("[caw] PD rejoined the running transport.");
+        }
+    }
     // ---- timeline (independent of the Csound engine)
     if (g_timelineRun) {
         if (g_pdTimelineMode) {
@@ -5630,6 +5860,7 @@ bool timelinePlaying() { return g_timelineRun; }
 void toggleTimelinePlay() {
     if (g_timelineRun) {
         g_timelineRun = false;
+        g_pdResumeAfterReload = false;
         if (g_pdTimelineMode) {
             pdTransport(false);g_pdPlayingClip = 0; g_pdTimelineMode = false;
         }
@@ -5639,9 +5870,13 @@ void toggleTimelinePlay() {
         g_scTimelineSig = 0; g_scPlanT = 0.0; g_scLastPDTimelineTime = -1.0;
         mixedPdTransport(false);
     } else {
-        // VSTi tracks play in every situation: Play brings the VST engine up (it may already be on,
-        // or waiting for a plugin). Csound / PD / SC are never started by Play.
-        if (!g_vstEngineOn && anyVstiTrack()) startVstEngine();
+        // VST tracks play in every situation: while Csound runs, its rack is the VST graph (nothing
+        // else to start); without it, Play brings the VST engine up. Csound / PD / SC are never
+        // started by Play.
+        if (!g_vstEngineOn && !g_vstHostedInCsound && anyVstTrack()) {
+            if (g_langVst) startVstEngine();
+            else playNotice("Enable VST in Settings > Languages - the VSTi tracks are skipped, the other engines play.", "Enable VST first");
+        }
         bool hasAudibleScClip = false;
         bool anyTrackSolo = false;
         for (const Track& track : g_proj.tracks) if (track.solo && !track.muted) anyTrackSolo = true;
@@ -5663,19 +5898,25 @@ void toggleTimelinePlay() {
             if (!engineIsUp() && !g_vstEngineOn && !g_pdEngineOn) return;   // nothing else could play: keep the old stop
         }
         std::vector<pd_timeline::Event> events; std::string error;
-        if (g_pdEngineOn && !makePdPlan(events, error)) {
+        // Load every PD clip, muted ones flagged: a mute is then live and never rebuilds the
+        // engine. Only clips that are audible actually start playing.
+        if (g_pdEngineOn && !makePdPlan(events, error, true)) {
+            events.clear();
             playNotice(error, error.find("no patch") != std::string::npos ? "PD clip has no patch: choose a .pd file" : "PD clip problem: see the log");
             // The PD clips are skipped; the VST / Csound / SC engines still play.
         }
+        bool audiblePdEvents = false;
+        for (const auto& e : events) if (!e.muted) { audiblePdEvents = true; break; }
         if(g_mixedPd) {
             int bad=0;
             if(!g_apiProc.pdReady() || !engineIsUp()) {playNotice("Shared engines are preparing. Wait for Csound and PD ready.");return;}
-            if(!pd_timeline::makePlan(g_proj,g_projectPath,events,error,false,&bad)) {playNotice("PD clip problem: "+error);return;}
+            if(!pd_timeline::makePlan(g_proj,g_projectPath,events,error,false,&bad,true)) {playNotice("PD clip problem: "+error);return;}
             if(g_pdNeedsReload || !pd_timeline::samePlan(events,g_pdTimelineEvents)) {
                 playNotice("PD clips changed. Restart the shared engines before playing.");return;
             }
+            audiblePdEvents = !events.empty();
         }
-        if (events.empty()) {
+        if (!audiblePdEvents) {
             // A PD track without any usable clip would otherwise just move the playhead without a word.
             bool pdTrack = false, pdClip = false;
             for (const Track& t : g_proj.tracks) if (t.kind == 6 && !t.muted) { pdTrack = true; for (const Clip& c : t.clips) if (!c.muted) pdClip = true; }
@@ -5683,7 +5924,7 @@ void toggleTimelinePlay() {
             else if (pdTrack && !pdClip) playNotice("The PD track has no clips. Double-click its lane to add one, then choose a .pd file.", "PD track has no clip: double-click its lane");
             else if (pdTrack) playNotice("All PD clips or PD tracks are muted (or another track is solo).");
         }
-        if (!events.empty() && !g_mixedPd) {
+        if (audiblePdEvents && !g_mixedPd) {
             // A PD problem skips the PD timeline only: VSTi / Csound / SC still play. Play again
             // once PD is ready (Run PD preloads its clips; the VST engine keeps working meanwhile).
             if (g_pdLibraryPath.empty()) g_pdLibraryPath = plat::bundledLibpd();
@@ -5694,7 +5935,13 @@ void toggleTimelinePlay() {
             } else if (!g_pdTimelineEngine.ready()) {
                 playNotice("PD is still preparing - the other engines play now. Press Play again when PD is ready.", "PD skipped: PD is preparing");
             } else if (g_pdNeedsReload || !pd_timeline::samePlan(events,g_pdTimelineEvents)) {
-                g_pdNeedsReload=true;playNotice("PD clips changed - they are skipped. Press Run PD to preload them again.", "PD skipped: Run PD again");
+                // An edit made just before Play: a live replan needs no reload at all.
+                if (!g_pdNeedsReload && pd_timeline::sameInstances(events,g_pdTimelineEvents) && g_pdTimelineEngine.replan(events)) {
+                    g_pdTimelineEvents=events;
+                    g_pdTimelineMode = true; g_pdPreviousTime = -1.0;
+                } else {
+                    g_pdNeedsReload=true;playNotice("PD clips changed - they are skipped. Press Run PD to preload them again.", "PD skipped: Run PD again");
+                }
             } else if (g_pdLibraryPath.empty()) {
                 playNotice("libpd was not found - Settings > Programs, or copy libpd.dll into <CAW folder>\\PureData\\.", "PD skipped: libpd was not found");
             } else {
@@ -5709,7 +5956,10 @@ void toggleTimelinePlay() {
             pdTransport(true);
             if (g_scReady) scheduleScTimeline(g_play);
         }
-        else if (!engineIsUp() && !g_scReady && !g_vstEngineOn) logLine(g_langCsound ? "[caw] Press Run Csound for Csound clips." : "[caw] No SuperCollider or Pure Data audio engine is running.");
+        else if (!engineIsUp() && !g_scReady && !g_vstEngineOn)
+            logLine(g_langCsound ? "[caw] Press Run Csound for Csound clips."
+                    : (!g_langPd && !g_langSc && !g_langVst) ? "[caw] Score only: no engine is enabled (Settings > Languages). The timeline and editors work."
+                    : "[caw] No SuperCollider or Pure Data audio engine is running.");
     }
 }
 
@@ -5808,22 +6058,32 @@ void drawTransport() {
     const bool pdStarting = (g_pdEngineOn && !g_pdTimelineEngine.ready()) ||
                             (g_mixedPd && g_playing && !g_apiProc.pdReady());
     const bool scStarting = g_scEngineOn && !g_scReady;
-    const bool anyStarting = csStarting || pdStarting || scStarting;
+    const bool vstStarting = g_vstEngineOn && !vstSolo().ready();
+    const bool anyStarting = csStarting || pdStarting || scStarting || vstStarting;
     const bool csReady = g_liveCsound && !g_playWaiting;
     const bool pdReady = (g_pdEngineOn && g_pdTimelineEngine.ready()) ||
                          (g_pdPreview.active() && g_pdPreview.ready()) ||
                          (g_mixedPd && g_apiProc.pdReady());
     const bool scReady = g_scEngineOn && g_scReady;
+    const bool vstReady = g_vstEngineOn && vstSolo().ready();
     const char csStatus = csStarting ? '~' : (csReady ? '1' : '0');
     const char scStatus = scStarting ? '~' : (scReady ? '1' : '0');
     const char pdStatus = pdStarting ? '~' : (pdReady ? '1' : '0');
+    const char vstStatus = vstStarting ? '~' : (vstReady ? '1' : '0');
     if (g_renderActive) {
         std::snprintf(statusText, sizeof statusText, "Rendering...");
         statusCol = ImVec4(0.95f, 0.60f, 0.20f, 1.f);
     } else {
-        std::snprintf(statusText, sizeof statusText, "CS:%c  SC:%c  PD:%c", csStatus, scStatus, pdStatus);
+        // The pill lists exactly what this session is set to use (Settings > Languages).
+        std::string parts;
+        if (g_langCsound || g_liveCsound) parts += std::string("CS:") + csStatus;
+        if (g_langPd || g_pdEngineOn) { if (!parts.empty()) parts += "  "; parts += std::string("PD:") + pdStatus; }
+        if (g_langSc || g_scEngineOn) { if (!parts.empty()) parts += "  "; parts += std::string("SC:") + scStatus; }
+        if (g_langVst || g_vstEngineOn) { if (!parts.empty()) parts += "  "; parts += std::string("VST:") + vstStatus; }
+        if (parts.empty()) parts = "score only";
+        std::snprintf(statusText, sizeof statusText, "%s", parts.c_str());
         if (anyStarting) statusCol = ImVec4(0.95f, 0.72f, 0.30f, 1.f);
-        else if (csReady || scReady || pdReady) statusCol = ImVec4(0.40f, 0.85f, 0.50f, 1.f);
+        else if (csReady || scReady || pdReady || vstReady) statusCol = ImVec4(0.40f, 0.85f, 0.50f, 1.f);
     }
     if (g_playNoticeT > 0.0) {   // a reason why Play did nothing, shown where it cannot be missed
         g_playNoticeT -= ImGui::GetIO().DeltaTime;
@@ -5832,7 +6092,14 @@ void drawTransport() {
     }
     char engineText[96];
     if (g_langCsound) std::snprintf(engineText, sizeof engineText, "%d Hz | ksmps %d | %d ch", cs.sr, cs.ksmps, cs.nchnls);
-    else std::snprintf(engineText, sizeof engineText, "%d Hz | %s", cs.sr, g_langSc ? "SuperCollider / PD" : "stereo PD");
+    else {
+        std::string eng;
+        if (g_langPd) eng = "Pure Data";
+        if (g_langSc) { if (!eng.empty()) eng += " + "; eng += "SuperCollider"; }
+        if (g_langVst) { if (!eng.empty()) eng += " + "; eng += "VST"; }
+        if (eng.empty()) eng = "score only";
+        std::snprintf(engineText, sizeof engineText, "%d Hz | %s", cs.sr, eng.c_str());
+    }
     const float dotW = S(14);
     const float statusW = dotW + ImGui::CalcTextSize(statusText).x + S(12);
     const float engineW = ImGui::CalcTextSize(engineText).x + S(16);
@@ -5895,22 +6162,32 @@ void drawTransport() {
     if (g_langCsound || g_liveCsound) {
         const bool csOn = g_liveCsound;
         const bool scOn = g_scEngineOn;
+        const bool vstOn = g_vstEngineOn;
         const bool csPd = g_mixedPd || (g_langCsound && g_langPd);
+        const bool vstWanted = g_langVst && anyVstTrack();   // instruments or effects - nothing to run without a VST track
         const bool on = csOn;
-        const char* runLabel = g_langSc
-            ? (csPd ? "Run Csound + PD + SC" : "Run Csound + SC")
-            : (csPd ? "Run Csound + PD" : "Run Csound");
-        const char* label = csOn
-            ? (g_langSc && !scOn ? "Add SuperCollider"
-                : (scOn ? (csPd ? "Stop engines" : "Stop Csound + SC")
-                        : (csPd ? "Stop engines" : "Stop Csound")))
-            : runLabel;
+        // The label is the list of engines this button starts, exactly as checked in Settings >
+        // Languages ("Run Csound + VST", "Run Csound + PD + SC + VST", ...).
+        std::string label = g_langSc ? (csPd ? "Run Csound + PD + SC" : "Run Csound + SC")
+                                     : (csPd ? "Run Csound + PD" : "Run Csound");
+        if (g_langVst) label += " + VST";
+        if (csOn) {
+            // Checked engines that are not up yet: pressing ADDS them; when all are up, it stops them.
+            std::string missing;
+            if (g_langSc && !scOn) missing = "SC";
+            if (vstWanted && !vstOn) { if (!missing.empty()) missing += " + "; missing += "VST"; }
+            if (!missing.empty()) label = "Add " + missing;
+            else label = (csPd || scOn || vstOn) ? "Stop engines" : "Stop Csound";
+        }
         if (on) pushBtnOn(ImVec4(0.20f, 0.42f, 0.24f, 1.f));
-        if (ImGui::Button(label)) {
+        if (ImGui::Button(label.c_str())) {
             if (csOn) {
-                if (g_langSc && !scOn) startScEngine();
-                else {
+                bool added = false;
+                if (g_langSc && !scOn) { startScEngine(); added = true; }
+                if (vstWanted && !vstOn) { startVstEngine(); added = true; }
+                if (!added) {
                     if (scOn) stopScEngine();
+                    if (vstOn) stopVstEngine();
                     stopPlayback();
                 }
             } else {
@@ -5919,32 +6196,44 @@ void drawTransport() {
                 // into that callback instead of opening and replacing the card twice.
                 startEngine();
                 if (startScAfterHost && g_liveCsound && !startScEngine()) stopPlayback();
+                if (vstWanted && !g_vstEngineOn) startVstEngine();
             }
         }
         if (on) ImGui::PopStyleColor(3);
-        if (ImGui::IsItemHovered()) helpTip(g_langSc
-            ? "Run Csound, PD (when enabled), and SuperCollider together. If Csound is already running, this button adds SC or stops the combined engines."
+        if (ImGui::IsItemHovered()) helpTip("%s", (g_langSc || g_langVst)
+            ? "Run the checked engines together (Csound with PD when enabled, SuperCollider, VST). If Csound is already running, this button adds the missing ones or stops them all."
             : (csPd ? "Run Csound and PD through one CAW audio output." : "Run Csound for Csound timeline clips."));
         ImGui::SameLine();
     }
     if (g_langPd && !g_langCsound && !g_mixedPd) {
         const bool on = g_pdEngineOn;
-        const char* label = on
-            ? (g_langSc && !g_scEngineOn ? "Add SuperCollider"
-                : (g_scEngineOn ? "Stop PD + SC" : "Stop PD"))
-            : (g_langSc ? "Run PD + SC" : "Run PD");
+        const bool scOn = g_scEngineOn;
+        const bool vstOn = g_vstEngineOn;
+        const bool vstWanted = g_langVst && anyVstTrack();   // instruments or effects - nothing to run without a VST track
+        std::string label = g_langSc ? "Run PD + SC" : "Run PD";
+        if (g_langVst) label += " + VST";
+        if (on) {
+            std::string missing;
+            if (g_langSc && !scOn) missing = "SC";
+            if (vstWanted && !vstOn) { if (!missing.empty()) missing += " + "; missing += "VST"; }
+            if (!missing.empty()) label = "Add " + missing;
+            else label = (scOn || vstOn) ? "Stop engines" : "Stop PD";
+        }
         if (on) pushBtnOn(ImVec4(0.20f, 0.42f, 0.24f, 1.f));
-        if (ImGui::Button(label)) {
-            if (on && g_langSc && !g_scEngineOn) {
-                startScEngine();
-            } else if (on && g_scEngineOn) {
-                stopScEngine();
-                if (g_pdTimelineMode && g_timelineRun) { pdTransport(false); g_timelineRun = false; }
-                g_pdTimelineEngine.stop(); g_pdPlayingClip = 0; g_pdEngineOn = false; g_pdTimelineMode = false; g_pdTimelineEvents.clear();
-            } else if (on) {
-                if (g_pdTimelineMode && g_timelineRun) { pdTransport(false); g_timelineRun = false; }
-                g_pdTimelineEngine.stop(); g_pdPlayingClip = 0; g_pdEngineOn = false; g_pdTimelineMode = false; g_pdTimelineEvents.clear();
-                restoreScSoloOutput();
+        if (ImGui::Button(label.c_str())) {
+            if (on) {
+                bool added = false;
+                if (g_langSc && !scOn) { startScEngine(); added = true; }
+                if (vstWanted && !vstOn) { startVstEngine(); added = true; }
+                if (!added) {
+                    const bool hadSc = scOn;
+                    if (hadSc) stopScEngine();
+                    if (vstOn) stopVstEngine();
+                    if (g_pdTimelineMode && g_timelineRun) { pdTransport(false); g_timelineRun = false; }
+                    g_pdTimelineEngine.stop(); g_pdPlayingClip = 0; g_pdEngineOn = false; g_pdTimelineMode = false; g_pdTimelineEvents.clear();
+                    g_pdResumeAfterReload = false;
+                    if (!hadSc) restoreScSoloOutput();
+                }
             } else if ((g_playing && !g_useCsoundApi) || engineIsUp() || g_testSound.running() || g_renderActive || g_pdPreview.active()) {
                 playNotice("Stop the legacy audio process, test sound, or export before starting PD.");
             } else {
@@ -5952,7 +6241,7 @@ void drawTransport() {
                 std::string error;
                 std::vector<pd_timeline::Event> plan;
                 if (g_pdLibraryPath.empty()) playNotice("Choose libpd in Settings > Programs.");
-                else if (!makePdPlan(plan, error)) playNotice(error, "PD clip problem: see the log");
+                else if (!makePdPlan(plan, error, true)) playNotice(error, "PD clip problem: see the log");
                 else {
                     if (!g_audioDevicesReady) refreshAudioDevices(false);
                     if (g_proj.cs.outDev == -2) playNotice("Select an audio output in Settings > Audio.");
@@ -5977,29 +6266,44 @@ void drawTransport() {
                                 g_pdEngineOn = false; g_pdTimelineMode = false; g_pdTimelineEvents.clear();
                                 restoreScSoloOutput();
                             }
+                            if (vstWanted && !g_vstEngineOn && g_pdEngineOn) startVstEngine();
                         }
                     }
                 }
             }
         }
         if (on) ImGui::PopStyleColor(3);
-        if (ImGui::IsItemHovered()) helpTip(g_langSc
-            ? "Run PD and SuperCollider together on one CAW output, or add/stop SC while PD keeps running."
+        if (ImGui::IsItemHovered()) helpTip("%s", g_langSc || g_langVst
+            ? "Run the checked engines together on one CAW output (PD, SuperCollider, VST), or add/stop them while PD keeps running."
             : "Preload all PD clips. Audio output stays open until Stop PD.");
         ImGui::SameLine();
     }
     if (g_langSc && !g_langCsound && !g_langPd) {
         const bool on = g_scEngineOn;
-        if (on) pushBtnOn(ImVec4(0.20f, 0.42f, 0.24f, 1.f));
-        if (ImGui::Button(on ? "Stop SuperCollider" : "Run SuperCollider")) {
-            if (on) stopScEngine();
-            else startScEngine();
+        const bool vstOn = g_vstEngineOn;
+        const bool vstWanted = g_langVst && anyVstTrack();   // instruments or effects - nothing to run without a VST track
+        std::string label;
+        if (!on) label = g_langVst ? "Run SuperCollider + VST" : "Run SuperCollider";
+        else if (vstWanted && !vstOn) label = "Add VST";
+        else label = vstOn ? "Stop engines" : "Stop SuperCollider";
+        if (on || vstOn) pushBtnOn(ImVec4(0.20f, 0.42f, 0.24f, 1.f));
+        if (ImGui::Button(label.c_str())) {
+            if (!on) {
+                if (startScEngine() && vstWanted && !g_vstEngineOn) startVstEngine();
+            } else if (vstWanted && !vstOn) {
+                startVstEngine();
+            } else {
+                if (vstOn) stopVstEngine();
+                stopScEngine();
+            }
         }
-        if (on) ImGui::PopStyleColor(3);
-        if (ImGui::IsItemHovered()) helpTip("Start or stop SuperCollider inside CAW. Its audio is mixed into the same output stream as Csound and Pure Data.");
+        if (on || vstOn) ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered()) helpTip("Start or stop the checked engines inside CAW. Their audio is mixed into the same output stream.");
         ImGui::SameLine();
     }
-    {   // The VST engine: CAW's own engine for the VSTi tracks. Independent of Csound, PD and SuperCollider.
+    // The VST-only session: the same combined Run button, in its shortest form ("Run VST").
+    // With any other engine checked the VST engine is part of that engine's button instead.
+    if (g_langVst && !g_langCsound && !g_liveCsound && !g_langPd && !g_langSc) {
         const bool on = g_vstEngineOn;
         if (on) pushBtnOn(ImVec4(0.20f, 0.42f, 0.24f, 1.f));
         if (ImGui::Button(on ? "Stop VST" : "Run VST")) {
@@ -6008,7 +6312,7 @@ void drawTransport() {
         }
         if (on) ImGui::PopStyleColor(3);
         if (ImGui::IsItemHovered())
-            helpTip("Run the VSTi (instrument) tracks. Starts CAW's own VST engine: it loads the instrument plugins and plays the MIDI clips and the notes from clip code. It does not need Csound; it joins the soundcard stream of Csound / PD / SuperCollider when they run. Press Play afterwards.");
+            helpTip("Run the VSTi (instrument) tracks. Starts CAW's own VST engine: it loads the instrument plugins and plays the MIDI clips and the notes from clip code. It does not need Csound. Press Play afterwards.");
         ImGui::SameLine();
     }
     int ms = (int)(g_play * 1000.0);
@@ -8174,15 +8478,14 @@ void drawArrange(float belowH, float rightW) {
 
     if (ImGui::IsMouseHoveringRect(hdrMin, hdrMax) && ImGui::IsMouseClicked(1) && m.y >= yTop[(size_t)nT] && !ImGui::IsPopupOpen("##track_ctx")) { g_ctxTrack = -1; ImGui::OpenPopup("##track_ctx"); }
     if (ImGui::BeginPopup("##track_ctx")) {
-        if (g_langCsound && ImGui::MenuItem("Add Csound track")) { g_selTrack = addLangTrack(0); g_selClip = -1; }
-        if (g_langSc) {
-            if (ImGui::MenuItem("Add SuperCollider track")) { g_selTrack = addNonCsoundTrack(true); g_selClip = -1; }
-            if (ImGui::IsItemHovered()) helpTip("Double-click the lane to add a SuperCollider code clip. Start SC with the transport Run button, then press Play.");
-        }
-        if (g_langPd) {
-            if (ImGui::MenuItem("Add Pure Data track")) { g_selTrack = addNonCsoundTrack(false); g_selClip = -1; }
-            if (ImGui::IsItemHovered()) helpTip("Double-click the track to create a PD clip, then open the clip and load a .pd patch.");
-        }
+        // Every kind of track can be added whatever the session list says: an unchecked engine
+        // is only not RUN (code it now, enable the engine in Settings > Languages to hear it).
+        if (ImGui::MenuItem("Add Csound track")) { g_selTrack = addLangTrack(0); g_selClip = -1; }
+        if (!g_langCsound && ImGui::IsItemHovered()) helpTip("Csound is not enabled in Settings > Languages: the track and its code work, Run will not start Csound.");
+        if (ImGui::MenuItem("Add SuperCollider track")) { g_selTrack = addNonCsoundTrack(true); g_selClip = -1; }
+        if (ImGui::IsItemHovered()) helpTip("Double-click the lane to add a SuperCollider code clip. Start SC with the transport Run button, then press Play.");
+        if (ImGui::MenuItem("Add Pure Data track")) { g_selTrack = addNonCsoundTrack(false); g_selClip = -1; }
+        if (ImGui::IsItemHovered()) helpTip("Double-click the track to create a PD clip, then open the clip and load a .pd patch.");
         ImGui::Separator();
         if (ImGui::MenuItem("Add VSTi")) { g_selTrack = addVstTrack(true); g_selClip = -1; }
         if (ImGui::IsItemHovered()) helpTip("A VST3 instrument with MIDI input and parameter automation.");
@@ -12002,6 +12305,6 @@ bool appQuitRequested() {
     stopScEngine();
     g_scEngine.stop();
     stopPlayback();
-    stopVstEngine();
+    stopVstEngine(true);
     return true;
 }

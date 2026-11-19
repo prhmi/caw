@@ -37,11 +37,11 @@ public:
     void setMasterGain(float linear);
     // Publish a completed command-file number to the engine thread.
     void setCommandSerial(int serial);
-    void setVstJobs(const std::vector<VstJob>& jobs);   // VST3 tracks to run next to Csound (call before start)
-    // Instrument (VSTi) tracks: NOT rendered here any more - CAW's 4th engine (the app-side
-    // VSTi rack) owns the plugins. The engine only FORWARDS what Csound writes for them:
-    // the note ring (clip code note / cc / msg) and the kP1..kP8 parameter channels.
-    void setVstInstrumentJobs(const std::vector<VstJob>& jobs);
+    void setVstJobs(const std::vector<VstJob>& jobs);   // the whole VST graph: instruments AND effects (call before start)
+    // Live VST graph update while the engine runs: the rack reloads the plugins when a track was
+    // added / removed or its .vst3 changed, otherwise it only re-points the effect inputs and the
+    // AUDIO OUTPUT. Pushed by the UI on every wiring / plugin change - no Run needed.
+    void setVstWiring(const std::vector<VstJob>& jobs);
     // Live M / S: the set of VST track ids that should keep sounding. Updated by the UI whenever a
     // track's mute or solo changes; the rack skips every loaded track whose id is not in the set.
     void setVstActiveTracks(const std::set<int>& ids);
@@ -64,9 +64,9 @@ public:
     // restart the clip to hear the edit at once. Does nothing while no engine runs - the next Run
     // compiles the code anyway. label = clip name, used in the console lines.
     void pushLiveInstrument(const std::string& label, std::string code);
-    // AUDIO OUTPUT switched live (VST panel): writes the source-clip gate channel
-    // (cawvstmix_<id>: 0 = the VSTe replaces its sources in the master, 1 = mix) and updates
-    // the raw PD / SC mix suppression for that track without a restart.
+    // AUDIO OUTPUT switched live (VST panel): the rack replaces (or stops replacing) the VST
+    // sources it consumes and the raw PD / SC mix suppression is updated - no restart. The CSD
+    // source-clip gates are written separately by the app (vstGateValues) on the same change.
     void setVstOutModeLive(int trackId, int mode);
     // SuperCollider mix capture (filled by CAW's audio callback) for VSTe "SuperCollider" inputs.
     void setScAudioRing(CawScRing* ring);
@@ -77,6 +77,10 @@ public:
     // The parameter values the engine is actually using (normalized kP1..kP8, per track id).
     // Returns false when the engine is off or the track has no VST rack entry.
     bool vstEngineParams(int trackId, double out[8]) const;
+    struct VstTrackPeak { int trackId = 0; float l = 0.f, r = 0.f; };
+    // Per-track output peaks of the rack (every VST track, instrument or effect), max-held since
+    // the last call: the lane meters read them while Csound hosts the plugins.
+    std::vector<VstTrackPeak> takeVstPeaks();
     // Live parameter edit: write each value into the named Csound control channel once (the clip
     // code reads it on the next block). Used by the VSTE panel sliders so a dragged P1..P8 value
     // reaches the running plugin without restarting Csound.

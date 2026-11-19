@@ -4,6 +4,7 @@
 #include <map>
 #include <array>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <cstdint>
 // One VST3 track as the Csound engine thread sees it.
@@ -16,19 +17,24 @@ struct VstJob {
     bool instrument = true;        // true = VSTi (MIDI in), false = VSTe (audio in)
     std::vector<int> pick;         // plugin parameter index of kP1..kP8
     std::vector<double> init;      // start value of kP1..kP8 (normalized)
-    // The 8 VSTe input slots, mirroring Track::vstInputs. lineStart / lineCount are the input lines
-    // the source occupies (resolved at CSD build time, stable for the run). The rack copies every
-    // ENABLED slot's lines into the plugin input packed from line 1, so switching an input on/off
-    // live never leaves silent gaps in front of a later input.
+    // The 8 VSTe input slots, mirroring Track::vstInputs. The rack copies every ENABLED slot's
+    // lines into the plugin input packed from line 1, so switching an input on/off live never
+    // leaves silent gaps in front of a later input. lineStart / lineCount say how many lines the
+    // slot occupies; the sources are resolved BY NAME every block, so a re-wire works live.
     //   mode 0 = track, 1 = clips, 2 = master (spout copy).
-    //   engine 0 = Csound lines (cawvstin_<id>_<line> channels, fed by the CSD routing);
+    //   engine 0 = Csound clips: csChans holds one channel per line (cawtap_<clip>_<ch>, the
+    //              per-clip output taps the CSD publishes - read live, resolved by name);
     //             1 = the Pure Data mix (rendered by the PD bridge outside Csound);
     //             2 = the SuperCollider mix (rendered in CAW's audio callback);
     //             3 = a VSTi / VSTe source (srcId = its track id): the rack wires the source
     //                 plugin's own stereo output into the slot, exactly the channels the source
     //                 sends to the master - a VST track's audio never runs through Csound.
     //             PD / SC / VST sources cannot be split per clip: the whole source mix feeds the slot.
-    struct Input { bool on = false; int mode = 0; std::string name; int lineStart = 0; int lineCount = 0; int engine = 0; int srcId = 0; };
+    struct Input {
+        bool on = false; int mode = 0; std::string name; int lineStart = 0; int lineCount = 0;
+        int engine = 0; int srcId = 0;
+        std::vector<std::string> csChans;   // engine 0 only: the tap channel of every line
+    };
     Input inputs[8];
     bool routedIn = false;         // true if any input is configured (the 8-line buffer is used instead of silence)
     int outMode = 0;               // 0 = master (replace source), 1 = mix (source + VSTe to master)
@@ -77,4 +83,11 @@ struct VstEngineAudio {
     const std::atomic<const float*>* pdMix = nullptr;  // the latest Pure Data render (interleaved, pdMixChannels)
     int pdMixChannels = 2;
     CawScRing* scRing = nullptr;                       // the SuperCollider mix (stereo, device scale)
+};
+// One note of the MIDI clips of the VSTi tracks, as the app hands them to CAW's own VST engine
+// (the 4th engine, while Csound is off). It plays them on its block clock. While Csound hosts,
+// the Csound score plays the same clips into the note ring instead - one transport, one clock.
+struct VstPlayNote {
+    double start = 0.0, dur = 0.0;   // seconds on the timeline
+    int trackId = 0, pitch = 60, velocity = 100;
 };

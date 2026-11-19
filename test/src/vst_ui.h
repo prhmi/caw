@@ -38,6 +38,7 @@ struct Slot {
     bool systemScaling = true, loadedSystemScaling = true;
     int learn = -1;                       // slot (0..7) that waits for a knob turn in the plugin window, -1 = none
     std::string err, pluginFilter, paramFilter, loadedPath;
+    std::string note;                     // one-line result of the last load (e.g. which picks moved to the new plugin)
 #ifdef CAW_VST3
     std::unique_ptr<caw::IPlugin> plugin;
     // Live parameter sync: plugin parameter index -> the value both the editor GUI and the engine
@@ -69,6 +70,8 @@ inline std::function<bool(int, double[8])> takeVstEngineParams;
 inline std::function<void(int, const std::vector<int>&)> pushVstPickRefresh;   // P1..P8 re-picked while running
 inline std::function<void(int, int, double)> pushVstParamLive;   // (trackId, parameter index, value) EVERY editor knob, live
 inline std::function<void(int, int)> pushVstOutModeLive;         // (trackId, 0 = master replace, 1 = mix) AUDIO OUTPUT switched live
+inline std::function<void()> pushVstWiring;                      // an input mode / name changed: re-resolve the routing in the running VST engine now
+inline std::function<void(int)> notifyPluginLoaded;              // a .vst3 finished loading into the editor: the engine may apply it now
 
 inline std::string lower(const std::string& s) { std::string o; for (char c : s) o += (char)std::tolower((unsigned char)c); return o; }
 
@@ -132,30 +135,67 @@ inline void captureAllParameters(Project& project) {
 }
 
 inline bool loadPlugin(Slot& s, Track& t, const std::string& path, double sr) {
-    (void)sr; s.err.clear();
-    if (path == t.vstPath) captureTrackParameters(t, s);
+    (void)sr; s.err.clear(); s.note.clear();
+    const bool changed = path != t.vstPath;
+    if (!changed) captureTrackParameters(t, s);
 #ifdef _WIN32
     static bool com = false; if (!com) { OleInitialize(nullptr); com = true; }   // many plugins expect COM on the thread that loads them
 #endif
+    // Another plugin takes over the SAME picks: the mapping follows the parameter NAMES, because
+    // the indices of another plugin mean something else (they could even drive a mute / volume
+    // knob). The editor instance that is on screen right now still knows what P1..P8 were.
+    std::vector<std::string> oldTitles;
+    if (changed && s.plugin && !t.vstPath.empty() && s.loadedPath == t.vstPath) {
+        const auto& old = s.plugin->params();
+        oldTitles.reserve(t.vstPick.size());
+        for (int idx : t.vstPick)
+            oldTitles.push_back(idx >= 0 && (size_t)idx < old.size() ? old[(size_t)idx].title : std::string());
+    }
     auto p = caw::makeVst3Plugin(); std::string err;
     p->setEditorSystemScaling(s.systemScaling);
     // This copy only shows the plugin; the sound is made by a separate engine instance.
     bool ok = false;
     try { ok = p->load(path, err); } catch (...) { err = "the plugin failed while loading"; }
     if (ok) {
-        if (path != t.vstPath) t.vstParameterState.clear();
+        if (changed) {
+            int moved = 0, lost = 0;
+            const auto& fresh = p->params();
+            for (size_t k = 0; k < t.vstPick.size() && k < oldTitles.size(); ++k) {
+                const std::string& title = oldTitles[k];
+                if (title.empty()) continue;               // nothing to match against: the raw index stays
+                int found = -1;
+                for (const caw::PluginParam& fp : fresh)
+                    if (!fp.readOnly && fp.title == title) { found = fp.index; break; }
+                if (found < 0) for (const caw::PluginParam& fp : fresh)
+                    if (!fp.readOnly && lower(fp.title) == lower(title)) { found = fp.index; break; }
+                if (found >= 0) { t.vstPick[k] = found; ++moved; }
+                else { t.vstPick[k] = -1; ++lost; }        // not in this plugin: show the slot as empty instead of driving a random knob
+            }
+            if (!oldTitles.empty() && (moved || lost))
+                s.note = "Mapping carried over: " + std::to_string(moved) + " of " + std::to_string(oldTitles.size()) +
+                    " picks matched this plugin." + (lost ? " " + std::to_string(lost) + " were not found - pick those again." : "");
+        }
+        // The saved state is keyed by parameter ID, so the patch survives a plugin change: only
+        // the IDs this plugin reports are applied - nothing is erased.
         for (const caw::PluginParam& param : p->params()) {
             const auto saved = t.vstParameterState.find(param.id);
             if (!param.readOnly && saved != t.vstParameterState.end()) p->setParam(param.index, saved->second);
         }
         s.plugin = std::move(p); t.vstPath = path; s.loadedPath = path;
         s.loadedSystemScaling = s.systemScaling; s.learn = -1;
+        s.autoTried = true;   // loaded here: the panel must not load the same plugin a second time next frame
+        // Fresh baselines: the values this plugin has right now are the agreed ones. Without this
+        // the poll below reads the new defaults as "the user moved the knob", overwrites vstInit
+        // and pushes them to the engine - which is how a mapping got reset by picking a plugin.
+        s.sync.clear(); s.syncSeen.clear(); s.slotParam.clear();
         // Every knob turned in this plugin's own window reaches the running engine at once
         // (all parameters, not just the 8 picked slots). trackId by value: no dangling lane refs.
         const int liveTrackId = t.id;
         s.plugin->setLiveEditHook([liveTrackId](int index, double value) {
             if (pushVstParamLive) pushVstParamLive(liveTrackId, index, value);
         });
+        if (pushVstPickRefresh) pushVstPickRefresh(t.id, t.vstPick);   // a running engine follows the (re-mapped) picks at once
+        if (notifyPluginLoaded) notifyPluginLoaded(t.id);              // the engine applies it now, no 0.5 s wait
     }
     else { s.err = err.empty() ? "could not load that plugin" : err; }
     return ok;
@@ -176,6 +216,8 @@ inline void assign(Track& t, caw::IPlugin& plugin, size_t slot, const caw::Plugi
     while (t.vstPickName.size() < t.vstPick.size()) t.vstPickName.push_back("P" + std::to_string(t.vstPickName.size() + 1));
     while (t.vstInit.size() < t.vstPick.size()) t.vstInit.push_back(0.5);
     const double init = plugin.getParam(p.index);
+    if (slot >= t.vstPick.size())   // a slot left free by a plugin change (-1) or by Clear is reused before a new one is added
+        for (size_t k = 0; k < t.vstPick.size(); ++k) if (t.vstPick[k] < 0) { slot = k; break; }
     if (slot >= t.vstPick.size()) { slot = t.vstPick.size(); t.vstPick.push_back(p.index); t.vstInit.push_back(init); t.vstPickName.push_back(""); }
     else { t.vstPick[slot] = p.index; t.vstInit[slot] = init; }
     t.vstPickName[slot] = laneName(t, p.title, slot);
@@ -324,7 +366,8 @@ inline void drawMappings(Project& proj, Track& t, Slot& s, float scale) {
             ImGui::PushID((int)k); ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0); ImGui::TextColored(ImVec4(1.f, .72f, .30f, 1.f), "P%d", (int)k + 1);
             const bool filled = k < t.vstPick.size();
-            std::string name = filled ? "(parameter unavailable)" : "(empty)";
+            std::string name = !filled ? "(empty)"
+                : t.vstPick[k] < 0 ? "(not in this plugin - pick it again)" : "(parameter unavailable)";
             if (filled) for (const auto& p : params) if (p.index == t.vstPick[k]) { name = p.title; break; }
             ImGui::TableSetColumnIndex(1);
             if (!filled && !bound[k].empty()) {
@@ -384,9 +427,9 @@ inline void drawMappings(Project& proj, Track& t, Slot& s, float scale) {
     if (caw_ui::combo("##audio_out_mode", &om, outLabels, 2)) {
         t.vstOutMode = om == 1 ? 1 : 0;
         t.vstOutMaster = t.vstOutMode == 1;   // keep the legacy field in sync for older builds / save migration
-        if (pushVstOutModeLive) pushVstOutModeLive(t.id, t.vstOutMode);   // live: gates the source clips in the running engine, no Run needed
+        if (pushVstOutModeLive) pushVstOutModeLive(t.id, t.vstOutMode);   // live: flips the source gates + the rack's replace in the running engine, no Run needed
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Master: the VSTe output replaces the source tracks' own master output (their meters go gray).\nMix: the source tracks keep sounding to the master alongside the VSTe (all meters keep their color).\n\nSwitching works while the engine plays.");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Master: the VSTe output replaces the source tracks' own master output (their meters go gray).\nMix: the source tracks keep sounding to the master alongside the VSTe (all meters keep their color).\n\nSwitching works while the engine plays. Inputs can be re-wired while it plays too - no Run needed.");
     ImGui::TextWrapped(t.vstOutMode == 0
         ? "Replace: the source clips' own `out` lines are muted; only the processed VSTe signal reaches the master. Source-track meters are drawn gray."
         : "Mix: the source clips and the VSTe both reach the master. Every meter keeps its default color.");
@@ -421,7 +464,8 @@ inline void drawParameterBrowser(Track& t, Slot& s) {
         const auto& p = *matches[(size_t)row];
         auto it = std::find(t.vstPick.begin(), t.vstPick.end(), p.index);
         bool on = it != t.vstPick.end();
-        const bool full = !on && t.vstPick.size() >= 8;
+        // empty slots (a plugin change left some picks at -1) are always available for a new pick
+        const bool full = !on && (int)std::count_if(t.vstPick.begin(), t.vstPick.end(), [](int v) { return v >= 0; }) >= 8;
         if (full) ImGui::BeginDisabled();
         const std::string label = (on ? "P" + std::to_string((int)(it - t.vstPick.begin()) + 1) + "  " : std::string("     ")) + p.title + "##parameter" + std::to_string(p.index);
         if (ImGui::Checkbox(label.c_str(), &on)) {
@@ -517,12 +561,7 @@ inline void drawWindows(Project& proj) {
                     ImGui::SetCursorScreenPos(ImVec2(rowPos.x + 8.f * scale, rowPos.y + 3.f * scale + ImGui::GetTextLineHeight()));
                     ImGui::TextDisabled("%s", sub.c_str());
                     ImGui::SetCursorScreenPos(ImVec2(rowPos.x, rowPos.y + rowH + ImGui::GetStyle().ItemSpacing.y));
-                    if (pickedRow) {
-                        const bool changed = f != t.vstPath;
-                        if (loadPlugin(s, t, f, proj.cs.sr) && changed) {
-                            s.learn = -1;   // the P1..P8 picks and their start values stay: loading (or reloading) a plugin must not wipe the mapping
-                        }
-                    }
+                    if (pickedRow) loadPlugin(s, t, f, proj.cs.sr);   // picks, names and start values stay: a new plugin matches them by name
                 }
                 if (scanDone && plugins.empty()) ImGui::TextDisabled("No .vst3 found in the standard VST3 folders.");
                 else if (scanDone && visible == 0) ImGui::TextDisabled("No plugins match this type or search.");
@@ -542,7 +581,7 @@ inline void drawWindows(Project& proj) {
                 for (const Clip& c : t.clips)
                     if (c.code.find("note ") != std::string::npos || c.code.find("cc ") != std::string::npos || c.code.find("msg ") != std::string::npos) { hasNoteCode = true; break; }
                 if (!hasNotes && !hasNoteCode)
-                    ImGui::TextColored(ImVec4(1.f, .72f, .30f, 1.f), "This instrument needs notes to make sound: right-click the track > Add MIDI clip (its notes go straight to the plugin - no code clip needed), then draw notes in the MIDI editor and press Play. The VST engine must be running (Run VST button).");
+                    ImGui::TextColored(ImVec4(1.f, .72f, .30f, 1.f), "This instrument needs notes to make sound: right-click the track > Add MIDI clip (its notes go straight to the plugin - no code clip needed), then draw notes in the MIDI editor and press Play. The VST engine must be running (the transport Run button - Run VST when it is the only engine checked).");
             }
             if (!inst) {   // VSTe: the audio inputs - one row per configured input, more can be added
                 ImGui::Spacing();
@@ -570,14 +609,16 @@ inline void drawWindows(Project& proj) {
                     ImGui::SameLine();
                     ImGui::SetNextItemWidth(90.f * scale);
                     int m = in.mode;
-                    if (caw_ui::combo("##in_mode", &m, inModes, 3)) in.mode = std::min(2, std::max(0, m));
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("track = every clip of the named track; clips = the clip with that name; master = the project master mix.\n\nChanging mode or name takes effect on the next Run Csound. On/off works live.");
+                    if (caw_ui::combo("##in_mode", &m, inModes, 3)) { in.mode = std::min(2, std::max(0, m)); if (pushVstWiring) pushVstWiring(); }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("track = every clip of the named track; clips = the clip with that name; master = the project master mix (including the VSTi).\n\nOn/off and a new mode / name are wired at once, with Csound running or with the VST engine - no Run needed. A clip added after Run has no tap yet: Run once for it.");
                     ImGui::SameLine();
                     if (in.mode != 2) {   // track / clips: a name; master needs no name
                         ImGui::SetNextItemWidth(120.f * scale);
                         char nb[96]; std::snprintf(nb, sizeof nb, "%s", in.name.c_str());
                         const char* hint = in.mode == 0 ? "Track name..." : "Clip name...";
-                        if (ImGui::InputTextWithHint("##in_name", hint, nb, sizeof nb)) in.name = nb;
+                        ImGui::InputTextWithHint("##in_name", hint, nb, sizeof nb);
+                        if (in.name != nb) in.name = nb;
+                        if (ImGui::IsItemDeactivatedAfterEdit() && pushVstWiring) pushVstWiring();
                         ImGui::SameLine();
                         if (ImGui::SmallButton("+##in_pick")) ImGui::OpenPopup("vst_in_pick");
                         if (ImGui::BeginPopup("vst_in_pick")) {
@@ -591,14 +632,14 @@ inline void drawWindows(Project& proj) {
                                     const std::string tag = std::string(kindText) + "  (" + sub + ")";
                                     const float tagW = ImGui::CalcTextSize(tag.c_str()).x;
                                     const float leftX = ImGui::GetCursorPosX(), rightX = ImGui::GetContentRegionMax().x;
-                                    if (ImGui::Selectable(o.name.c_str(), o.name == in.name, ImGuiSelectableFlags_None, ImVec2(rightX - leftX, 0.f))) { in.name = o.name; ImGui::CloseCurrentPopup(); }
+                                    if (ImGui::Selectable(o.name.c_str(), o.name == in.name, ImGuiSelectableFlags_None, ImVec2(rightX - leftX, 0.f))) { in.name = o.name; ImGui::CloseCurrentPopup(); if (pushVstWiring) pushVstWiring(); }
                                     ImGui::SameLine(std::max(leftX + ImGui::CalcTextSize(o.name.c_str()).x + ImGui::GetStyle().ItemSpacing.x, rightX - tagW));
                                     ImGui::TextDisabled("%s", tag.c_str());
                                 }
                             } else {
                                 std::set<std::string> seen;
                                 for (const Track& o : proj.tracks) if (o.kind != 1 && o.kind != 2) for (const Clip& c : o.clips)
-                                    if (seen.insert(c.name).second && ImGui::Selectable(c.name.c_str(), c.name == in.name)) { in.name = c.name; ImGui::CloseCurrentPopup(); }
+                                    if (seen.insert(c.name).second && ImGui::Selectable(c.name.c_str(), c.name == in.name)) { in.name = c.name; ImGui::CloseCurrentPopup(); if (pushVstWiring) pushVstWiring(); }
                             }
                             ImGui::EndPopup();
                         }
@@ -619,9 +660,10 @@ inline void drawWindows(Project& proj) {
                                 s.hiddenInputs.erase(i);
                                 break;
                             }
-                        pushInputMaskLive(t);   // an input configured before the last Run works live; a brand-new name needs the next Run
+                        pushInputMaskLive(t);   // the new slot's on/off state
+                        if (pushVstWiring) pushVstWiring();   // its (empty) source is resolved at once
                     }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add another input (up to 8). If its source was already routed on the last Run Csound, the checkbox works live; otherwise press Run Csound again.");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add another input (up to 8). The checkbox works live; the VST engine wires the new input at once, with Csound running press Run Csound again.");
                 }
                 ImGui::SameLine();
                 ImGui::TextDisabled("%d / 8", configured);
@@ -630,6 +672,7 @@ inline void drawWindows(Project& proj) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, .45f, .40f, 1.f));
                 ImGui::TextWrapped("%s", s.err.c_str()); ImGui::PopStyleColor();
             }
+            if (!s.note.empty()) ImGui::TextDisabled("%s", s.note.c_str());
             if (!s.plugin) { ImGui::TextDisabled("Choose a plugin to start."); ImGui::End(); continue; }
             ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
             // Learn keeps running regardless of which pane or tab is visible.

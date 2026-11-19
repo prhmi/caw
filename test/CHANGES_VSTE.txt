@@ -725,3 +725,434 @@ Files: app.cpp, vst_rack.h, vst_solo.h, vst_ui.h.
    Play skips the SC clips and plays the rest (it still stops when SC is the only engine).
    Starting SuperCollider while Run VST alone holds the soundcard now hands the device over
    cleanly (the VST stream closes; SC's stream carries the mix) instead of opening a second one.
+
+ROUND 21 - ONE SOUNDCARD, INDEPENDENT ENGINES, NO HIDDEN DSP
+-----------------------------------------------------------
+The rule now: all engines are tracks of one project on one output, like instruments
+inside a DAW. Stopping / muting / editing one engine never stops, rebuilds or silences
+another - and when nothing sounds, nothing renders.
+
+1. PD + VST together ("when PD is selected, VST solo won't work / VSTi meter missing")
+   - Root cause: muting a PD clip dropped it from the plan, so the plan changed, so the
+     transport was stopped and the PD engine (and its device stream, which also carries
+     the VST mix) was closed and reopened. VST tracks also counted as an "other engine"
+     conflict in the PD plan.
+   - The PD plan now contains EVERY clip with a `muted` flag. M / S is applied live by the
+     scheduler: a muted clip stays loaded but is not started / ticked; its controls are
+     skipped. Nothing is rebuilt, the device stays open, the transport keeps running.
+   - pd_timeline::makePlan(includeMuted) + samePlan / sameInstances; only a different SET
+     of PD clips reloads the PD engine, and even then the transport keeps running on the
+     VST / SC clock and PD rejoins when ready (g_pdResumeAfterReload).
+   - VST tracks (kind 3 / 4) are no longer "other audio" for the PD plan: PD and VST play
+     together; the VST mix flows through the PD stream's shared realtime hook.
+
+2. Live mute / solo never touches the transport
+   - pd_frame_scheduler: Event.muted; render() releases a just-muted voice (gate 0), skips
+     muted voices / controls, and replan() keeps exactly one voice per clip (no growth),
+     copies the live mute and starts an unmuted clip that covers the playhead immediately.
+   - app.cpp: a mute / timing / notes / x-field change is a live replan; the "PD clips
+     changed. Playback stopped" path is gone. A PD plan error now stops only the PD
+     timeline, not the transport or the other engines.
+
+3. One PortAudio host (new caw_audio_host.h)
+   - Pa_Initialize / Pa_Terminate are process global; a stream closing while another
+     engine's stream was open (Stop PD, Stop SC, a device scan during playback) terminated
+     PortAudio under the other engine. Every user (CawAudioOutput, the device scan, the
+     test sound) now takes a reference: init once, terminate only when the last user is
+     gone, serialized. This is the actual "engines affecting each other" fix at the device.
+
+4. No hidden process when nothing sounds ("clips finished / everything muted")
+   - PdDawEngine no longer polls every 10 ms while stopped: the worker parks on a condition
+     variable and is woken by transport() / replan() / stop(). No DSP, no spin.
+   - VstSoloEngine renders only when something can sound: playing with held notes or
+     running clip code, or inside the 2.5 s tail after a stop / live edit (so note-offs are
+     delivered). Otherwise the rack is not processed at all and its peak meters are
+     cleared; the FIFO loop stops at the first silent block. Run VST with no plugin and no
+     transport = zero DSP, and no output stream is opened at all until a plugin is loaded.
+   - The PD scheduler only ticks voices whose window covers the current sample, so a muted
+     or finished clip costs nothing inside libpd.
+
+5. Engine independence
+   - Stopping / losing SuperCollider no longer stops the transport while the VST engine
+     (or PD) can still play; the VST engine gets its own stream back.
+   - Play with an edit made just before pressing it: PD applies the new plan live instead
+     of asking for Run PD again.
+   - In PD mode the VST engine receives MIDI-clip edits and SC automation runs from the PD
+     playhead.
+Files: src/app.cpp, src/pd_timeline.h, src/pd_frame_scheduler.h, src/pd_plan_update.h,
+       src/pd_daw_engine.h, src/vst_solo.h, src/audio_output.h, src/audio_devices.cpp,
+       src/selected_test_sound.h, src/caw_audio_host.h (new).
+
+Build fix (MSVC C2065 in audio_output.h): open() still assigned to PaError "e" after the
+caw_audio_host swap, but the declaration was gone. "e" is now declared where the stream is
+opened. Whole project re-checked with the VST3 configuration (-DCAW_VST3).
+
+Round 22 - M / S never stops the PD engine
+------------------------------------------
+1. Shared engine ("Csound + PD", g_mixedPd): the plan was rebuilt WITHOUT muted clips, so
+   muting the PD track - or soloing any other track - removed those clips from the plan.
+   refreshMixedPdPlan then saw "a different set of PD clips" and did exactly what that branch
+   does: stop the transport, stop all engines and ask for a restart. All three plan builds
+   (Run, the 0.25 s refresh and Play) now include muted clips with the muted flag, so a mute
+   is a live replan of the already loaded PD instances (same scheduler mute path as standalone
+   PD). Files: src/app.cpp (3 call sites).
+2. Standalone PD: the "mixed PD and Csound/VST/SC" rule tested "plan is not empty", and a
+   muted PD clip is still in the plan. Muting the PD track (or soloing another track) in a
+   project that also has Csound/SC clips therefore failed the plan and stopped the PD
+   timeline. The rule now requires at least one AUDIBLE PD clip. File: src/pd_timeline.h.
+Verified: plan harness (PD+Csound track) - solo Csound / mute PD track -> valid plan, clip
+flagged muted; both audible -> the real limitation still reports its error. app.cpp full
+syntax check with -DCAW_VST3.
+
+Round 22b - "mute the PD track, then start the engine"
+-------------------------------------------------------
+PdHostMixer::prepare (the shared Csound + PD engine) copied every clip into the scheduler
+without its muted flag: events.push_back({clipId,start,end}). A track muted BEFORE the engine
+started therefore played anyway until the next plan refresh. The flag is now copied like in
+the standalone engine and in replans. File: src/pd_host_mixer.h.
+
+
+
+Round 22c - "I must load the VST after Start VST, so I lose the mapping each time"
+-------------------------------------------------------------------------------
+Two real defects in the plugin-load path (both only showed up while the engine was being set up):
+
+1. The P1..P8 picks were stored as raw PARAMETER INDICES. An index means a different knob in
+   another plugin, so after picking a .vst3 the slots pointed at unrelated parameters ("(parameter
+   unavailable)", no value slider) - and clip code such as "P1 = uni(lfo(0.2))" started driving
+   whatever parameter sat at that index, including a mute / volume knob. That is the mapping
+   "disappearing" - and it can silence the instrument.
+   loadPlugin now carries the mapping over BY PARAMETER NAME: the titles of the current picks are
+   read from the editor instance that is being replaced; the new plugin receives the parameters
+   with the same title (exact first, then case-insensitive). A pick the new plugin does not report
+   is set to -1: drawn as "(not in this plugin - pick it again)" and never driving a random knob.
+   The panel prints how many picks matched. Free slots count as available in the library and
+   assign() reuses a free slot instead of appending, so re-picking is one click.
+
+2. Picking a plugin reset the mapped start values: after the load the live-sync baselines
+   (s.sync / s.syncSeen / s.slotParam) still held the OLD plugin's values, so on the next frame
+   the new plugin's defaults looked like "the user moved the knob" - vstInit[k] and
+   vstParameterState were overwritten and pushed to the engine. The baselines are cleared on every
+   successful load now, so the values the new plugin really has are the agreed ones.
+   t.vstParameterState is not cleared on a plugin change any more either: the state is keyed by
+   parameter ID and only the IDs the new plugin reports are applied, so the patch survives.
+
+3. The panel loaded the chosen plugin TWICE: autoTried was never set on a combo pick, so the
+   saved-project auto-load ran again on the next frame and rebuilt the editor instance after the
+   user already had it. loadPlugin marks the slot as loaded.
+
+Order no longer matters ("play VST in every situation"):
+
+4. New notifyPluginLoaded hook, fired on every successful load. The app applies the new plugin set
+   on that very frame (vstEngineCheckJobs, past the 0.5 s gate) instead of waiting for the next
+   poll - and when the transport is already playing and Run VST was never pressed, it starts the
+   engine by itself, so a picked .vst3 starts playing immediately.
+
+5. startVstEngine, the 0.5 s reload and the retry share ONE post-load sequence now
+   (vstEngineAfterLoad: clip code, MIDI schedule / transport join, output stream). Each path used
+   to repeat it by hand, which is how "choose it before Run VST" and "choose it after Run VST"
+   could end up in different states.
+
+6. A failed instrument load is retried every 5 s (and at once when the plugin is picked again)
+   instead of never: a transient load failure no longer leaves the engine silent until a
+   Stop / Run VST cycle. New log lines name each step ("the instrument plugins changed -
+   reloading", "could not be loaded - retrying every 5 s", "live picks ... updated").
+Files: src/vst_ui.h, src/app.cpp.
+Verified: full app.cpp syntax check with -DCAW_VST3 (MinGW g++), both trees identical.
+
+
+
+Round 22d - "if I stop and start, the track has no sound until I pick the plugin again"
+-------------------------------------------------------------------------------
+Stop VST destroyed the rack (it was the old stop(): clear() -> every Vst3Plugin destroyed ->
+the SDK PlugProvider destructor runs terminatePlugin()). Run VST then created the SAME .vst3
+again in the same process whose factory had already been initialized - the instrument loaded
+but stayed mute. Picking another plugin and picking the same one back worked because that path
+re-creates the instances through the editor, so it looked like the mapping needed a re-pick.
+
+Stop VST now only stops the sound:
+
+1. VstSoloEngine::stop() keeps the plugin instances loaded. It stops the transport flag and
+   engineOn, sends all-notes-off (pushed on the first block after the next Run VST), clears
+   staged MIDI, scripts, notes, the mirror and the output bus - but keeps the rack, jobsSig_ and
+   activeIds_. jobsSig_ is what start() compares, so Run VST with the same instruments takes
+   the REUSE branch: no clear, no re-init, no terminate/re-create. No DSP meanwhile:
+   renderDue() is false and the dedicated stream is closed.
+
+2. The reuse branch of start() re-pushes each running instance's P1..P8 mapping
+   (rack_.pushPickUpdate), because the mapping can be edited in the panel while the engine is
+   off; it is applied like a live re-pick on the next block.
+
+3. VstSoloEngine::unload() is the old stop() body - the real teardown, used only by:
+   a new project (adoptProject), app exit (appQuitRequested), and the last instrument plugin
+   going away (vstEngineCheckJobs). stopVstEngine(bool unloadPlugins = false) keeps the old
+   signature for the Stop VST button and passes true on those paths.
+
+4. startVstEngine: if the rack is still loaded but the plugin was removed while stopped, it
+   unloads first (nothing to resume); otherwise logs "the plugins stayed loaded - the same
+   instances play again (no reload)". Stop VST logs "the plugins stay loaded - Run VST resumes
+   them".
+
+Everything else from 22c (title-based mapping, notifyPluginLoaded, vstEngineAfterLoad, 5 s
+retry) is unchanged and still runs on the reuse path.
+Files: src/vst_solo.h, src/app.cpp.
+Verified: full app.cpp syntax check with -DCAW_VST3 (MinGW g++), both trees identical.
+
+
+
+Round 23 - VSTi routed into a master-mode VSTe, and the startup engine list
+-------------------------------------------------------------------------------
+A) "when VSTi goes to VSTe the VSTi sound is still there, even with master selected"
+   A VSTe with AUDIO OUTPUT = master (replace) correctly removed the dry output of Csound
+   source clips (the CSD gates their out lines behind cawvstmix_<id>), but a VSTi track is
+   NOT a Csound clip: it renders in CAW's 4th engine and was mixed straight into the master
+   inside VstRack::process(), next to the VSTe's processed output. Nothing suppressed it, so
+   the instrument sounded twice (dry + effect).
+   The effect runs in the Csound-side rack, which reads the instrument from
+   cawVstSoloOutBus(); suppressing inside the 4th engine's stream is impossible (the stream
+   callback zeroes its realtime scratch before the rack pulls it), so the replacement is
+   applied at the mix point of the 4th engine's own rack:
+   - VstRack::setReplacedSources() (UI thread, mutex-guarded snapshot once per block) skips
+     the dry master mix of exactly those jobs; they still render, still meter, and are still
+     published to cawVstSoloOutBus, so the VSTe input is unaffected.
+   - The app pushes the set (app.cpp collectVstReplacedSources / pushVstReplacedSources) from
+     the same jobs the rack got at Run (g_vstRackEffectIds), so a VSTe added after Run does
+     not silence its source; the live out-mode combo and input on/off refresh it immediately.
+   - Offline render runs instruments and effects in ONE rack and never sees the app: init()
+     derives replacedInternal_ from its own jobs (effect, outMode == replace, input engine
+     == VSTi/VSTe) so exports behave identically.
+B) Startup: languages are now categories and everything else can still be coded
+   - Choose-languages dialog: "Programming languages" (Csound, Pure Data, SuperCollider) and
+     "Engines and media" (VST - VSTi and VSTe, Audio - planned). Nothing checked = "score
+     only": no engine is loaded and the dialog says so; Continue is always enabled.
+   - The list only decides what CAW LOADS and what Run starts: Add Csound / SuperCollider /
+     Pure Data track are unconditional (an unchecked engine logs a hint instead).
+   - Run buttons follow the checked list: "Run Csound + VST", "Run Csound + PD + SC + VST",
+     "Run VST" when it is the only engine; a running combined button adds missing engines
+     ("Add SC + VST") and only then turns into "Stop engines".
+   - Status pill lists the checked engines (CS/PD/SC/VST, "score only" when none); Play with a
+     disabled VSTi engine says so instead of silently skipping; Run, offline export and the
+     Csound rack load no VST jobs when VST is unchecked.
+Files: src/vst_rack.h, src/vst_solo.h, src/vst_ui.h, src/app.cpp.
+Verified: full app.cpp syntax check with -DCAW_VST3 (MinGW g++), both trees identical.
+
+
+
+Round 24 - VSTe without Csound, frame-accurate VSTi->VSTe handoff, master input, quiet startup
+-------------------------------------------------------------------------------
+A) "vste doesn't work without a language engine, it should work with the VST engine"
+   The 4th engine (VstSoloEngine) only loaded instrument jobs; effects existed solely in the
+   Csound-side rack, so a VSTe project needed Csound running. Now the VST engine loads ALL VST
+   tracks (instruments AND effects, collectVstEngineJobs): the effects are processed in its
+   rack while Csound is off, and skipped (active-set filter) while Csound runs them in its own
+   rack. The jobs keep the same signature either way, so starting/stopping Csound never
+   reloads the plugins (the round-22d "plugins stay loaded" guarantee holds).
+   - vstSoloActiveIds() drops kind-4 tracks while engineIsUp() - the effect is not processed
+     twice; on stopVstEngine the plugins stay loaded, Run VST resumes them.
+   - Play guard: the VST engine is required when any VSTi exists, or when a VSTe exists and
+     no language engine is up.
+B) "VSTi signal getting crashed into VSTe now"
+   The old cawVstSoloOutBus held ONE latest stereo block. The 4th engine renders in CAW's
+   audio callback, the Csound-side rack pops once per Csound block - different sizes and
+   clocks, so the consumer could pop the same block twice (audible repeats / stutter) or get
+   a stale/silent one. Replaced by one frame ring per instrument (CawVstSoloRings, keyed by
+   Track::id, CAP 65536 stereo frames): the producer pushes the instrument's rendered frames,
+   each consumer pops exactly its own block. Overrun drops the oldest frames, underrun reads
+   as silence - continuous audio, no repeats.
+C) "master in the input VSTe doesn't send the VSTi signal"
+   A master-mode input read only Csound's spout, and a replaced VSTi was excluded from it.
+   Now the master input assembles: spout/fullScale + the published instrument rings + the
+   outputs of replaced instruments, so a VSTe taking "master" hears the VSTi whether Csound
+   is running or not. Same-rack engine-3 inputs read the source plugin's output directly.
+D) Live routing in the VST engine
+   - VstRack::setWiring() applies inputs / routedIn / outMode onto the running jobs in place
+     (no plugin reload); pushed every 0.5 s check and at once by the new UI hook
+     pushVstWiring when an input's mode changes, a name edit ends, a name is picked, or an
+     input row is added.
+   - setInputMasks() / setOutMode() push M / S and output-mode edits live; the replacement
+     rule is derived per block from the effect jobs themselves (plus the app's pushed set for
+     effects held by the Csound rack), so master/mix switching takes effect immediately.
+   - Tooltips now state that mode/name changes are wired at once by the VST engine, and that
+     a Run is only needed for the Csound-side routing.
+E) Startup dialog simplified
+   One-line title ("What does this session use?") and plain names only: Csound, Pure Data,
+   SuperCollider, VST, Audio - no per-entry explanations, no "experimental" / "live" tags.
+Files: src/vst_job.h, src/vst_rack.h, src/vst_solo.h, src/vst_ui.h, src/app.cpp.
+Verified: full app.cpp syntax check with -DCAW_VST3 (MinGW g++), both trees identical.
+
+Round 25 - VSTi silenced while Csound runs; what a VSTe can hear in the VST engine
+-------------------------------------------------------------------------------
+A) "VSTi with csound (or other) doesn't sound at all"
+   Round 24 derived the "this VSTi is replaced by a master-mode VSTe" set from the LIVE project,
+   but the Csound-side rack only knows the wiring it received at Run. Wire (or re-name) an effect
+   input after Run and the app muted the VSTi while the effect had no audio: silence on both
+   sides. The replacement set now comes from the exact jobs the Csound rack got (g_vstRackJobs,
+   stored at Run), with the live output mode, input on/off, mute / solo and track existence
+   applied; a muted or unsoloed VSTe replaces nothing. It is re-pushed on mute / solo changes and
+   when Csound stops, so the VSTi comes back the moment the rack is gone.
+B) "VSTe still doesn't work with VST engine"
+   First: the executable that was tested (build/Release/caw.exe in 43_startup_1, 07:45) was built
+   from PRE-round-24 sources - the VST engine in it never loaded effects at all. Rebuild from
+   these sources. On top of that:
+   - the 4th engine now receives CAW's SuperCollider ring (VstEngineAudio passed to start()), so
+     a VSTe wired to the SuperCollider mix processes audio in the VST engine too;
+   - when the effects run in the VST engine, the console lists every VSTe and exactly what it can
+     hear there, and warns when an input is a Csound / Pure Data track (they only flow while
+     Csound runs). No input enabled is reported as "nothing to process" instead of silence.
+Files: src/app.cpp, src/vst_solo.h.
+Verified: full app.cpp syntax check with -DCAW_VST3 (MinGW g++), both trees identical.
+
+Round 26 - One VST graph: VSTi and VSTe inside the Csound engine (root rebuild)
+-------------------------------------------------------------------------------
+A) Root cause of "VSTi with Csound doesn't sound" and "VSTe still doesn't work with VST engine"
+   The VST world was split in two: instruments rendered in CAW's 4th engine (app-side, 512-frame
+   blocks), effects in the Csound-side rack; the two were stitched together through lossy rings,
+   an app-side "replaced sources" set and two different clocks. Instruments were therefore never
+   loaded in the engine that actually ran while Csound played, and the Play path explicitly threw
+   the MIDI-clip note rows away for the app to schedule - so a VSTi hosted by Csound was silent.
+   No patch on that split could be reliable: the pieces had different block sizes and ownership.
+B) The new architecture - one graph per audio host, like a DAW
+   - While Csound runs, ITS rack (src/vst_rack.h in the engine thread) loads the WHOLE VST graph:
+     instruments AND effects, in one plugin set. It processes them in track order, instruments
+     first, so a VSTi feeds a VSTe in the SAME block; every plugin output is mixed straight into
+     the Csound spout, and a master-mode VSTe replaces its source inside the same rack (the
+     replacement rule is derived per block from the effect jobs - no pushed set, nothing stale).
+   - One clock: the Csound score already turns every MIDI clip of a VSTi track into a
+     CawVstNote_<id> event; that helper writes the note into cawvst_<id>_wr/tab and the rack plays
+     it on the Csound block clock (ksmps) - the same transport, loop and seek as the Csound clips.
+   - commandPlayFrom now sends those note rows as type 14 to the hosting engine instead of
+     skipping them (they used to be reserved for the 4th engine). Code notes (note / cc / msg)
+     keep flowing through Csound -> ring -> plugin.
+   - Live M / S gates the ring and sends all-notes-off on a transition; live P1..P8 overrides,
+     input on/off masks and out-mode keep working unchanged on the loaded instances.
+   - The lane meters of VST tracks are now published by the engine's rack (takeVstPeaks) while
+     Csound hosts.
+   - While Csound hosts, CAW's 4th engine stays up but renders nothing (g_vstHostedInCsound), so
+     exactly one rack processes and there is no cross-engine ring left. Without Csound, the 4th
+     engine is the host of the same graph, exactly as before.
+   - Removed for good: CawVstSoloRings (the cross-rack rings), the instrument forwarder in the
+     Csound runner, setReplacedSources / the replaced-source policing, and the duplicate
+     note schedule that briefly existed in the rack.
+Files: src/app.cpp, src/vst_job.h, src/vst_rack.h, src/vst_solo.h,
+       src/csound_api_runner.h, src/csound_api_runner.cpp.
+Verified: src/csound_api_runner.cpp + src/app.cpp syntax check with -DCAW_VST3 (MinGW g++),
+       exit 0. MSVC build + audio behaviour not testable in this environment - the console
+       shows "CAW engine build: 38_one_rack_26 (one VST graph in the engine)".
+
+Round 27 - Live VSTe wiring + live plugin reload inside the Csound rack (root fix)
+-------------------------------------------------------------------------------
+A) Root causes of the four symptoms
+   1) "effects do nothing" / "sound still comes from the VSTi track":
+      the Csound-hosted rack only knew the ONE wiring it received at Run. Its effect inputs were
+      named control channels (cawvstin_<id>_<line>) that the CSD mixed into from clips at build
+      time, and no live path existed into that rack: vstui::pushVstWiring only updated the 4th
+      engine, the hooks were not even wired unless Run VST had been pressed, and a race between
+      the VSTi (instrument) and the VSTe (effect) in track order meant the effect could read an
+      empty buffer on the block it was wired. Wiring an effect after Run therefore did nothing,
+      and a master-mode effect never silenced the VSTi source it was supposed to replace.
+   2) "mix sounds crazy": mixed mode added both the source and a VSTe input that was one
+      stale/duplicated signal (input lines were packed from absolute line indices, with the
+      CSD-side sends fixed for the run), so the effect processed the wrong material.
+   3) "changing the vst plugin silences it until the track is deleted and re-created":
+      the rack's job set was read once, at Run. A .vst3 change was forwarded only to the 4th
+      engine (notifyPluginLoaded returned early for anything that was not a VSTi), so the Csound
+      rack kept a dead/old instance while the app believed the new one was live.
+B) The fix - one live graph, DAW-style buses
+   - Per-clip named taps: the CSD publishes every Csound clip's output as the audio channel
+     cawtap_<clip>_<ch> (chnmix next to the existing gaCawT meter taps, so taps stay OUTSIDE the
+     out-gates). The rack resolves them by name every block, reads them into the VSTe inputs and
+     clears them after the pass. A re-wire is just a new name list - no CSD rebuild.
+   - Live job push: VstRack::queueJobs + applyPendingJobs at the top of process(). Same track
+     ids and .vst3 => only the wiring (inputs, routedIn, AUDIO OUTPUT) is re-pointed; a changed
+     track / plugin => the plugins are reloaded on the engine thread (parameter state re-applied,
+     note bridge re-resolved) with "... VST graph changed: reloading the plugins live (no Run
+     needed)." in the console.
+   - CsoundApiRunner::setVstWiring(jobs) - the UI thread hands the current project jobs to the
+     running rack; the runner also keeps them for a Run that is being started, and the rack is
+     now initialized even with zero VST tracks so a track added later can be loaded live.
+   - Source gates, live: every clip now carries one gate per VSTe track,
+     cawvstmix_<clip>_<vstId> (0 = the clip reaches the master, 1 = that master-mode effect
+     replaces it). The app owns the values (Run, export, wiring / AUDIO OUTPUT / M-S / input
+     on/off changes) and writes them into the running Csound; the default of a missing channel is
+     0 = audible, so nothing can ever be muted by accident.
+   - Dependency order: the rack sorts instruments first, then runs a dependency DFS, so a VSTe
+     always runs AFTER the VSTi / effect it reads - the same block, no half-block of silence.
+   - UI hooks are wired at Run (wireVstUiHooks) even when Run VST was never pressed, so input
+     mode / name changes, AUDIO OUTPUT and plugin changes all reach the Csound rack.
+   - notifyPluginLoaded now handles VSTe tracks too and pushes the new job set to the Csound rack
+     immediately (the 4th engine keeps its own reload path).
+   - At Run every VST track is loaded whatever its mute / solo state (M / S are live), so a muted
+     track comes back without a Run.
+   - Console: "CAW engine build: 39_one_rack_27 (one VST graph in the engine; live wiring)."
+C) What to look for when testing
+   - At Run: "VSTe \"name\" inputs: in1: ... (Csound clip taps, 2 ch)" / "(VST output)".
+   - While playing, change an input mode/name: the effect picks it up on the next block; no Run.
+   - Change a plugin in the panel: "... VST graph changed: reloading the plugins live (no Run
+     needed)." and the new plugin sounds without deleting the track.
+   - AUDIO OUTPUT Master: the source track's meter stays live but only the VSTe reaches the
+     output; Mix: both sound once.
+   Note: a clip added AFTER Run has no cawtap channel yet - its VSTe input stays silent until
+   the next Run (the console hint says so). Existing clips (the normal case) re-wire live.
+Files: src/vst_job.h, src/csd_builder.h, src/csd_builder.cpp, src/vst_rack.h,
+       src/csound_api_runner.h, src/csound_api_runner.cpp, src/app.cpp, src/vst_ui.h.
+Verified: src/csound_api_runner.cpp + src/app.cpp + src/csd_builder.cpp syntax check with
+       -DCAW_VST3 (MinGW g++), exit 0. MSVC build + audio behaviour not testable in this
+       environment.
+
+Round 28 - Plugin picks load OFF the audio thread (the "whole VST sound turns off" root fix)
+-------------------------------------------------------------------------------
+A) Root cause
+   Round 27 reloaded the plugin graph synchronously on the engine thread - the thread that
+   produces audio into the soundcard. notifyPluginLoaded -> setVstWiring -> applyPendingJobs ->
+   VstRack::load() ran unloadAll() + every load()/prepare() inline in the middle of audio
+   production, then process() continued. One plugin that takes a while (sample libraries), blocks
+   (dialog, network, modelines) or throws while loading therefore:
+     - stalled the producer (AudioOutput::push waits 20 ms per retry; at 48 kHz a 40 ms block is
+       only 0.8 s of headroom) -> underruns / the engine clock hiccups,
+     - or threw out of the rack: the runner catches it and sets status = -1 -> the whole engine
+       (Csound + every VST) stops with "VST processing failed.",
+   and because the reload was unloadAll + recreate EVERYTHING, every other track lost its plugin
+   instance and its held voices too - the familiar "everything goes mute, delete the track and
+   re-create it" symptom.
+B) The fix - a loader thread, an instance registry, adopt-by-swap
+   - VstRack now keeps an INSTANCE REGISTRY (insts_: track id -> loaded plugin) that outlives
+     every graph. queueJobs() compares a load signature (id|path|kind). Same signature = wiring
+     only (setWiring, as in Round 27). Different = the request goes to a background loader.
+   - The loader thread (own COM apartment here; the old OleInitialize-only trick is now local to
+     it) builds the new graph: it REUSES every instance whose (track, .vst3, kind) still matches
+     and creates ONLY the new / changed plugin. Every create / load / parameter restore /
+     prepare() is wrapped in try/catch: a failing plugin only drops its own track ("that track
+     stays silent"), the previous graph keeps playing and the engine stays up.
+   - Graphs are immutable shared_ptr snapshots. The loader publishes the finished graph; the
+     audio thread adopts it at the top of a block with a pointer swap (no load, no destroy on
+     the audio path). The old graph is retired to a graves list and destroyed by the LOADER
+     thread - a plugin destructor can never run inside the callback.
+   - The MIDI note ring continues across a rebuild: each instance carries the audio thread's
+     read position (Inst::wr); a reused instance resumes there, a brand-new instance starts at
+     the ring HEAD so notes it never saw are not re-fired.
+   - Csound channels (P1..P8, wr, tab) are resolved lazily on the engine thread
+     (resolveChans), never on the loader thread; a P slot picked while the engine runs resolves
+     on the next block, and a live pick invalidates the cached pointers for that track only.
+   - The rack's log lambda is now a mutex-protected relay drained by the engine thread (the
+     console queue is single-producer SPSC), so loader-thread lines show up in order.
+   - VstSoloEngine::start() no longer calls rack_.clear() on a signature change: rack init()
+     reuses matching instances (the 4th engine gets the same "only the picked plugin is
+     created" behaviour), and Stop / Run VST keeps holding the exact same instances.
+   - Init's synchronous build is serialized with the loader (loaderLifeMutex_), so a wiring push
+     that lands while a Run is loading plugins cannot build a second graph concurrently.
+   - Console: "CAW engine build: 39_one_rack_28 (one VST graph in the engine; plugin changes load
+     off the audio thread)."
+C) What to look for when testing
+   - While playing, pick / change a plugin: the transport keeps running, the other tracks keep
+     sounding, and the console prints "[caw] VST graph reloaded live (no Run needed); every
+     track kept its plugin instance." (plus one "VST track \"name\" loaded (...)" line for the
+     picked plugin only).
+   - Pick a plugin while stopped, then Run: same line set, no engine restart.
+   - A plugin that fails to load prints "the plugin threw while loading ... - that track stays
+     silent." and DOES NOT stop the other tracks or the engine.
+   - Stop VST / Run VST and Stop / Run (Csound): no plugin is re-created (the "VST engine: the
+     plugins stayed loaded" line still applies), held notes never replay.
+Files: src/vst_rack.h, src/vst_solo.h, src/csound_api_runner.cpp.
+Verified: src/vst_rack.h (with and without -DCAW_VST3), src/vst_solo.h,
+       src/csound_api_runner.cpp and src/app.cpp syntax check with -DCAW_VST3 (MinGW g++),
+       exit 0. MSVC build + audio behaviour not testable in this environment.
