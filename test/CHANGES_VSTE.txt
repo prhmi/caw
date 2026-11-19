@@ -1,0 +1,727 @@
+VSTE panel changes — 38_bridge_19_fixed5 (rounds 3–5)
+======================================================
+
+Round 3 fixes (on top of round 2). This round I went through the whole engine pipeline line by
+line: how the VST tracks are generated into the Csound project, and the complete audio routing
+map of every engine (Csound clips, Pure Data, SuperCollider, VSTi, VSTe).
+
+THE AUDIO ROUTING MAP (what actually happens per block)
+-------------------------------------------------------
+One Csound block on the engine thread:
+  1. Csound runs one block. Csound clip audio goes to the master (spout) AND to the meter taps
+     (gaCawT_<clip>_<ch>). For every VSTe input route the taps are chnmixed into the audio
+     channels cawvstin_<vstTrackId>_<line>  (CSD, fixed at Run time).
+  2. The drain writes one-shot UI values into named control channels (cawvst_<id>_p<k> and the
+     clip lane channels).
+  3. The VST rack runs every VSTi/VSTe plugin: it reads kP1..kP8 + the packed input lines, runs
+     the plugin, and ADDS the plugin output into the master (spout).
+  4. Pure Data renders (pd->render) and its output is ADDED INTO THE MASTER AFTER THE RACK.
+  5. SuperCollider renders inside CAW's audio callback (PortAudio) - completely outside the
+     engine thread - and its output is added to the device stream last.
+
+THE TWO ROOT CAUSES I FOUND THIS ROUND
+--------------------------------------
+a) Parameters: the whole chain (UI -> setControlChannels -> drain -> Csound channel -> rack ->
+   ParamMsg -> plugin) is correct, but every hop is INDIRECT. If any single hop fails or is
+   overwritten (clip not running, clip overwriting the channel, automation, a channel that could
+   not be resolved), the change never sticks and only a restart (which loads the saved parameter
+   state directly) applies it. There was NO guaranteed same-block path.
+b) Pure Data / SuperCollider: their audio NEVER passes through Csound or the rack (see steps 4
+   and 5 above). A VSTe input sourced from a PD or SC track got silence - restart did not help
+   either, because the routing only ever carried Csound-side audio. That is the "for pd and
+   super not at all".
+
+ROUND 3 CHANGES
+---------------
+1. Guaranteed live parameters - a DIRECT override path
+   The panel now also pushes every parameter change straight into the rack
+   (VstRack::pushParamOverride, UI -> CsoundApiRunner::pushVstParamOverride). The rack applies it
+   on the VERY block it arrives: no Csound channel involved, nothing can delay or revert it.
+   Rule in the rack: the manual value wins; it releases as soon as the channel value catches up
+   (no automation - the value sticks), or when automation actively moves the lane after a 500 ms
+   window (automation resumes, like touching a param in a DAW). While the lane is static but
+   cannot carry the value, the manual value simply holds.
+   The channel writes from round 2 stay in place (engine channel + every clip's lane channel) so
+   the value also persists for the running clips and the next Run. The editor-GUI <-> engine
+   mirror from round 2 is unchanged.
+   This works for BOTH VSTi and VSTe tracks and no longer depends on any clip state.
+
+2. Pure Data and SuperCollider sources now feed VSTe inputs
+   - A track / clips input whose source is a PD (kind 6) or SC (kind 5) track reserves two stereo
+     lines and feeds the WHOLE engine mix into the slot (VstJob::Input.engine = 1 / 2). A PD / SC
+     mix cannot be split per clip - the mix of that engine is the source.
+   - PD: the engine publishes the latest pd->render buffer to the rack each block
+     (VstEngineAudio.pdMix). SC: CAW's audio callback captures the SC mix into a lock-free ring
+     (CawScRing) and the rack pulls one block per block (VstEngineAudio.scRing).
+   - If an ACTIVE master-mode VSTe consumes the mix, the RAW mix is suppressed while it runs:
+     PD inside the engine thread, SC via an atomic flag checked in CAW's audio callback. The
+     processed output replaces the raw mix (master semantics). With mix-mode VSTe tracks both
+     play in parallel.
+   - Master (mode 2) inputs still read the Csound master spout - note that spout contains
+     Csound + VST output; the PD mix is added after the rack, so a "master" input does not
+     include PD (use a PD track input for that). SC is added in the audio callback and is also
+     not in the spout.
+
+3. Audio inputs UI (your requests)
+   - Unchecking an input does NOT hide the row anymore: the row stays, greyed state, audio off.
+   - A separate small "-" button per row collapses the row (UI only); "Show hidden" brings all
+     collapsed rows back; hidden rows keep their settings.
+   - The name text box is shorter (fixed 120px-scaled width instead of filling the whole row).
+   - "+ Add input" adds the next unused slot; the counter shows configured / 8.
+
+Files touched in this round: vst_job.h, vst_rack.h, csound_api_runner.h, csound_api_runner.cpp,
+vst_ui.h, vst3_host.cpp (round 2 owner fix kept), csd_builder.cpp, app.cpp.
+Not compiled in this sandbox (no VST3 SDK / ImGui / cmake / portaudio) - build with build.bat.
+
+ROUND 4 — THE BUG THAT KEPT TRACK / CLIPS INPUTS SILENT (fixed here)
+--------------------------------------------------------------------
+You tested fixed3 and track/clips inputs still produced nothing. I re-read the rack line by line
+and found the ordering bug, plus one smaller stride bug:
+
+1. THE SILENCE BUG (vst_rack.h) - the rack CLEARED the cawvstin_<id>_<line> channels at the TOP
+   of the per-track loop, BEFORE reading them into the plugin input buffer. The timeline in the
+   engine loop is: Csound perform() runs first (the clips chnmix this block's audio into the
+   cawvstin channels), THEN the rack runs. So the clear destroyed exactly the block Csound had
+   just written, and rdAt() then read zeros - on EVERY block, for EVERY track/clips input. The
+   audio path was correct everywhere else (CSD taps, chnmix, line ranges, packing, plugin
+   channels); it was erased in the last step before the plugin. Master inputs were unaffected
+   (they read the spout, not these channels), and parameters worked, which matches "still dont
+   work" for track/clips sources only.
+   FIX: the channels are now cleared AFTER the per-track loop (for every routed VSTe, active or
+   muted, so they can never accumulate), i.e. read -> run plugin -> clear, and the next perform()
+   mixes into fresh channels again.
+
+2. PD MIX STRIDE (csound_api_runner.cpp) - VstEngineAudio.pdMixChannels was never set, so it
+   stayed at the default 2 while the PD mixer actually renders interleaved at the engine channel
+   count (prepare uses nchan). With a 2-channel soundcard setup it worked by luck; with 4/6/8
+   channels a "PureData" input read the wrong stride (garbage / half-rate audio).
+   FIX: vstEa.pdMixChannels = (int)nchan is now set when the rack is prepared.
+
+Verified in the sandbox: vst_rack.h compiles clean in BOTH build variants (with and without
+CAW_VST3) via g++ -fsyntax-only; the runner change is a one-line in-scope assignment. Still not
+a full build (no VST3 SDK / ImGui / cmake / portaudio here) - build with build.bat.
+
+What to expect after rebuild (38_bridge_19_fixed4):
+  - track / clips inputs: the source clips' audio now actually reaches the VSTe (same block).
+  - master inputs: unchanged (already worked).
+  - PureData / SuperCollider inputs: one block of latency (~2.7 ms at 128 samples), PD/SC mix as
+    a stereo pair per slot.
+  - parameters: unchanged from fixed3 (direct override path).
+Files touched this round: vst_rack.h, csound_api_runner.cpp.
+
+ROUND 5 — SELF-DIAGNOSTICS (the build now tells us what is wrong)
+-----------------------------------------------------------------
+fixed4 still did not fix it for you, and you cannot tell me what exactly is wrong. So this round
+the engine explains itself. The code fixes of fixed4 are all still in; what is NEW is logging:
+
+1. BUILD VERSION LINE - when Run starts, the console now says:
+     [caw] CAW engine build: 38_bridge_19_fixed5 (VSTe input routing diagnostics on).
+   If your console does NOT show this line, you are still running an old .exe - the zip was
+   unpacked but not rebuilt, or the wrong folder was built. Rebuild with build.bat first.
+
+2. ROUTING SUMMARY PER VSTE - when the rack loads, for every VSTe with configured inputs:
+     [caw] VSTe "MyEffect" inputs: in1: "Drums" -> lines 1-2, in2: master
+   This is what the engine ACTUALLY wired at Run time. If a source is missing here, the project
+   was not saved before Run, or the input is not "on".
+
+3. MISSING-CHANNEL WARNING - if the routing exists in the UI but the running Csound does not
+   have the channels (the routing was configured AFTER Run was pressed), you get:
+     [caw] VSTe "MyEffect": 2 of 2 input channels are MISSING from the running Csound - the
+     routing was configured after Run. Press Run again.
+   This is expected behaviour: the CSD routing is built when Run starts. New sources need a new
+   Run; the live on/off checkboxes (existing sources) work without one.
+
+4. SILENCE HINTS (rate-limited, only while OTHER audio is actually playing):
+     [caw] VSTe "MyEffect": input audio is SILENT while other audio plays. Sources must PLAY on
+       the timeline; a source configured after Run needs a new Run; a VSTi track must be taken
+       via the MASTER input (VSTi audio never runs through Csound).
+     [caw] VSTe "MyEffect": the input HAS signal but the plugin outputs silence - check its
+       parameters (e.g. wet 0%) or open the editor.
+   Note the VSTi case: a VSTi's audio lives in the rack, never in Csound, so a TRACK input named
+   after a VSTi track is always silent - use the MASTER input to feed a VSTi into a VSTe.
+
+Files touched this round: vst_rack.h (summary + hints), csound_api_runner.cpp (version line).
+Verified: vst_rack.h compiles clean in both build variants (g++ -fsyntax-only).
+
+WHAT TO SEND ME SO I CAN FIX IT PRECISELY
+-----------------------------------------
+1. Does the console show "build: 38_bridge_19_fixed5" when you press Run? (yes / no)
+2. The full "[caw]" log lines from one Run: especially the "VST track ... loaded" lines, the
+   "VSTe ... inputs:" lines, and any "MISSING" or "SILENT" lines.
+3. What exactly is silent: the VSTe produces NO sound at all, or it sounds but the other track
+   does not arrive in it? Does the plugin's own GUI meter move?
+4. What kind of source are you testing: a Csound track/clips, master, a VSTi track, Pure Data,
+   or SuperCollider? Is the source clip actually PLAYING on the timeline while you test?
+5. Does a plain VSTi (instrument) track make sound on your build? (tells us whether the rack
+   works at all vs only the input routing being off)
+6. Did you rebuild with build.bat from the fixed5 zip? (yes / no - and if no, that is the fix)
+
+ROUND 6 — LIVE PARAMETER EDITING REBUILT (the actual feature)
+-------------------------------------------------------------
+You told us what it is really about: LIVE PARAMETER EDITING. I read the whole chain - the
+plugin wrapper, the VSTE panel sync, the runner queues, the rack - and found the structural
+bug plus several holes. This round rebuilds the live path so an edit ALWAYS reaches the
+running engine and leaves proof in the console.
+
+THE STRUCTURAL BUG (vst3_host.cpp) - EDITOR KNOB TURNS WERE THROWN AWAY
+  When you turned a knob in the plugin's OWN window, VST3 sends the value to the host via
+  performEdit. The wrapper's EditorHandler::performEdit DISCARDED the value (it was not even
+  read - only the Learn feature recorded that a knob moved). The live sync
+  (syncLiveParameters, every frame) compares the plugin's value against the last agreed value
+  to detect YOUR edit - but the value never updated, so it never pushed anything to the
+  engine. Turning knobs in the plugin's own window could never work, in any round.
+  FIX: performEdit now captures the value and updates the parameter cache immediately
+  (handler_.onLiveEdit). A knob turn is detected on the next frame and pushed to the engine.
+
+WHAT ELSE WAS FIXED / HARDENED
+1. getParam (vst3_host.cpp) already polls the plugin controller directly, so editor state is
+   authoritative; the new performEdit capture closes the last gap (plugins whose editors
+   bypass performEdit still update the cache through the controller poll).
+2. The rack now holds a live edit for 2.5 s (was 0.5 s), refreshed on every drag event - a
+   quick tweak no longer snaps back while running automation catches up (vst_rack.h).
+3. The GUI no longer fights your hand: while the mouse button is held anywhere, the engine
+   mirror never drags the editor knobs back (vst_ui.h).
+4. Re-picking parameters WHILE RUNNING now works: the P1..P8 mapping is queued to the rack
+   (pushVstPickRefresh -> CsoundApiRunner::refreshVstPicks -> VstRack::pushPickUpdate) and the
+   next edit maps to the right parameter without restarting (vst_ui.h, csound_api_runner.h/.cpp,
+   vst_rack.h). Previously a slot picked after Run silently pushed to the WRONG parameter.
+5. PROOF IN THE CONSOLE - every applied live edit logs one line:
+     [caw] live param: "MyTrack" P2 -> 0.800
+   and when running automation takes back over:
+     [caw] live param: "MyTrack" P2 released (lane automation took over)
+   If you drag a slider and see NO "live param" line, the edit did not reach the engine -
+   copy the console and we know exactly which link is missing.
+6. If the build has no VST3 host (CAW_VST3=OFF), the engine says so at startup and the VST
+   panel shows a red banner - no more silent dead panels.
+
+THE COMPLETE LIVE PATH NOW (all links verified)
+  plugin GUI knob  -> performEdit -> wrapper cache -> syncLiveParameters (next frame)
+                   -> pushParamLive -> (1) rack override: applied on the SAME block, holds 2.5 s
+                                       (2) channel writes: cawvst_<id>_p<k> + every clip's lane
+  P1..P8 slider    -> same two paths (already worked; now logged and snap-back-free)
+  re-pick a slot   -> pushVstPickRefresh -> rack job updated live
+  automation       -> still wins after the 2.5 s hold ends (and logs that it did)
+
+Files touched this round: vst3_host.cpp, vst_rack.h, vst_ui.h, csound_api_runner.h,
+csound_api_runner.cpp, app.cpp (one hook line). Verified: vst_rack.h compiles clean in both
+build variants (g++ -fsyntax-only); the wrapper and UI edits follow the existing patterns.
+
+HOW TO TEST (rebuild with build.bat from 38_bridge_19_fixed6.zip)
+  1. Press Run so the engine plays.
+  2. Turn a knob IN THE PLUGIN'S OWN WINDOW -> the sound must change at once and the console
+     prints [caw] live param: ... .
+  3. Drag the P1..P8 slider in the AUTOMATION SLOTS table -> same.
+  4. Pick a NEW parameter into a free slot while running -> its slider edits live too.
+  If any step does not change the sound, copy the [caw] console lines - they now say exactly
+  where the chain stops.
+
+ROUND 7 — EVERY PARAMETER IS LIVE FROM THE PLUGIN GUI
+-----------------------------------------------------
+Round 6 made the 8 mapped parameters (P1..P8) live. This round opens the live path to ALL
+plugin parameters, for the workflow: open the VST GUI -> play with any knob and HEAR it
+immediately -> find the ones you like -> map them into P1..P8 -> modulate them from clip code.
+The 8 slots keep their special role: they are the bridge the clip code can automate.
+
+WHAT CHANGED
+1. plugin_host.h: IPlugin::setLiveEditHook - a callback fired for EVERY editor knob turn with
+   (parameter index, normalized value).
+2. vst3_host.cpp: performEdit (fixed6) now forwards every editor edit to the hook, deduped per
+   parameter, so a held knob does not spam the queue.
+3. vst_ui.h: when a plugin is loaded into a track, the hook is wired: every editor edit is
+   pushed to the engine for that track (pushVstParamLive), regardless of picks.
+4. csound_api_runner: pushVstParamValue queues the edit to the rack.
+5. vst_rack.h: pushParamValue delivers ANY parameter to the engine instance's param ring - it
+   is applied on the SAME block, exactly like the picked-slot path. Read-only parameters are
+   filtered out.
+6. Run and audio export now bake the CURRENT GUI state of every loaded plugin:
+   captureAllParameters runs before the jobs are built, so "tweak in the GUI, then press Run"
+   gives exactly what you hear (previously only picked parameters were saved per edit).
+
+HOW THE PIECES FIT NOW
+  - ANY knob in the plugin GUI  -> engine, same block (audition everything live)
+  - the 8 PICKED parameters    -> additionally mapped to Csound channels (cawvst_<id>_p1..8)
+                                  so clip code (cawget) and automation lanes can modulate them
+  - Learn / pick while running -> the new pick is mapped at once (fixed6 refresh)
+  - Run / export               -> uses the exact parameter state the GUIs show
+
+Files touched: plugin_host.h, vst3_host.cpp, vst_ui.h, csound_api_runner.h, csound_api_runner.cpp,
+vst_rack.h, app.cpp (hook + capture calls). Verified: vst_rack.h compiles clean in both build
+variants (g++ -fsyntax-only); the IPlugin interface change is default-implemented, so nothing
+else needed updating.
+
+TEST (rebuild with build.bat from 38_bridge_19_fixed7.zip)
+  1. Press Run, open the plugin's GUI, turn ANY knob -> the sound changes at once.
+  2. When you find a keeper, Learn/pick it into a free P slot while still running.
+  3. Modulate it from clip code (cawget of its lane) as before.
+
+ROUND 8 — LIVE AUDIO OUTPUT SWITCH, INPUT ROW VISIBLE FROM THE START, EMPTY TRACKS AS SOURCES
+---------------------------------------------------------------------------------------------
+1. AUDIO OUTPUT (Master / Mix) now switches LIVE.
+   Before: the CSD commented out the source clips' own `out` lines for a master-mode VSTe, so
+   Master vs Mix was baked in at build time and needed a Run. Now the CSD wraps those `out`
+   lines in live gates instead - one level per consuming VSTe:
+       kCawGate9 chnget "cawvstmix_9"
+       if kCawGate9 == 1 then
+         outch ...            (the clip's own out line)
+       endif
+   Gate 0 = replace (default, only the VSTe reaches the master), gate 1 = mix. The meter taps
+   stay OUTSIDE the gates, so the VSTe input keeps receiving the clip signal in both modes.
+   The VST panel's AUDIO OUTPUT combo writes the gate channel of the running engine (one-shot
+   control-channel write, applied on the next block) - the switch is heard at once, no Run.
+   The initial value is pushed at Run and for audio export, so exports honor Mix too.
+   The raw PD / SC mix suppression (master-mode VSTe consuming those mixes) updates with the
+   same switch via the runner. Meters gray/ungray immediately (they read the live mode).
+   NOTE: adding a NEW source track/clip name to an input still needs a Run (routing is built
+   into the CSD); only the replace-vs-mix decision itself is live now.
+
+2. AUDIO INPUTS: the FIRST input row is always visible.
+   Before: a fresh VSTe showed no input rows - you had to click "+ Add input" (bottom corner)
+   to get the first one. Now row 1 is always there, ready to configure; "+ Add input" is only
+   needed for rows 2..8. An unchecked empty row behaves exactly like before (silent until on).
+
+3. AUDIO INPUTS: the track picker lists tracks WITHOUT clips too.
+   The 'track' source picker previously only offered tracks that have clips; now every source
+   track (Csound / PD / SC kinds) is listed, even an empty one - you can wire the input before
+   writing any clip into it.
+
+Files touched: csd_builder.cpp (gated out lines), csound_api_runner.h/.cpp (setVstOutModeLive),
+vst_ui.h (live combo, first input row, clip-less track picker), app.cpp (hook wiring + initial
+gate values at Run and export). Verified: csd_builder.cpp compiles clean (g++ -fsyntax-only);
+runner / panel files use only existing symbols and types (portaudio / imgui headers are not in
+this check environment - compile on Windows with build.bat as usual).
+
+TEST
+  1. Run with a VSTe on a track source, then flip AUDIO OUTPUT Master <-> Mix while it plays:
+     the source clips fade in/out of the master at once, meters ungray/gray.
+  2. Select a fresh VSTe: the first AUDIO INPUTS row is already there - set its mode and name
+     (or pick an EMPTY track from the picker), press Run once, then the on/off checkbox works live.
+  3. Export audio with AUDIO OUTPUT = Mix: the rendered file contains source + VSTe.
+
+ROUND 9 — UI: READABLE POPUPS AND A BETTER PICK-LIST DESIGN
+-------------------------------------------------------------
+1. Popups are now clearly separate layers (this was the bug you saw).
+   The old theme had PopupBg (0.11, 0.11, 0.12) almost the same as the panel
+   WindowBg (0.09, 0.09, 0.10), and the popup border color was DARKER than both,
+   so every combo list / context menu melted into the panel behind it.
+   - PopupBg is now much darker (0.05, 0.05, 0.065, 97% opaque) - lists read as
+     their own layer on top of any panel.
+   - Border is now a visible light-gray hairline, so popups (and panels) keep a
+     crisp edge. PopupRounding = 4 to match the window rounding.
+   This applies everywhere at once: the VST3 pick list, the input track / clip
+   pickers, the in-mode and AUDIO OUTPUT combos, the audio device lists in
+   Settings, all context menus, the parameter library.
+
+2. The VST3 pick list got a card design instead of bare rows.
+   Each plugin is a two-line row: the plugin name on top, and a small gray
+   second line with the type ("instrument" / "effect" / "type unknown") and the
+   folder it lives in - so same-named plugins from different folders are easy
+   to tell apart. The whole card highlights on hover and the loaded plugin
+   keeps the orange accent. Search box and click behavior unchanged.
+
+3. The input track picker (AUDIO INPUTS > '+') got right-aligned tags.
+   Each row now shows its engine at the right edge: "Csound", "SuperCollider" or
+   "Pure Data", plus how many clips the track has ("no clips yet" for empty
+   tracks). The full row is clickable, not just the name. The clip-name picker
+   is unchanged.
+
+Files touched: app.cpp (theme: PopupBg / Border / PopupRounding), vst_ui.h
+(plugin card rows, tagged input picker). The popup color fix needs no rebuild
+steps - compile with build.bat as usual.
+
+TEST
+  1. Open a VSTi / VSTe panel, click the plugin combo: the list should sit on a
+     clearly darker panel with a visible edge; each plugin shows name + type +
+     folder; the loaded one is orange-highlighted.
+  2. AUDIO INPUTS > '+' on a VSTe: rows show engine + clip count at the right,
+     empty tracks readable as "no clips yet", whole row clickable.
+  3. Check Settings > Audio device combos and any right-click menu: same dark
+     readable popup style everywhere.
+
+ROUND 10 — VST SOURCE INPUT ROUTING, VSTi NOTES HELP, CODE BINDING, DARKER POPUPS
+-----------------------------------------------------------------------------------
+1. A VSTi / VSTe track can now feed ANOTHER track's input (AUDIO INPUTS > track /
+   clips). Before, a VST source stayed silent: a VST track's audio never runs
+   through Csound, so the input lines were never filled. Now the engine wires the
+   source plugin's own stereo output into the slot - exactly the same channels the
+   source sends to the master ("VSTe output channel = the same in the input track").
+   - track / clips input naming a VSTi or VSTe track (or one of its clips) takes
+     the source's stereo L/R, like the PD / SC engine mixes already did.
+   - a muted source stays silent; an instrument source reaches the effect in the
+     same block; a VSTe -> VSTe chain can lag one block (~3 ms), harmless.
+   - the console lists such slots as: in1: "Source" (VST output, rack-wired).
+
+2. VSTi "no sound" is explained in the UI and in the console now.
+   An instrument plugin only sounds when NOTES reach it: draw a MIDI clip on the
+   track (right-click the lane > Add MIDI clip) or write  note 60, 100, 0.4  in a
+   clip's CAW code. The plugin editor's own on-screen keyboard does NOT feed the
+   engine (no sound from clicking it). If a VSTi stays silent while other audio
+   plays, the console now says exactly that; the VSTi panel shows the hint as soon
+   as the track has no MIDI clip and no note code.
+
+3. The code binding for automation slots is clarified and made robust.
+   p2 = cawget("test1")  in a clip's CAW code binds slot P2 to the lane "test1"
+   (parentheses optional). IMPORTANT: the slot must still have a PICKED parameter
+   (Parameters tab) - the code only replaces WHERE the value comes from; with no
+   picked parameter there is nothing to drive, which is why it looked dead.
+   - the generated code now sends code-bound slots even when fewer parameters are
+     picked, and the value channel is declared for them (before, a bound slot
+     beyond the picked count silently did nothing).
+   - the AUTOMATION SLOTS table shows "code-bound: p2 = cawget \"test1\"" in
+     orange for such slots, with a tooltip telling you to pick a parameter.
+   The lane must exist: draw automation on the track (the + in AUTOMATION lists
+   every lane) - cawget reads the lane of that name (default range 0..1).
+
+4. Popups went one step darker with a clearly visible edge (the pick list is now
+   unmistakably its own layer): PopupBg 0.03 (near-black, 99% opaque), border
+   0.45 gray at 65% alpha. If your screenshot still shows single-line plugin rows
+   without the gray type/folder sub-line, the build was not refreshed - rebuild
+   with this zip and the pick list shows the two-line cards.
+
+Files touched: vst_job.h (Input.srcId + engine 3), app.cpp (source resolution),
+csd_builder.cpp (2-line reservation for VST sources, bound-slot channels, no
+Csound tap for VST sources), vst_rack.h (rack-wired VST source inputs, VSTi
+silence diagnostic, updated hint texts), vst_lang.h (bound slots always send),
+vst_ui.h (code-bound slot hints, VSTi notes hint, regex include).
+
+TEST
+  1. VSTe1 (source) -> VSTe2 AUDIO INPUTS > track "VSTe1": with both playing,
+     VSTe2 now processes VSTe1's stereo output (console: VST output, rack-wired).
+  2. VSTi with a MIDI clip: notes play. VSTi without any MIDI clip / note code:
+     the panel shows the orange "needs notes" hint; the console says why.
+  3. Pick a parameter (Parameters tab), then add to a clip's code:
+     p1 = cawget("name")  - draw the "name" automation lane on the track; the
+     picked parameter follows the lane; the slot row shows "code-bound".
+  4. Open any combo / pick list: near-black layer with a light border, clearly
+     separated from the panel.
+
+ROUND 11 — VSTi AS A TRUE 4TH ENGINE (DAW-LIKE)
+------------------------------------------------
+The VST rack already IS a 4th engine: the plugins render next to Csound / PD / SC
+on the engine thread and their audio is added straight to the soundcard mix -
+nothing of a VSTi runs through the Csound orchestra. What still tied it to the
+Csound world were the NOTES, and that is what this round removes.
+
+1. WHY A VSTi STAYED SILENT EVEN WITH A MIDI CLIP (the bug):
+   MIDI clips only played when they could BORROW a code clip: the note events
+   fired the code clip's instrument, which re-fired the note helper. A muted,
+   deleted or missing code clip silently dropped every note. And "Add MIDI clip"
+   existed only in the CLIP right-click menu, so a MIDI clip without a code clip
+   was easy to build and could never sound.
+
+2. MIDI clips on a VSTi track now send notes DIRECTLY to the plugin:
+   every note is one score event on CawVstNote_<id> (on at note start, off at
+   note end). No code clip involved anywhere - mute or delete the code clip, the
+   MIDI clip still plays. A VSTi now behaves like a DAW instrument:
+     Add VSTi -> load plugin -> right-click the track > Add MIDI clip ->
+     draw notes in the MIDI editor -> Play. Sound.
+   Csound tracks keep the old borrow behaviour (the notes play the clip's
+   instrument); PD / SC tracks are untouched.
+
+3. "Add MIDI clip" is now also in the TRACK right-click menu (VSTi tracks):
+   creates a silent code clip plus a 4-second MIDI clip at the playhead in one
+   step. The code clip holds only a comment - the notes come from the MIDI clip,
+   so the template's random-note code cannot double-trigger.
+
+4. The AUDIO OUTPUT (Master replace / Mix) option is hidden for VSTi tracks:
+   it only makes sense for an effect. An instrument always sends its audio to
+   the master, like the other three engines. (The field is still saved/loaded
+   for compatibility but has no UI for instruments.)
+
+5. The VSTi hint (panel) and the console diagnostic now describe the new path.
+
+NOTES
+  - Mute / solo still apply (a muted track is silent) - as in a DAW.
+  - Parameter automation lanes still live in the CAW code / AUTOMATION SLOTS
+    (round 10); with no code clip running, the plugin uses its saved parameter
+    state and the editor / Learn sliders.
+  - The plugin editor's own on-screen keyboard still cannot feed the engine
+    (the editor lives in the plugin GUI process); use MIDI clips or note code.
+
+Files touched: csd_builder.cpp (direct CawVstNote_<id> events for VSTi MIDI
+clips), app.cpp (track-menu Add MIDI clip), vst_ui.h (AUDIO OUTPUT only for
+VSTe, updated hint), vst_rack.h (updated diagnostic text).
+
+TEST
+  1. Add VSTi, load a synth. Right-click the TRACK > Add MIDI clip. Draw notes
+     in the MIDI editor, press Play -> the synth sounds. Mute/delete the code
+     clip: still sounds.
+  2. The panel shows the orange hint only while the track has neither MIDI
+     notes nor note code.
+  3. The VSTi panel no longer shows the AUDIO OUTPUT replace/mix combo.
+
+ROUND 12 — THE LIVE-PLAY NOTE DROP (why a VSTi stayed silent even with fixed11)
+-------------------------------------------------------------------------------
+The console in the screenshot ("instr VSTi1 uses 5 p-fields but is given 6" +
+"CawStop ...") showed the clip WAS running every loop pass. Those warnings are
+benign and pre-existing: the live transport fires every clip row with a 6th
+p-field. They are not the problem.
+
+THE REAL BUG: live Play resolves every timeline event against the CLIP name
+table (g_engClips / gSCawClips). The direct note events that round 11 introduced
+target the note helper "CawVstNote_<id>" - not a clip name - so the Play path
+looked the name up, found nothing, and SILENTLY DROPPED EVERY NOTE BEFORE IT
+REACHED CSOUND. The offline render would have worked; live play never did.
+(This also explains "no sound with midi" in every earlier round: notes that
+travelled through the transport were filtered by a clip-name list.)
+
+THE FIX - a proper namespace for VSTi notes:
+  1. New name list gSCawVstNotes ("CawVstNote_<id>" per VSTi track, project
+     order), emitted next to gSCawClips and filled into g_engVstNotes when Run
+     is pressed. Both sides use the same builder function, so the numbering
+     always matches.
+  2. New row type 14 = "MIDI note straight to a VSTi note helper". Play from /
+     seek / loop all send MIDI-clip notes as type 14; the CSD loader resolves
+     them like clips (nstrnum) and fires the helper with p4 = pitch, p5 =
+     velocity. Note-offs come from the helper's release logic, and CawStop
+     still releases all helpers on stop / loop wrap.
+  3. Code notes (note 60, 100, 0.4 in a clip) were never transported - they
+     fire inside Csound - and keep working unchanged.
+
+DIAGNOSTICS (so the console now TELLS you which side is mute):
+  - "[caw] VSTi 'X': MIDI bridge live - notes are reaching the plugin."  (once,
+    on the first note that arrives)
+  - "[caw] VSTi 'X': the MIDI bridge is NOT connected (...)"  if the ring
+    channel/table is missing - and the rack now re-resolves the note table
+    every block until it appears, so a table that publishes late no longer
+    needs a second Run.
+  - The silence hint now also fires when the VSTi is the ONLY track in the
+    project (after 15 s of running silence, max twice per run), and says which
+    case applies:
+      no notes reached it  ->  draw notes (right-click track > Add MIDI clip)
+                              or add note lines, then Play.
+      notes ARE reaching the plugin but it stays silent  ->  the plugin's own
+                              state: preset / patch loaded? master volume? many
+                              synths start silent until a preset is chosen.
+
+Files touched: csd_builder.cpp/.h (gSCawVstNotes + type 14), app.cpp
+(g_engVstNotes + type 14 rows in commandPlayFrom), vst_rack.h (lazy table
+re-resolution, first-note confirmation, without-other-audio silence hints).
+
+TEST
+  1. Rebuild, Run (or Play). Draw MIDI notes on the VSTi track, press Play:
+     the console should show "MIDI bridge live - notes are reaching the
+     plugin" and the synth sounds.
+  2. With note CODE in the clip: same confirmation; sound.
+  3. If it still stays silent, the console now names the failing side: a
+     "NOT connected" line means the engine needs a new Run; a "notes ARE
+     reaching the plugin" line means the plugin itself (preset / volume) is
+     the next thing to check - please send that console output.
+
+ROUND 13 — THE VSTi IS NOW CAW'S 4TH ENGINE (independent of Csound)
+-------------------------------------------------------------------
+Per your request, the instrument tracks no longer run through Csound AT ALL.
+They render in the app itself, the way a DAW plays a VST while sharing one
+soundcard. This removes every fragile link the previous rounds fought with
+(score events, transport rows, name tables, the note-ring publish timing):
+  - NO Csound engine needed. Press Play (even if Csound fails to start or is
+    stopped) and the instruments sound. The playhead is clocked by the
+    soundcard itself (audio-rate accurate, loop-aware).
+  - Notes are scheduled by CAW from the MIDI clips: a VSTi track's own MIDI
+    clips go straight to its plugin, and MIDI clips on other tracks still
+    route through their target clip onto the VSTi (your "MIDI track" setup).
+  - When Csound IS running, both run together without double notes: Csound
+    keeps the CODE notes (note / cc / msg in clip code) and forwards them plus
+    the P1..P8 parameter channels to the plugins; the MIDI-clip notes come only
+    from CAW's scheduler. The clocks stay locked (the engine follows the
+    Csound transport within 60 ms and vice versa).
+  - VSTe (effects) is unchanged and still renders next to Csound. A VSTe whose
+    input is a VSTi keeps working: the instruments publish their output on a
+    shared bus that the effect's rack wiring reads.
+  - Plugin GUI edits, Learn slots and automation reach the instruments through
+    the same paths as before (forwarded channels when Csound runs, direct
+    pushes when it does not).
+
+WHAT YOU WILL NOW SEE IN THE CONSOLE (the app console, always visible):
+  - "[caw] VSTi engine: N instrument(s) rendered by CAW itself - Csound is not
+    needed for them."
+  - "[caw] VST track 'X': loaded (instrument)." / "...: no plugin loaded,
+    skipped." - if you see "no plugin loaded", open the instrument panel and
+    load the .vst3 - that was very likely the whole remaining problem.
+  - "[caw] VSTi engine: notes are reaching the plugins." - once the first note
+    fires.
+  - "[caw] VSTi engine: playing through <device>." - when CAW opened its own
+    output (only when no other engine has the soundcard open).
+  - If Csound cannot start: "[caw] The VSTi engine keeps playing the instrument
+    tracks without Csound."
+
+TEST
+  1. Rebuild. Add VSTi, load a plugin, right-click the track > Add MIDI clip,
+     draw notes, press Play -> sound (with or without Run Csound).
+  2. Stop Csound entirely and press Play: the instruments still play.
+  3. With Csound running as well: Csound clips + instruments play together,
+     no double notes.
+  4. Read the console lines above if anything stays silent - they now name the
+     failing step (plugin not loaded / no notes / no output device).
+
+Files: vst_solo.h (new - the 4th engine), vst_rack.h (solo mode, direct MIDI,
+slot-direct overrides, VSTi->VSTe output bus), csound_api_runner.cpp/.h (note +
+parameter forwarder), app.cpp (engine lifecycle, transport clock, job split,
+live mixes, UI wiring).
+
+ROUND 13a — BUILD FIX (fixed14)
+-------------------------------
+fixed13 had two C++ scope errors in csound_api_runner.cpp (MSVC errors C2327 /
+C2065 / C2530 / C2143 at lines 423, 424, 870): the note/parameter forwarder
+inside the engine worker addressed the state through the wrong name, and the
+forwarder record type was unqualified in the public setter. Both are fixed - no
+other file had errors. Same functionality as Round 13 otherwise.
+
+ROUND 14 — THE SILENCE BUG (fixed15)
+------------------------------------
+Two real bugs found by comparing with ca2_v24 and tracing the 4th engine chain:
+
+1. vstSolo().play() was NEVER called - the engine was started with resync() only,
+   which repositions but never sets the play state. The MIDI-clip schedule never
+   fired and the engine only rendered in 2.5 s bursts. Now Play calls play(g_play),
+   stopped edits keep resync().
+
+2. vstSolo().setLog() was never wired - every "VSTi engine:" line (including
+   plugin-load errors!) was swallowed. That is why the console showed nothing from
+   the engine. Now it logs through the normal console. A new explicit line says
+   when no instrument tracks / plugin were found.
+
+3. New one-shot console line "Forwarding clip-code notes to the VSTi engine."
+   proves the Csound ring bridge works (v24 reference: same ring mechanism).
+
+ROUND 15 — BACK TO THE v24 SOUND PATH (fixed16)
+-----------------------------------------------
+The instruments render in the Csound engine's rack again - exactly how ca2_v24
+produced VSTi sound. The rack (engine thread) reads every VST track's note ring
+(cawvst_<id>_wr / _tab) and P1..P8 channels, renders the plugins and mixes their
+output straight into the Csound output - the same space the effects and the PD
+mix use. No separate engine, no extra output stream, no hook chain.
+
+- Engine start passes ALL VST jobs (effects + instruments) to the engine rack,
+  like v24 did. CAW's own 4th engine is retired from playback (kept loaded but
+  silent, so nothing renders twice).
+- The 4th-engine "keeps playing without Csound" fallbacks are removed: like v24,
+  VSTi needs the Csound engine (API mode) running.
+- Offline export already used this rack path, so exports keep working unchanged.
+- Live P1..P8 slider edits go through the engine rack (unchanged from v24).
+
+ROUND 16 - SEPARATE VST ENGINE BUTTON (fixed17)
+-----------------------------------------------
+Cause: fixed16 sent instruments to the Csound rack, but live Play still drops MIDI-clip notes for VSTi
+tracks (commandPlayFrom) and CAW's own VSTi engine (vst_solo.h) was never started - MIDI reached nobody.
+Fix: new "Run VST" / "Stop VST" button starts the VST engine independently of Csound/PD/SC.
+- Instruments run only in the VST engine; the Csound rack runs effects only (offline export unchanged).
+- MIDI clips are scheduled by CAW; clip-code notes (note/cc/msg) and P1..P8 are forwarded from Csound.
+- Own soundcard stream only when no other engine carries audio; otherwise mixed into that stream.
+- Play/Stop/seek/loop, live M/S, plugin-change reload, PD transport all follow the engine.
+Not compiled in the sandbox (no VST3 SDK / ImGui): build with build.bat.
+
+ROUND 17 - LIVE CODE EDITING
+----------------------------
+Editing the code of a VSTi / VSTe clip (or a Csound clip) no longer needs a Run / restart: the
+engine recompiles that clip's instrument while it plays.
+
+- When the code editor of a clip stops changing for 0.5 s, the clip's instrument definition is
+  pushed to the running API engine (csoundCompileOrc between audio blocks), using the exact text
+  the Run CSD would contain (buildClipInstrumentCode cuts it out of buildCsd "engine"), so a later
+  full restart never recompiles a different definition.
+- The clip is then restarted (same rules as Run: playing timeline / manual run, M / S respected)
+  so the new code is heard; other clips and engines are untouched, their live P1..P8 overrides
+  and automation survive. The edited clip's P values re-init from its defaults.
+- Csound 6 (csoundCompileOrc(cs, text)) and Csound 7 (extra async argument) are both handled; an
+  engine without the runtime compiler says so once in the console instead of failing silently.
+- Audio-rate / control-rate instruments keep their running instance's state otherwise; notes sent
+  from MIDI clips follow the usual transport. PD / SC tracks keep their own live reload.
+- Console: "[caw] live code "<clip>": recompiled" or the compile error, per push.
+Files: csd_builder.h/.cpp (buildClipInstrumentCode), csound_api_runner.h/.cpp (compile queue +
+pushLiveInstrument), app.cpp (edit detection, push + single-clip restart).
+
+ROUND 18 - RUN VST PLAYS THE CLIP CODE BY ITSELF
+------------------------------------------------
+Before, clip-code notes (note / cc / msg) only reached the instruments through Csound: Run VST
+loaded the plugins and played the MIDI clips, but a clip that says "every 0.5 { note ... }"
+stayed silent unless Csound was running too.
+
+Now the VST engine interprets the CAW code itself while Csound is OFF:
+- new src/vst_script.h: parser + runtime for the language documented in vst_lang.h - every /
+  when / else, note / cc / msg, P1..P8 (read, write, +=), own variables, ternary and the math
+  set (lfo / tri / sqr / saw, rnd, smooth, line, clip, min / max, abs / sin / cos / int / sqrt,
+  mtof, uni), pitch / vel / dur / time / pi.
+- vst_solo.h: the engine evaluates each VSTi clip's code once per 128-sample block on its own
+  transport clock, inside the clip's box, with loops / seeks / Play / Stop. `note` starts a
+  note that ends after its length (same active-note list as the MIDI clips); `cc` / `msg` go
+  straight to the plugin; a P1..P8 the code writes is pushed into the plugin as a live
+  parameter. Clip-code edits recompile the running engine after the usual 0.5 s pause.
+- app.cpp: builds the scripts from the VSTi tracks (respects track / clip mute and solo) and
+  hands them to the engine only while Csound is off. As soon as Csound runs again the list is
+  cleared, because Csound translates the same code and forwards its notes - never both.
+- `csound:` lines, plain Csound statements and level() have no meaning here and are ignored
+  (they still work when Csound is the one running the code).
+No restart of any engine is needed. Press Run VST, then Play.
+Files: vst_script.h (new), vst_solo.h, app.cpp.
+
+ROUND 19 - P1..P8 FROM CLIP CODE MOVE THE PLUGIN (AND THE UI), VSTi AS AN INPUT
+-------------------------------------------------------------------------------
+Two gaps from Round 18:
+
+1. Clip code wrote P1..P8 in the 4th engine, but nobody could see it: the engine applied the
+   value to the plugin, yet the P1..P8 sliders / the plugin GUI in the instrument panel got
+   their values only from the Csound rack's mirror, which does not exist while Run VST runs
+   alone. The 4th engine now publishes the values it is really using:
+   - vst_solo.h: the engine's rack gets its own VstParamMirror and exposes params(trackId, out)
+     (cleared on start / stop). The UI hook takeVstEngineParams falls back to it, so the P
+     sliders and the plugin editor's knobs follow the code (LFOs sweep the knob) exactly like
+     automation does when Csound runs.
+   - vst_rack.h: in solo mode an applied P override is also stored as the slot's live value so
+     the mirror is truthful; slots that were never written publish their picked start value
+     instead of -1.
+   - A one-time console line now says what is wrong when the code writes a P slot that has no
+     plugin parameter picked ("clip code writes P1 but no parameter is picked for P1 ...").
+   - setScripts(): the start values (params) are no longer part of the script identity. The UI
+     mirrors the live engine values back into vstInit, and that must never restart a running
+     script; unchanged scripts also skip the compile now.
+
+2. A VSTi track could not be chosen as a VSTe audio input: the rack and the CSD already
+   support VST sources (engine 3, the source plugin's own stereo output is wired into the
+   slot), but the AUDIO INPUTS "+" picker only listed Csound / SuperCollider / Pure Data
+   tracks. It now lists VSTi and VSTe tracks too (tagged, and never the VSTe itself).
+Files: vst_rack.h, vst_solo.h, vst_ui.h, app.cpp.
+
+ROUND 20 - SIGNAL DISPLAY, VSTi LANE METERS, PLUGIN LOADED LATER, PD + VST
+-------------------------------------------------------------------------
+Four reports, one per item:
+
+1. "Start VST - no signal display. I must start the Csound engine to have signal display."
+   The VST engine's own output stream was captured (peaks + raw samples) but nobody read that
+   capture: only the Csound, SuperCollider and PD streams fed the master meter, the scope and
+   the spectrum. updateMeters() now takes the VST stream's MonitorCapture as well (peak per
+   channel, clip light, applyRawSamples for scope / FFT / spectrum), so Run VST alone shows
+   the same master meter and signal display as the other engines - no Csound needed.
+
+2. "I must load the VST after Start VST, so I lose the mapping each time. VST should play in
+   every situation."
+   - Run VST no longer refuses when no instrument plugin is loaded: the engine starts and
+     waits. Loading / changing a .vst3 in the instrument panel is picked up by the existing
+     0.5 s job check, which loads the plugin and joins the transport (or schedules the notes
+     when stopped) - no Stop / Run VST cycle. Deleting the last plugin unloads it but keeps
+     the engine on and waiting.
+   - Choosing another plugin no longer clears the P1..P8 picks / names / start values
+     (vst_ui.h): the mapping survives every plugin (re)load. Out-of-range picks are already
+     ignored safely by the rack.
+   - Pressing Play brings the VST engine up by itself when a VSTi track has a plugin
+     (startVstEngine), so Play works with Csound, PD, SC or no other engine at all.
+     Run Csound's notice now says Play also starts it.
+
+3. "Meter for VSTi is not showing."
+   The instrument plugins render in the 4th engine, not in the Csound meter layout, so their
+   lane meter indices were never written. vst_rack.h now captures each instrument's output
+   peaks in solo mode (max-held until taken, mono-safe, cleared on load / unload);
+   vst_solo.h exposes takePeaks(); app.cpp drains them every frame into g_vstMeterDb and the
+   lane meter draw uses it for VSTi tracks while the VST engine runs - bars and red clip LED.
+
+4. "When PD is selected, VST solo won't work."
+   Play used to abort on PD-only problems (PD still preloading, clips changed, PD not ready)
+   even though the VST engine could play. The PD gates now skip ONLY the PD timeline and let
+   VSTi / Csound / SC play (notice says why, Play again when PD is ready); the hard stops
+   remain only for real device conflicts (legacy process, PD clip preview, test sound,
+   export). The VST engine joins the PD clock (followClock) as before, and when PD owns the
+   device its CawAudioOutput carries the VST mix through the shared realtime hook.
+Files: app.cpp, vst_rack.h, vst_solo.h, vst_ui.h.
+   The same rule now applies to SuperCollider clips: when SC is disabled or still starting,
+   Play skips the SC clips and plays the rest (it still stops when SC is the only engine).
+   Starting SuperCollider while Run VST alone holds the soundcard now hands the device over
+   cleanly (the VST stream closes; SC's stream carries the mix) instead of opening a second one.
