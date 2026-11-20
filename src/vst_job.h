@@ -15,6 +15,9 @@ struct VstJob {
     std::string path;              // .vst3 file
     std::string classId;           // the class inside the file (a bundle can hold several); empty = first
     std::map<uint32_t, double> parameterState; // stable plugin parameter IDs
+    std::string stateBlob;         // SEPARATED ENGINES: the editor instance's full plugin state (Kontakt's loaded
+                                   // .nki etc. - binary state, not a parameter). The rack applies it to the engine
+                                   // instance at creation; a live change arrives via VstRack::pushState instead.
     bool instrument = true;        // true = VSTi (MIDI in), false = VSTe (audio in)
     std::vector<int> pick;         // plugin parameter index of kP1..kP8
     std::vector<double> init;      // start value of kP1..kP8 (normalized)

@@ -885,7 +885,7 @@ std::vector<TimelineEvent> timelineEvents(const Project& p, double from, bool in
             //    Every note is one start (p4 pitch, p5 velocity).
             for (const MidiClip& mc : t.midiClips) {
                 if (mc.muted) continue;
-                if (t.kind == 3) {
+                if (t.kind == 3 || t.kind == 4) {
                     for (const MidiNote& n : mc.notes) {
                         if (n.start >= mc.dur) continue;
                         const double s = mc.start + n.start;

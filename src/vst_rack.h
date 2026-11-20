@@ -29,6 +29,53 @@
 #include <thread>
 #include <vector>
 #include "vst_job.h"
+
+// Named Csound clip tap channels captured by the Csound worker (one push per ksmps cycle) for a
+// VST graph that runs OUTSIDE the Csound thread (the 4th engine). SEPARATED ENGINES: Csound never
+// loads VST plugins - it only publishes these taps, so a VST-side stall (editor work, plugin
+// churn) can never reach Csound's audio thread. The pusher never blocks (try_lock: one ksmps
+// chunk is dropped on contention) and the reader holds the last value while the ring is short.
+namespace vsttaps {
+    struct Ring {
+        std::mutex m;
+        std::vector<float> buf;
+        size_t cap = 16384, w = 0, r = 0, count = 0;
+        float last = 0.f;
+        bool primed = false;
+    };
+    inline std::mutex& registryLock() { static std::mutex m; return m; }
+    inline std::map<std::string, Ring>& registry() { static std::map<std::string, Ring> r; return r; }
+    inline void push(const std::string& name, const float* src, int n) {
+        if (!src || n <= 0) return;
+        Ring* ring = nullptr;
+        { std::lock_guard<std::mutex> g(registryLock()); ring = &registry()[name]; }
+        std::unique_lock<std::mutex> g(ring->m, std::try_to_lock);
+        if (!g.owns_lock()) return;                        // the reader is draining: drop this chunk
+        if (ring->buf.size() < ring->cap) ring->buf.assign(ring->cap, 0.f);
+        for (int i = 0; i < n; ++i) {
+            ring->buf[ring->w] = src[i];
+            ring->w = (ring->w + 1) % ring->cap;
+            if (ring->count < ring->cap) ++ring->count; else ring->r = (ring->r + 1) % ring->cap;
+        }
+        ring->last = src[n - 1];
+        ring->primed = true;
+    }
+    // Fills dst (n frames). Returns false only if the tap was never seen at all (UI warns).
+    inline bool pop(const std::string& name, float* dst, int n) {
+        Ring* ring = nullptr;
+        { std::lock_guard<std::mutex> g(registryLock()); auto it = registry().find(name); if (it == registry().end()) return false; ring = &it->second; }
+        int got = 0;
+        std::unique_lock<std::mutex> g(ring->m, std::try_to_lock);
+        if (g.owns_lock()) got = (int)std::min((size_t)n, ring->count);
+        for (int i = 0; i < got; ++i) { dst[i] = ring->buf[ring->r]; ring->r = (ring->r + 1) % ring->cap; }
+        if (g.owns_lock()) ring->count -= (size_t)got;
+        const float hold = got > 0 ? dst[got - 1] : ring->last;   // a torn float read is harmless here
+        for (int i = got; i < n; ++i) dst[i] = hold;              // hold last while the ring is short
+        if (got > 0) { ring->last = dst[got - 1]; ring->primed = true; }
+        return got > 0 || ring->primed;
+    }
+    inline void clear() { std::lock_guard<std::mutex> g(registryLock()); registry().clear(); }
+}
 #include "monitor_capture.h"
 #include "caw_bus.h"
 #ifdef _WIN32
@@ -91,6 +138,44 @@ public:
         VstParamValue pv; pv.trackId = trackId; pv.index = paramIndex; pv.value = std::min(1.0, std::max(0.0, value));
         pendingValues_.push_back(pv);
     }
+    // SEPARATED ENGINES: full plugin state from the editor instance (Kontakt's loaded .nki, FX
+    // presets with internal state - binary state, not a parameter). NEVER applied on the audio
+    // thread: a sampler loading a patch blocks for seconds and may synchronize with the plugin's
+    // own GUI thread (the host UI thread) - doing that inside the audio callback froze the app.
+    // applyStateNow() is called by the engine's state worker while it HOLDS the render mutex,
+    // so the audio callback skips blocks instead of deadlocking.
+#ifdef CAW_VST3
+    void applyStateNow(int trackId, const std::string& blob) {
+        if (blob.empty()) return;
+        std::shared_ptr<Graph> graph;
+        { std::lock_guard<std::mutex> lock(graphMutex_); graph = graph_; }
+        if (!graph) return;
+        for (Rt& r : graph->rts) {
+            if (r.job.id != trackId || !r.inst) continue;
+            if (r.inst->appliedState == blob) return;   // already applied - also dedupes the creation path
+            try {
+                r.plug->setState(blob);
+                r.inst->appliedState = blob;
+                if (log_) log_("[caw] VST track \"" + r.job.name + "\": patch state applied to the engine (" + std::to_string(blob.size()) + " bytes).\n");
+            } catch (...) {
+                if (log_) log_("[caw] VST track \"" + r.job.name + "\": applying the patch state threw - the track keeps its previous state.\n");
+            }
+            return;
+        }
+    }
+#endif
+    // SEPARATED ENGINES: the engine instance of a track, for the UI thread's editor feed (EQ
+    // analyzers, synth meters replay the engine's audio + notes in processIdle). A shared
+    // pointer, so it stays alive even while the loader thread replaces the graph. Any thread.
+    // (Only exists in VST3 builds; without plugin hosting there is no feed source.)
+#ifdef CAW_VST3
+    std::shared_ptr<caw::IPlugin> pluginOfTrack(int trackId) {
+        std::shared_ptr<Graph> g = currentGraph();
+        if (!g) return {};
+        for (Rt& r : g->rts) if (r.job.id == trackId && r.plug) return r.plug;
+        return {};
+    }
+#endif
     // The 4th engine (app-side VSTi rack) has no Csound channels or note ring:
     // MIDI arrives directly. Call from the ONE thread that also calls process().
     void setSoloMode(bool solo) { soloMode_ = solo; }
@@ -196,6 +281,7 @@ public:
               bool strict = false, VstParamMirror* mirror = nullptr, const VstEngineAudio* engineAudio = nullptr) {
         stopLoader();
         sr_ = sr; block_ = block; nchan_ = nchan; sb_ = sampleBytes; strict_ = strict;
+        tapBuf_.assign((size_t)std::max(1, block), 0.f);   // the tap-ring scratch follows the block
         mirror_ = mirror; ea_ = engineAudio; log_ = log; ptr_ = ptr; tab_ = table;
         {
             std::vector<std::shared_ptr<Graph>> dead;
@@ -277,6 +363,11 @@ public:
                         caw::ParamMsg m; m.paramIndex = pv.index; m.value = pv.value;
                         r.ep->paramIn.push(m);   // the engine instance applies it on this very block
                     }
+            // Patch state (Kontakt's loaded .nki) is applied by the engine's STATE WORKER while
+            // it holds the render mutex (applyStateNow) - NEVER here: a sampler loading a patch
+            // blocks for seconds and must not run on the audio thread. The creation path applies
+            // the job's blob on the loader thread; a reused instance keeps its Inst, so its
+            // appliedState dedupe carries over the graph swap untouched.
             for (Rt& r : rts)
                 for (const VstPickUpdate& pu : picks)
                     if (pu.trackId == r.job.id && pu.pick != r.job.pick) {
@@ -511,10 +602,17 @@ public:
                                 r.srcMissingWarned = true;
                                 if (log_) log_("[caw] VSTe \"" + r.job.name + "\": input \"" + src.name + "\" is a VSTi / VSTe source that is NOT in the rack - it was added after Run, or its plugin did not load. Press Run Csound once so its note ring and audio are wired in.\n");
                             }
-                        } else {   // a Csound clip: its named tap channel (read live, so a re-wire needs no Run)
+                        } else {   // a Csound clip: its named tap channel. Inside the Csound worker
+                                   // (ptr_ set) it is read live from Csound; outside it (the 4th
+                                   // engine) the worker captures the same channels per ksmps cycle
+                                   // into the vsttaps rings and this side pops them - so a VST-side
+                                   // stall can never stall Csound's audio.
                             void* ch = k < (int)src.csChans.size() ? chanOf(src.csChans[(size_t)k]) : nullptr;
                             if (ch) {
                                 for (int n = 0; n < block_; ++n) r.in[(std::size_t)n * 8 + outLine] = (float)rdAt(ch, n) / fullScale;
+                            } else if (k < (int)src.csChans.size() && !tapBuf_.empty()
+                                       && vsttaps::pop(src.csChans[(size_t)k], tapBuf_.data(), block_)) {
+                                for (int n = 0; n < block_; ++n) r.in[(std::size_t)n * 8 + outLine] = tapBuf_[(size_t)n];
                             } else if (src.lineCount > 0) {
                                 ++r.tapsMissing;
                             }
@@ -675,6 +773,8 @@ private:
         std::shared_ptr<caw::IPlugin> plug;
         std::atomic<long> wr{0};   // the note-ring position the audio thread has played up to
         std::atomic<bool> fresh{true};   // never resolved yet: start at the ring head, do not re-fire old notes
+        std::string appliedState;   // SEPARATED ENGINES: last patch-state blob this instance has (written by buildGraph
+                                    // before the instance renders, and by process() on the render thread - no other writer)
     };
     struct Rt {
         VstJob job; std::shared_ptr<Inst> inst; std::shared_ptr<caw::IPlugin> plug; std::shared_ptr<caw::Endpoint> ep;
@@ -707,6 +807,7 @@ private:
     float rdSpout(const void* spout, int i, int c) const { return sb_ == 8 ? (float)static_cast<const double*>(spout)[(std::size_t)i * nchan_ + c] : static_cast<const float*>(spout)[(std::size_t)i * nchan_ + c]; }
     void clearBus(void* p) const { if (sb_ == 8) std::fill_n(static_cast<double*>(p), block_, 0.0); else std::fill_n(static_cast<float*>(p), block_, 0.f); }
     void add(void* b, size_t i, float v) const { if (sb_ == 8) static_cast<double*>(b)[i] += v; else static_cast<float*>(b)[i] += v; }
+    std::vector<float> tapBuf_;    // scratch for a popped Csound tap ring (separated engines)
     // A clip tap channel, resolved by name on this thread and cached. A late-created channel is
     // picked up on a later block; a new one is zeroed on first resolution (it may hold last run's
     // leftovers). Cleared after every block (see process) so each pass starts from zero.
@@ -847,6 +948,10 @@ private:
                             if (parameter.readOnly || saved == j.parameterState.end()) continue;
                             if (std::fabs(saved->second - parameter.value) <= 1e-6) continue;   // already what the plugin reports
                             made->plug->setParam(parameter.index, saved->second);
+                        }
+                        if (!j.stateBlob.empty()) {   // SEPARATED ENGINES: the editor instance's loaded patch (Kontakt .nki etc.)
+                            try { made->plug->setState(j.stateBlob); made->appliedState = j.stateBlob; }
+                            catch (...) { say("[caw] VST track \"" + j.name + "\": the editor's patch state could not be applied at load - the plugin keeps its defaults.\n"); }
                         }
                         made->plug->prepare(sr_, block_);
                     } catch (...) {

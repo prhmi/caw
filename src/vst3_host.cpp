@@ -37,6 +37,7 @@
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivstmessage.h"
 #include "pluginterfaces/vst/ivstevents.h"
+#include "pluginterfaces/vst/ivstmidicontrollers.h"
 using namespace Steinberg; using namespace Steinberg::Vst;
 namespace fs = std::filesystem;
 
@@ -54,6 +55,36 @@ static std::string normCid(const std::string& text) {   // accepts {braces}, das
     std::string s;
     for (char c : text) if (std::isxdigit((unsigned char)c)) s += (char)std::toupper((unsigned char)c);
     return s.size() == 32 ? s : std::string();
+}
+// Minimal base64 (RFC 4648) for the plugin state blob: the full component state is binary, and it
+// travels through the app as std::string (VstJob::stateBlob / the editor's pushedState) - base64
+// keeps it text-safe everywhere, including a future project-file field.
+static const char* const kBase64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static std::string base64Encode(const std::string& raw) {
+    std::string out; out.reserve((raw.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < raw.size(); i += 3) {
+        const unsigned v = ((unsigned char)raw[i] << 16)
+                         | (i + 1 < raw.size() ? (unsigned char)raw[i + 1] << 8 : 0u)
+                         | (i + 2 < raw.size() ? (unsigned char)raw[i + 2] : 0u);
+        out += kBase64[(v >> 18) & 63]; out += kBase64[(v >> 12) & 63];
+        out += i + 1 < raw.size() ? kBase64[(v >> 6) & 63] : '=';
+        out += i + 2 < raw.size() ? kBase64[v & 63] : '=';
+    }
+    return out;
+}
+static bool base64Decode(const std::string& in, std::string& out) {
+    static int rev[256]; static bool ready = false;
+    if (!ready) { ready = true; std::fill_n(rev, 256, -1); for (int i = 0; i < 64; ++i) rev[(unsigned char)kBase64[i]] = i; }
+    out.clear();
+    unsigned buf = 0; int bits = 0;
+    for (char c : in) {
+        if (c == '=') break;                     // padding: the rest is empty by construction
+        const int r = rev[(unsigned char)c];
+        if (r < 0) return false;                 // not a base64 character
+        buf = buf << 6 | (unsigned)r; bits += 6;
+        if (bits >= 8) { bits -= 8; out += (char)((buf >> bits) & 0xFF); }
+    }
+    return true;
 }
 // PlugProvider uses this shared context for component/controller initialization.
 // Keep it alive for the entire process, including detached scans and plugin teardown.
@@ -114,9 +145,24 @@ public:
 class Vst3Plugin : public IPlugin {
     std::atomic<int> inBusCh_{2}, outBusCh_{2};   // channel count of the plugin's first audio input / output bus (queried at prepare)
     bool editorComponentActive_ = false;
+    bool editorProcessing_ = false;   // SEPARATED ENGINES: the editor instance runs processIdle() ticks
+    bool editorLogged_ = false;       // one-shot log: confirms the editor instance began processing (and setProcessing's return)
     double editorSetupSr_ = 0.0;
     int editorSetupBlock_ = 0;
     std::vector<std::vector<float>> inScratch_, outScratch_;   // de-interleaved process scratch for any channel count
+    // SEPARATED ENGINES: what this instance heard and dispatched, captured for the EDITOR
+    // instance's feed (EQ analyzers, synth meters). tapAudio_ / tapEvents_ are written on the
+    // thread that runs process() (the rack's render thread) and drained by the UI thread in
+    // takeEditorFeed(); heldNotes_ only lives on the process() thread.
+    std::mutex tapMutex_;
+    std::vector<float> tapAudio_;            // interleaved stereo (2 ch) of the last rendered block
+    int tapFrames_ = 0;
+    std::deque<MidiMsg> tapEvents_;          // dispatched MIDI since the last drain (capped)
+    std::set<int> heldNotes_;                // channel * 128 + pitch of note-ons with no note-off yet
+    // The controller's MIDI CC / bend / aftertouch -> parameter assignment, cached ONCE at load on
+    // the UI thread (IMidiMapping is documented "[UI-thread & Connected]" - it must never be
+    // queried inside process()). Index: channel * 141 + ctrlNumber; (ParamID)-1 = unmapped.
+    std::vector<ParamID> ccMap_;
 public:
     void setEditorSystemScaling(bool enabled) override { systemScaling_ = enabled; }
     void closeEditor() override {
@@ -220,6 +266,25 @@ public:
                 const tresult sync = ctrl_->setComponentState(&state);
                 vstLog("controller: component state sync result=" + std::to_string((int)sync));
             } else vstLog("controller: component state unavailable result=" + std::to_string((int)read));
+            // The controller MAY map MIDI CCs / bend / aftertouch to parameters (IMidiMapping,
+            // a UI-thread interface): cache the whole assignment table once here - process()
+            // then only looks it up, never calls the interface.
+            ccMap_.assign((size_t)16 * 141, (ParamID)-1);
+            {
+                FUnknownPtr<IMidiMapping> mm(ctrl_);
+                if (mm) {
+                    int mapped = 0;
+                    for (int chn = 0; chn < 16; ++chn)
+                        for (int cn = 0; cn <= 140; ++cn) {
+                            ParamID pid = 0;
+                            if (mm->getMidiControllerAssignment(0, (int16)chn, (CtrlNumber)cn, pid) == kResultTrue) {
+                                ccMap_[(size_t)chn * 141 + (size_t)cn] = pid;
+                                ++mapped;
+                            }
+                        }
+                    vstLog("controller: IMidiMapping " + std::to_string(mapped) + " assignment(s) cached");
+                } else vstLog("controller: IMidiMapping absent - CC / bend do not drive parameters");
+            }
         } else vstLog("controller: unavailable");
         for (int i = 0, n = comp_->getBusCount(kEvent, kInput); i < n; ++i) comp_->activateBus(kEvent, kInput, i, true);
         comp_->activateBus(kAudio, kOutput, 0, true);
@@ -241,8 +306,11 @@ public:
         if (!proc_ || !comp_ || sr <= 0.0 || maxBlock <= 0) return;
         if (editorComponentActive_ && std::fabs(editorSetupSr_ - sr) < 0.01 && editorSetupBlock_ == maxBlock) return;
         // The UI instance is separate from the real-time audio instance. Configure and activate
-        // its component only after the host engine has a real format; do NOT call setProcessing(true)
-        // or process() here, because this instance is not connected to the audio callback.
+        // its component only after the host engine has a real format; processIdle() (vstui::
+        // queueEditorTasks, on the housekeeping worker) runs small silent blocks on it so sampler UIs stay alive, but it is
+        // never connected to the audio callback.
+        if (editorProcessing_) { proc_->setProcessing(false); editorProcessing_ = false; }
+        editorLogged_ = false;   // a re-prepare (sample-rate / block change, reactivation) gets a fresh confirmation log
         if (editorComponentActive_) comp_->setActive(false);
         ProcessSetup setup{kRealtime, kSample32, maxBlock, sr};
         const tresult setupResult = proc_->setupProcessing(setup);
@@ -262,6 +330,118 @@ public:
         editorSetupBlock_ = maxBlock;
         vstLog("editor: component prepared for engine " + std::to_string((int)sr) + " Hz / " + std::to_string(maxBlock) + " frames");
     }
+    // SEPARATED ENGINES: UI-thread idle tick for the EDITOR instance. Kontakt (and other
+    // sampler-style plugins) only finish their loading screen and move their meters when their
+    // component is processed. Runs a small block at ~12 Hz (vstui::queueEditorTasks); no engine
+    // connection: the engine instance on the audio path is a different object and is unaffected.
+    // With a feed, the block carries the ENGINE instance's real input audio and dispatched MIDI,
+    // so EQ analyzers draw the actual signal and synth meters follow the notes that sound.
+    void processIdle(int frames, const EditorFeed* feed) override {
+        if (!proc_ || !comp_ || !editorComponentActive_ || frames <= 0) return;
+        // VST3: IAudioProcessor::setProcessing is OPTIONAL. Many plugins (and VST2 adapters)
+        // return kResultFalse from setProcessing(true) - the spec says the host must then just
+        // call process() anyway. The engine path already does this; the editor instance must
+        // too, or every EQ analyzer / scope / meter in a plugin window stays dead while sound
+        // plays fine. Call setProcessing once (polite), then ALWAYS process.
+        if (!editorProcessing_) {
+            editorProcessing_ = true;
+            const tresult sp = proc_->setProcessing(true);
+            if (!editorLogged_) {
+                editorLogged_ = true;
+                vstLog("editor instance: processing started (setProcessing returned " + std::to_string((int)sp) + "; " + std::to_string(inBusCh_.load(std::memory_order_relaxed)) + " input channel(s))");
+            }
+        }
+        if (editorSetupBlock_ > 0 && frames > editorSetupBlock_) frames = editorSetupBlock_;   // stay within the prepared block
+        // The feed's engine audio replaces the silence. An instrument has no input bus: its GUI
+        // lives on the dispatched notes (below).
+        int nIn = instrument_ ? 0 : std::min(2, inBusCh_.load(std::memory_order_relaxed));
+        const bool haveAudio = feed && feed->frames > 0 && (int)feed->audio.size() >= feed->frames * 2 && !instrument_;
+        if (haveAudio && feed->frames < frames) frames = feed->frames;
+        const int nOut = std::min(2, outBusCh_.load(std::memory_order_relaxed));
+        if ((int)inScratch_.size() < nIn) inScratch_.resize((size_t)nIn);
+        if ((int)outScratch_.size() < nOut) outScratch_.resize((size_t)nOut);
+        for (int c = 0; c < nIn; ++c) {
+            if ((int)inScratch_[(size_t)c].size() < frames) inScratch_[(size_t)c].resize((size_t)frames);
+            for (int i = 0; i < frames; ++i)
+                inScratch_[(size_t)c][(size_t)i] = haveAudio && c < 2 ? feed->audio[(size_t)i * 2 + (size_t)c] : 0.f;
+        }
+        for (int c = 0; c < nOut; ++c) {
+            if ((int)outScratch_[(size_t)c].size() < frames) outScratch_[(size_t)c].resize((size_t)frames);
+            std::fill_n(outScratch_[(size_t)c].begin(), (size_t)frames, 0.f);
+        }
+        float* ins[8] = {}; float* outs[8] = {};
+        for (int c = 0; c < nIn; ++c) ins[c] = inScratch_[(size_t)c].data();
+        for (int c = 0; c < nOut; ++c) outs[c] = outScratch_[(size_t)c].data();
+        AudioBusBuffers ib{}, ob{}; ib.numChannels = nIn; ib.channelBuffers32 = ins; ob.numChannels = nOut; ob.channelBuffers32 = outs;
+        events_.clear(); changes_.clearQueue();
+        if (feed) for (const MidiMsg& m : feed->events) mapMidi(m, events_, changes_, 0);
+        ProcessData d{}; d.processMode = kRealtime; d.symbolicSampleSize = kSample32; d.numSamples = frames;
+        d.numInputs = nIn > 0 ? 1 : 0; d.inputs = nIn > 0 ? &ib : nullptr; d.numOutputs = 1; d.outputs = &ob;
+        d.inputEvents = feed && !feed->events.empty() ? &events_ : nullptr;
+        d.inputParameterChanges = &changes_;
+        proc_->process(d);
+    }
+    // The UI drains this instance's engine snapshot for the editor feed. Copies everything out
+    // under a short lock - the render thread must never wait on the UI.
+    bool takeEditorFeed(EditorFeed& out) override {
+        std::lock_guard<std::mutex> lock(tapMutex_);
+        out.audio = tapAudio_;
+        out.frames = tapFrames_;
+        out.events.assign(tapEvents_.begin(), tapEvents_.end());
+        tapEvents_.clear();
+        return out.frames > 0 || !out.events.empty();
+    }
+    // One MIDI message from a ring (the engine's or the editor tick's replay) into VST3 events /
+    // parameter changes. CC 120 / 123 (all sound / all notes off) become real note-offs for every
+    // note this instance still sees as held: the transport stop sends exactly those, and a plugin
+    // that never receives them keeps its voices forever ("Stop does not stop the sound"). Other
+    // CCs / bend / aftertouch drive parameters through the controller's IMidiMapping when the
+    // plugin provides one (optional per spec - otherwise they are skipped, as before).
+    void mapMidi(const MidiMsg& m, EventList& ev, ParameterChanges& pc, int32 offset) {
+        const uint8_t st = m.status & 0xF0, chn = m.status & 0x0F;
+        Event e{}; e.busIndex = 0; e.sampleOffset = offset; e.ppqPosition = 0; e.flags = 0;
+        if (st == 0x90 && m.d2 > 0) {
+            e.type = Event::kNoteOnEvent; e.noteOn = {chn, m.d1, 0.f, m.d2 / 127.f, 0, -1};
+            ev.addEvent(e);
+            heldNotes_.insert((int)chn * 128 + (int)m.d1);
+            return;
+        }
+        if (st == 0x80 || (st == 0x90 && m.d2 == 0)) {
+            e.type = Event::kNoteOffEvent; e.noteOff = {chn, m.d1, m.d2 / 127.f, -1, 0.f};
+            ev.addEvent(e);
+            heldNotes_.erase((int)chn * 128 + (int)m.d1);
+            return;
+        }
+        if (st == 0xB0 && (m.d1 == 120 || m.d1 == 123)) {
+            int sent = 0;
+            for (auto it = heldNotes_.begin(); it != heldNotes_.end() && sent < 64; ) {
+                const int key = *it;
+                if ((key >> 7) != (int)chn) { ++it; continue; }
+                Event off{}; off.busIndex = 0; off.sampleOffset = offset; off.ppqPosition = 0; off.flags = 0;
+                off.type = Event::kNoteOffEvent; off.noteOff = {(int16)(key >> 7), (int16)(key & 127), 0.f, -1, 0.f};
+                ev.addEvent(off);
+                it = heldNotes_.erase(it);
+                ++sent;
+            }
+            return;
+        }
+        if (ccMap_.empty()) return;
+        int cn = 0; double value = 0;
+        if (st == 0xB0) { cn = (int)m.d1; value = m.d2 / 127.0; }
+        else if (st == 0xD0) { cn = kAfterTouch; value = m.d2 / 127.0; }
+        else if (st == 0xE0) { cn = kPitchBend; const int v14 = ((m.d2 & 0x7F) << 7) | (m.d1 & 0x7F); value = (v14 / 16383.0) * 2.0 - 1.0; }
+        else return;                      // poly aftertouch (0xA0): no mapping path
+        if (cn > 140) return;
+        const ParamID pid = ccMap_[(size_t)chn * 141 + (size_t)cn];
+        if (pid == (ParamID)-1) return;
+        for (const PluginParam& p : params_) {
+            if (p.id != pid || p.readOnly) continue;
+            int32 qi, pi;
+            if (auto* q = pc.addParameterData(p.id, qi)) q->addPoint(offset, value, pi);
+            params_[(size_t)p.index].value = value;   // keep the cache and the UI in sync
+            break;
+        }
+    }
     void prepare(double sr, int maxBlock) override {
         audioBuffers_.prepare(maxBlock);
         ProcessSetup s{kRealtime, kSample32, maxBlock, sr}; proc_->setupProcessing(s);
@@ -271,18 +451,18 @@ public:
         if (comp_->getBusInfo(kAudio, kOutput, 0, bi) == kResultOk && bi.channelCount > 0) outBusCh_.store((int)bi.channelCount, std::memory_order_relaxed); else outBusCh_.store(2, std::memory_order_relaxed);
         vstLog("audio buses: in " + std::to_string(inBusCh_.load()) + " ch, out " + std::to_string(outBusCh_.load()) + " ch"); }
     void process(const float* in, float* out, int frames, int ch, Endpoint& ep) override {
-        // 1. MIDI events from the ring (cawsm, MIDI clips, device)
-        events_.clear(); MidiMsg m; int guard = 0;
+        // 1. MIDI events from the ring (cawsm, MIDI clips, device). CC / bend / aftertouch are
+        //    mapped too now (see mapMidi): the transport stop's all-notes-off MUST reach the
+        //    plugin, and a mapped CC drives its parameter live. The raw messages are also
+        //    captured for the editor feed; the audio thread never waits on the UI for that.
+        events_.clear(); changes_.clearQueue();
+        MidiMsg m; int guard = 0;
         while (ep.midiIn.pop(m) && ++guard < 512) {
-            Event e{}; e.busIndex = 0; e.sampleOffset = 0; e.ppqPosition = 0; e.flags = 0;
-            uint8_t st = m.status & 0xF0, chn = m.status & 0x0F;
-            if (st == 0x90 && m.d2 > 0) { e.type = Event::kNoteOnEvent; e.noteOn = {chn, m.d1, 0.f, m.d2 / 127.f, 0, -1}; }
-            else if (st == 0x80 || st == 0x90) { e.type = Event::kNoteOffEvent; e.noteOff = {chn, m.d1, m.d2 / 127.f, -1, 0.f}; }
-            else continue;                      // CC / bend: map to a plugin parameter via the IMidiMapping interface (TODO phase 2)
-            events_.addEvent(e);
+            { std::unique_lock<std::mutex> lock(tapMutex_, std::try_to_lock); if (lock.owns_lock() && tapEvents_.size() < 256) tapEvents_.push_back(m); }
+            mapMidi(m, events_, changes_, 0);
         }
         // 2. parameter changes from the ring (cawsp, automation lanes)
-        changes_.clearQueue(); ParamMsg pm; int32 qi;
+        ParamMsg pm; int32 qi;
         // Initial editor values (restored before the graph went live) reach the processor across the
         // next blocks, a bounded number per block: a burst of thousands of changes in one block makes
         // some plugins stop processing (Arturia ARP 2600 goes silent). Automation below is applied
@@ -323,6 +503,20 @@ public:
         proc_->process(d);
         if (out) for (int c = 0; c < ch; ++c) for (int i = 0; i < frames; ++i)
             out[(size_t)i * ch + c] = c < nOut ? outScratch_[(size_t)c][(size_t)i] : 0.f;   // channels the plugin does not have stay silent
+        // SEPARATED ENGINES: capture the first stereo pair of this block for the EDITOR
+        // instance's feed (EQ analyzers, scopes). Instruments capture silence - their GUI
+        // meters move on the dispatched notes, not on input audio. Never waits on the UI.
+        {
+            std::unique_lock<std::mutex> lock(tapMutex_, std::try_to_lock);
+            if (lock.owns_lock()) {
+                if (tapAudio_.size() != (size_t)frames * 2) tapAudio_.assign((size_t)frames * 2, 0.f);
+                const int ncap = in ? std::min(2, nIn) : 0;
+                for (int i = 0; i < frames; ++i)
+                    for (int c = 0; c < 2; ++c)
+                        tapAudio_[(size_t)i * 2 + (size_t)c] = c < ncap ? in[(size_t)i * ch + c] : 0.f;
+                tapFrames_ = frames;
+            }
+        }
         // 4. publish the last parameter values so code can read them (cawgp)
         if (ep.paramLast.size() == params_.size()) for (size_t i = 0; i < params_.size(); ++i) ep.paramLast[i].store((float)params_[i].value);
     }
@@ -457,8 +651,47 @@ public:
         err = "the plugin window is only available on Windows for now"; return false;
 #endif
     }
-    std::string getState() const override { return {}; }      // TODO: IComponent::getState via MemoryStream, base64 into the project file
-    void setState(const std::string&) override {}
+    // SEPARATED ENGINES: the full component state (Kontakt's loaded .nki, an FX preset, GUI-only
+    // state - binary, NOT expressible as parameters). Captured from the EDITOR instance and
+    // applied to the ENGINE instance (at engine creation via VstJob::stateBlob, or between blocks
+    // via VstRack::pushState). Base64 keeps the blob text-safe on the way through the app.
+    std::string getState() const override {
+        if (!comp_) return {};
+        try {
+            Steinberg::MemoryStream state;
+            if (comp_->getState(&state) != kResultTrue) return {};
+            Steinberg::int64 size = 0;
+            if (state.seek(0, Steinberg::IBStream::kIBSeekEnd, &size) != kResultOk || size <= 0) return {};
+            std::string raw; raw.resize((size_t)size);
+            state.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+            int32 got = 0;
+            if (state.read(&raw[0], (int32)raw.size(), &got) != kResultOk || got <= 0) return {};
+            raw.resize((size_t)got);
+            return base64Encode(raw);
+        } catch (...) { vstLog("state: capture threw - no state saved"); return {}; }
+    }
+    void setState(const std::string& blob) override {
+        if (!comp_ || blob.empty()) return;
+        std::string raw;
+        if (!base64Decode(blob, raw)) { vstLog("state: blob is not base64 - skipped (" + std::to_string(blob.size()) + " chars)"); return; }
+        if (raw.empty()) return;
+        try {
+            Steinberg::MemoryStream stream;
+            int32 written = 0;
+            if (stream.write((void*)raw.data(), (int32)raw.size(), &written) != kResultOk || written != (int32)raw.size()) {
+                vstLog("state: could not buffer the blob - skipped"); return;
+            }
+            stream.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+            const tresult applied = comp_->setState(&stream);
+            if (applied != kResultTrue) { vstLog("state: component refused the state, result=" + std::to_string((int)applied)); return; }
+            // The controller follows the patch too, so parameter reads / the GUI reflect it.
+            if (ctrl_) {
+                stream.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+                ctrl_->setComponentState(&stream);
+            }
+            vstLog("state: applied " + std::to_string(raw.size()) + " bytes" + (ctrl_ ? " (controller resynced)" : ""));
+        } catch (...) { vstLog("state: applying threw - the plugin keeps its previous state"); }
+    }
 private:
     static std::string u16to8(const TChar* s) { std::string o; for (; s && *s; ++s) o += (*s < 128) ? char(*s) : '?'; return o; }
     std::shared_ptr<VST3::Hosting::Module> module_; Steinberg::IPtr<PlugProvider> provider_;

@@ -143,6 +143,20 @@ if(CAW_VST3)
  endif()
  FetchContent_Declare(vst3sdk GIT_REPOSITORY https://github.com/steinbergmedia/vst3sdk.git GIT_TAG v3.7.12_build_20 GIT_SUBMODULES "base;pluginterfaces;public.sdk;cmake" GIT_SHALLOW ON)
  FetchContent_MakeAvailable(vst3sdk)
+ # The Steinberg SDK ships a RELATIVE archive output dir (lib/<config>). On the Visual Studio
+ # generator that resolves relative to each SDK .vcxproj's own folder, so when CAW is built
+ # out-of-tree or its build folder is reused after a deps-cache move, the linker looks for
+ # sdk_hosting.lib next to caw.vcxproj and fails with LNK1181. Pin every SDK static lib to an
+ # ABSOLUTE path inside THIS build tree; caw links them by target name, so the link line then
+ # always carries the real, resolved path.
+ foreach(_t sdk_hosting sdk_common base pluginterfaces)
+  if(TARGET ${_t})
+   set_target_properties(${_t} PROPERTIES
+     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib/$<CONFIG>"
+     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib/$<CONFIG>"
+     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
+  endif()
+ endforeach()
 endif()
 # ------------------------------------------------------------------ CAW
 set(CAW_SOURCES

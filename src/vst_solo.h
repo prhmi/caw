@@ -23,7 +23,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -36,16 +38,73 @@ using VstSoloNote = VstPlayNote;
 
 // One clip-code program of a VSTi track (see vst_script.h): the engine evaluates it on the
 // transport clock while Csound is OFF, so Run VST plays `note / cc / msg` code by itself.
+struct VstAutoPt { double t; double v; };   // one timeline automation point (seconds, normalized)
+
 struct VstScript {
     int trackId = 0, clipId = 0;
     double start = 0.0, dur = 1.0;
     std::string code;
     double params[8] = {0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5};   // P1..P8 start values (normalized)
+    // Timeline automation lanes (the C++ interpreter drives these, no Csound): for each slot k the
+    // lane name it is bound to (vstPickName) and that lane's points. A slot the clip code does NOT
+    // write is driven by its lane sampled at the transport time; a slot the code writes is owned by
+    // the code (the lane is ignored for it), so drawn ramps and `P1 = lfo(4)` never fight.
+    std::string pickName[8];
+    std::vector<VstAutoPt> autoPts[8];
 };
+
+// Linear interpolation of a sorted (by t) automation lane at time t; -1 if the lane is empty.
+inline double sampleVstAuto(const std::vector<VstAutoPt>& pts, double t) {
+    if (pts.empty()) return -1.0;
+    if (t <= pts.front().t) return pts.front().v;
+    if (t >= pts.back().t) return pts.back().v;
+    for (size_t i = 1; i < pts.size(); ++i) {
+        if (t < pts[i].t) {
+            const double ta = pts[i-1].t, tb = pts[i].t, va = pts[i-1].v, vb = pts[i].v;
+            return va + (vb - va) * ((tb > ta) ? (t - ta) / (tb - ta) : 0.0);
+        }
+    }
+    return pts.back().v;
+}
 
 class VstSoloEngine {
 public:
     using LogFn = std::function<void(const std::string&)>;
+
+    VstSoloEngine() {
+#ifdef CAW_VST3
+        // The STATE WORKER: full plugin state (Kontakt's loaded .nki) is applied here, NEVER on
+        // the audio thread and NEVER on the UI thread. A sampler loading a patch blocks for
+        // seconds and may synchronize with the plugin's own GUI thread (the host UI thread) -
+        // on the audio thread that deadlocked the app; on the UI thread it froze the interface.
+        // The worker holds the render mutex while applying: the audio callback try-locks the
+        // same mutex and skips blocks (a short dropout while the patch loads), the UI stays
+        // fully alive.
+        stateThread_ = std::thread([this] {
+            for (;;) {
+                std::pair<int, std::string> job;
+                {
+                    std::unique_lock<std::mutex> lock(stateMutex_);
+                    stateCv_.wait(lock, [this] { return !stateQ_.empty() || stateQuit_; });
+                    if (stateQ_.empty()) return;   // quit requested and queue drained
+                    job = std::move(stateQ_.front());
+                    stateQ_.pop_front();
+                }
+                {
+                    std::lock_guard<std::mutex> render(renderMutex_);
+                    rack_.applyStateNow(job.first, job.second);
+                }
+            }
+        });
+#endif
+    }
+    ~VstSoloEngine() {
+#ifdef CAW_VST3
+        { std::lock_guard<std::mutex> lock(stateMutex_); stateQuit_ = true; }
+        stateCv_.notify_all();
+        if (stateThread_.joinable()) stateThread_.join();
+#endif
+    }
 
     void setLog(LogFn log) { log_ = std::move(log); }
 
@@ -130,6 +189,7 @@ public:
         { std::lock_guard<std::mutex> mirrorLock(mirror_.mutex); mirror_.values.clear(); }
         { std::lock_guard<std::mutex> sl(stageMutex_); staged_.clear(); }
         { std::lock_guard<std::mutex> sl(scriptMutex_); scripts_.clear(); scriptsSig_ = 0; }
+        { std::lock_guard<std::mutex> sl(stateMutex_); stateQ_.clear(); }   // pending patch states die with the run: the next Run re-embeds them
         notesA_.clear(); notesB_.clear(); notesIndex_.store(0); cursor_.store(0);
         active_.clear();
         idle_ = false;
@@ -151,6 +211,7 @@ public:
         { std::lock_guard<std::mutex> mirrorLock(mirror_.mutex); mirror_.values.clear(); }
         { std::lock_guard<std::mutex> sl(stageMutex_); staged_.clear(); liveActive_.clear(); }
         { std::lock_guard<std::mutex> sl(scriptMutex_); scripts_.clear(); scriptsSig_ = 0; }
+        { std::lock_guard<std::mutex> sl(stateMutex_); stateQ_.clear(); }
         jobsSig_.clear(); activeIds_.clear();
         notesA_.clear(); notesB_.clear(); notesIndex_.store(0); cursor_.store(0);
         active_.clear();
@@ -300,6 +361,23 @@ public:
     }
     void pushParamOverride(int trackId, int slot, double value) { rack_.pushParamOverride(trackId, slot, value); touch(); }
     void pushParamValue(int trackId, int paramIndex, double value) { rack_.pushParamValue(trackId, paramIndex, value); touch(); }
+    // SEPARATED ENGINES: the editor instance's full plugin state (Kontakt's loaded .nki) reaches
+    // the engine's instance through the STATE WORKER (see the constructor) - parameters cannot
+    // express a loaded patch, and setState must never run on the audio or the UI thread.
+    void pushState(int trackId, const std::string& blob) {
+#ifdef CAW_VST3
+        if (blob.empty()) return;
+        { std::lock_guard<std::mutex> lock(stateMutex_); stateQ_.emplace_back(trackId, blob); }
+        stateCv_.notify_one();
+#else
+        (void)trackId; (void)blob;
+#endif
+    }
+    // SEPARATED ENGINES: the engine instance of a track - the source of the editor feed (EQ
+    // analyzers / synth meters). Null when the engine is off or the track is not loaded.
+#ifdef CAW_VST3
+    std::shared_ptr<caw::IPlugin> pluginOfTrack(int trackId) { return rack_.pluginOfTrack(trackId); }
+#endif
     // What the engine's plugins are actually using right now (P1..P8 of a track). Lets the UI follow
     // clip-code P writes and engine-side changes in this engine too, not only in the Csound rack.
     bool params(int trackId, double out[8]) {
@@ -446,6 +524,21 @@ private:
                     rack_.pushParamOverride(s.trackId, k, v);
                 }
             }
+            // Timeline automation (drawn lanes) feeds the slots the clip code does NOT write, sampled
+            // at the transport time. This is the C++ path: no Csound CawAuto ramps, no channels, and
+            // it works for VSTe exactly as for VSTi.
+            for (int k = 0; k < 8; ++k) {
+                if (e.prog.writesP[k]) continue;
+                if (s.autoPts[k].empty()) continue;
+                const double av = sampleVstAuto(s.autoPts[k], t0);
+                if (av < 0.0) continue;
+                const double v = std::min(1.0, std::max(0.0, av));
+                if (!e.lastPValid[k] || std::fabs(v - e.lastP[k]) > 1e-4) {
+                    e.lastP[k] = v;
+                    e.lastPValid[k] = true;
+                    rack_.pushParamOverride(s.trackId, k, v);
+                }
+            }
         }
     }
 
@@ -526,7 +619,14 @@ private:
     VstRack rack_;
     VstParamMirror mirror_;   // engine -> UI: the P1..P8 values the plugins are actually using
     std::atomic<bool> rackReady_{false};
-    std::mutex renderMutex_;            // audio callback (try-lock) vs load / unload / transport resets
+    std::mutex renderMutex_;            // audio callback (try-lock) vs load / unload / transport resets / patch-state worker
+    // The patch-state worker's queue (see the constructor): full plugin state blobs waiting to
+    // be applied to the engine instances while the render mutex is held.
+    std::deque<std::pair<int, std::string>> stateQ_;
+    std::mutex stateMutex_;
+    std::condition_variable stateCv_;
+    std::thread stateThread_;
+    bool stateQuit_ = false;
     std::atomic<bool> engineOn_{false};
     std::set<int> liveActive_;          // stageMutex_ guarded: the instruments that sound (live M / S)
     std::set<int> renderActive_;        // audio thread copy of liveActive_

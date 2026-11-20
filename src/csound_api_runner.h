@@ -42,7 +42,10 @@ public:
     // added / removed or its .vst3 changed, otherwise it only re-points the effect inputs and the
     // AUDIO OUTPUT. Pushed by the UI on every wiring / plugin change - no Run needed.
     void setVstWiring(const std::vector<VstJob>& jobs);
-    // Live M / S: the set of VST track ids that should keep sounding. Updated by the UI whenever a
+    // SEPARATED ENGINES: Csound loads NO VST plugins. It only captures these named clip tap
+    // channels (engine 0 sources, cawtap_*) once per ksmps cycle into the vsttaps rings, so the
+    // 4th engine's rack can consume Csound clip audio without touching Csound's thread.
+    void setVstTaps(const std::vector<std::string>& channels);    // Live M / S: the set of VST track ids that should keep sounding. Updated by the UI whenever a
     // track's mute or solo changes; the rack skips every loaded track whose id is not in the set.
     void setVstActiveTracks(const std::set<int>& ids);
     // Live VSTE input on/off: bit i set = input slot i of that track feeds the plugin. The rack

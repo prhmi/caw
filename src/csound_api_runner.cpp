@@ -174,6 +174,9 @@ struct CsoundApiRunner::Impl {
     std::map<int, unsigned> vstInputMasks;   // bit i = input slot i feeds the plugin (live on/off)
     std::map<std::string, double> vstParamOverrides;
     std::map<std::string, void*> vstParamChans;
+    std::vector<std::string> vstTaps;             // SEPARATED ENGINES: clip taps captured per cycle
+    std::map<std::string, void*> vstTapChans;     // resolved tap channel pointers (render thread)
+    std::vector<float> vstTapCopy;                // ksmps scratch for one tap channel (render thread)
     VstParamMirror vstMirror;                // engine -> UI: the kP1..kP8 values the rack is using
     VstRack* vstRackPtr = nullptr;           // valid only while the worker's render loop runs (vstMutex)
     VstEngineAudio vstEa;                    // realtime mixes the rack can consume (PD / SC)
@@ -463,6 +466,7 @@ struct CsoundApiRunner::Impl {
                 std::set<int> vstActiveNow; bool vstActiveValid = false;
                 std::map<int, unsigned> vstMasksNow;
                 std::set<int> vstPdMasterNow, vstScMasterNow;
+                std::vector<std::string> vstTapsNow;
                 bool pdRawSuppressed = false;
                 {
                     std::vector<std::pair<std::string, double>> overrides;
@@ -471,6 +475,7 @@ struct CsoundApiRunner::Impl {
                       vstParamOverrides.clear();
                       vstActiveNow = vstActive; vstActiveValid = vstActiveSet;
                       vstMasksNow = vstInputMasks;
+                      vstTapsNow = vstTaps;
                       vstPdMasterNow = vstPdMaster; vstScMasterNow = vstScMaster; }
                     // An ACTIVE master-mode VSTe replaces the raw PD / SC mix with its processed
                     // output: suppress the raw mixes while it runs (SC needs the flag because the
@@ -494,6 +499,25 @@ struct CsoundApiRunner::Impl {
                             if (sampleBytes == 8) *static_cast<double*>(it->second) = ov.second;
                             else *static_cast<float*>(it->second) = static_cast<float>(ov.second);
                         }
+                    }
+                }
+                // SEPARATED ENGINES: Csound clip taps for the 4th engine's rack. Captured once per
+                // ksmps cycle into the vsttaps rings, so the VST rack (outside this thread) can
+                // consume Csound clip audio - and a VST-side stall can never reach this thread.
+                if (!vstTapsNow.empty() && blockSize > 0) {
+                    for (const std::string& name : vstTapsNow) {
+                        auto itc = vstTapChans.find(name);
+                        if (itc == vstTapChans.end() || !itc->second) {
+                            void* p = nullptr;
+                            if (channelPtr(cs, &p, name.c_str(), 2 | 16 | 32) == 0 && p) { vstTapChans[name] = p; itc = vstTapChans.find(name); }
+                        }
+                        if (itc == vstTapChans.end() || !itc->second) continue;
+                        const void* chp = itc->second;
+                        if (vstTapCopy.size() < (size_t)blockSize) vstTapCopy.resize((size_t)blockSize);
+                        for (int n = 0; n < blockSize; ++n)
+                            vstTapCopy[(size_t)n] = sampleBytes == 8 ? (float)static_cast<const double*>(chp)[n]
+                                                                     : static_cast<const float*>(chp)[n];
+                        vsttaps::push(name, vstTapCopy.data(), blockSize);
                     }
                 }
                 const void* buffer = (hostOutput || captureEnabled || offline) ? spout(cs) : nullptr;
@@ -669,6 +693,8 @@ struct CsoundApiRunner::Impl {
         {   // the rack object is about to go out of scope: no more UI overrides can reach it
             std::lock_guard<std::mutex> lock(vstMutex);
             vstRackPtr = nullptr;
+            vstTapChans.clear();
+            vsttaps::clear();   // SEPARATED ENGINES: no worker pushing - the 4th engine holds last / warns
             pdMixPtr.store(nullptr, std::memory_order_release);
             if (scRawSuppress) scRawSuppress->store(false, std::memory_order_release);
         }
@@ -919,6 +945,12 @@ void CsoundApiRunner::setVstWiring(const std::vector<VstJob>& jobs) {
     if (d->vstRackPtr) d->vstRackPtr->queueJobs(jobs);
     d->vstInChDirty.store(true);   // a new VSTe: its cawvstin_* channels are created before its code compiles
     d->rebuildVstMasters();
+}
+void CsoundApiRunner::setVstTaps(const std::vector<std::string>& channels) {
+    std::lock_guard<std::mutex> lock(d->vstMutex);
+    if (d->vstTaps == channels) return;
+    d->vstTaps = channels;
+    d->vstTapChans.clear();   // re-resolve the changed channel set on the next cycle
 }
 void CsoundApiRunner::setVstActiveTracks(const std::set<int>& ids) {
     std::lock_guard<std::mutex> lock(d->vstMutex);

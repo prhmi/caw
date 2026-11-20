@@ -7,6 +7,18 @@
 
 namespace caw {
 struct PluginParam { int index = 0; unsigned id = 0; std::string title, units; double def = 0, value = 0; int steps = 0; bool readOnly = false; };
+struct MidiMsg;   // caw_bus.h
+
+// SEPARATED ENGINES: one snapshot of what the ENGINE instance just rendered - its input audio and
+// the MIDI it dispatched - drained by vstui::queueEditorTasks (the editor housekeeping worker) and replayed on the
+// EDITOR instance (processIdle) so plugin GUIs show live content: an EQ gets real audio for its
+// analyzer waves, a synth gets the notes for its meters. Without this the editor instance only
+// ever processes silence and every plugin window looks dead.
+struct EditorFeed {
+    std::vector<float> audio;        // interleaved stereo of the block (empty = silence)
+    int frames = 0;                  // frames in audio (audio.size() == frames * 2)
+    std::vector<MidiMsg> events;     // the MIDI messages dispatched on the captured blocks
+};
 
 // Format-neutral. VST3 now; CLAP / LV2 / AU can implement the same thing later.
 struct IPlugin {
@@ -39,6 +51,16 @@ struct IPlugin {
     // the plugin's own window changes a parameter. This is how ANY editor knob reaches the
     // running engine in real time (not just the 8 picked parameters).
     virtual void setLiveEditHook(std::function<void(int, double)> hook) { (void)hook; }
+    // SEPARATED ENGINES: UI-thread idle tick for the EDITOR instance (not the audio one). Kontakt
+    // and other sampler-style plugins only finish their loading screen and move their meters when
+    // their component is processed. Called at a low cadence from vstui::queueEditorTasks; the
+    // engine instance on the audio path is untouched. `feed` (optional) carries the engine's last
+    // block - real input audio for an EQ's analyzer, the dispatched notes for a synth's meters -
+    // so the plugin window shows what the engine actually does. Default no-op.
+    virtual void processIdle(int frames, const EditorFeed* feed = nullptr) { (void)frames; (void)feed; }
+    // The engine-side snapshot for the editor feed, drained by the UI thread. Returns false when
+    // nothing was captured yet. Default: no feed.
+    virtual bool takeEditorFeed(EditorFeed& out) { (void)out; return false; }
     virtual std::string getState() const = 0;              // for saving into the project
     virtual void setState(const std::string& blob) = 0;
 };

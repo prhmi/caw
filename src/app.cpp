@@ -119,7 +119,7 @@ std::unique_ptr<CawAudioOutput> g_vstSoloOutput;
 std::unique_ptr<MonitorCapture> g_vstSoloCapture;
 uint64_t g_vstSoloSnapshotSeq = 0;
 bool g_vstEngineOn = false;            // the "Run VST" button: CAW's own instrument engine is running
-bool g_vstHostedInCsound = false;      // true while the Csound engine's rack owns the VST graph (the 4th engine stays silent)
+bool g_vstHostedInCsound = false;      // SEPARATED ENGINES: always false - the 4th engine owns the VST graph in every mode
 double g_vstRetryT = 0.0;              // seconds until the dedicated output may be retried
 std::string g_vstFailedSig;            // the instrument set that failed to load; cleared by a re-pick / a new set
 double g_vstFailedRetryT = 0.0;        // seconds until a failed instrument load is tried again
@@ -149,8 +149,8 @@ void scRealtimeSource(void* context, float* output, unsigned long frames, int ch
         if (g_scRawSuppress.load(std::memory_order_acquire))
             std::fill(output, output + (size_t)frames * (size_t)channels, 0.f);   // a master-mode VSTe replaces the raw mix
     }
-    if (!g_vstHostedInCsound)
-        vstSolo().renderMix(output, (int)frames, channels);   // the 4th engine: only while it owns the VST graph
+    if (g_vstEngineOn)
+        vstSolo().renderMix(output, (int)frames, channels);   // SEPARATED ENGINES: the 4th engine always owns the VST graph
 }
 void attachScRealtimeSource(CawAudioSettings& settings) {
     settings.realtimeSource = &scRealtimeSource;
@@ -3915,7 +3915,7 @@ void updateMeters(float dt) {
         for(float& db:entry.second)db=std::max(-100.f,db-36.f*dt);
     for(auto& entry:g_vstMeterDb)
         for(float& db:entry.second)db=std::max(-100.f,db-36.f*dt);
-    if (g_vstEngineOn || g_vstHostedInCsound) {   // the rack of whichever engine hosts the VST graph
+    if (g_vstEngineOn) {   // the 4th engine's rack - it always hosts the VST graph (SEPARATED ENGINES)
         std::vector<VstRack::SoloPeak> peaks;
         vstSolo().takePeaks(peaks);
         for (const auto& p : g_apiProc.takeVstPeaks()) peaks.push_back({p.trackId, p.l, p.r});
@@ -4030,6 +4030,7 @@ std::vector<VstJob> collectVstJobs(const Project& project, const std::vector<Lan
         if (!ignoreMuteSolo && (t.muted || (anySolo && !t.solo))) continue;
         VstJob j; j.id = t.id; j.name = vstBusName(t); j.path = t.vstPath; j.classId = t.vstClassId;
         j.parameterState = t.vstParameterState;
+        j.stateBlob = vstui::editorStateBlob(t.id);   // SEPARATED ENGINES: the editor instance's loaded patch (Kontakt .nki) - empty until captured
         j.instrument = t.kind == 3; j.pick = t.vstPick; j.init = t.vstInit;
         j.outMode = t.vstOutMode == 1 ? 1 : 0;
         bool anyIn = false;
@@ -4088,6 +4089,24 @@ std::vector<VstJob> collectVstEngineJobs() {
     return collectVstJobs(g_proj, {}, true);   // muted or not: M / S are applied live
 }
 
+// The Csound clip tap channels (engine 0) the Csound worker must capture per ksmps cycle for the
+// 4th engine's VST rack. SEPARATED ENGINES: Csound never loads VST plugins - it only publishes
+// these taps, so VST-side churn (editor opens, plugin reloads) can never reach Csound's audio.
+std::vector<std::string> collectVstTapChannels(const std::vector<VstJob>& jobs) {
+    std::vector<std::string> out;
+    std::set<std::string> seen;
+    for (const VstJob& j : jobs)
+        for (const auto& in : j.inputs) {
+            if (!in.on || in.engine != 0) continue;
+            for (const std::string& c : in.csChans)
+                if (seen.insert(c).second) out.push_back(c);
+        }
+    return out;
+}
+void pushVstTapsToCsound() {
+    g_apiProc.setVstTaps(collectVstTapChannels(collectVstJobs(g_proj, g_engineMeters, true)));
+}
+
 // The MIDI-clip notes of the instrument tracks as one absolute-time schedule. A VSTi track's
 // own MIDI clips go straight to its plugin; MIDI clips on any other track still route through
 // their target clip (clipId) - when that clip lives on a VSTi track, its notes drive that plugin.
@@ -4100,14 +4119,14 @@ std::vector<VstSoloNote> buildVstSoloNotes() {
         for (const MidiClip& mc : t.midiClips) {
             if (mc.muted) continue;
             int targetTrackId = -1;
-            if (t.kind == 3) {
-                targetTrackId = t.id;
+            if (t.kind == 3 || t.kind == 4) {
+                targetTrackId = t.id;   // VSTi or VSTe: MIDI clips drive the plugin directly
             } else {
                 int laneIdx = -1;
                 const Clip* target = findClip(mc.clipId, &laneIdx);
                 if (!target || target->muted || laneIdx < 0) continue;
                 const Track& vt = g_proj.tracks[(size_t)laneIdx];
-                if (vt.kind != 3 || vt.muted || (anySolo && !vt.solo)) continue;   // not a VSTi: the Csound path plays it
+                if ((vt.kind != 3 && vt.kind != 4) || vt.muted || (anySolo && !vt.solo)) continue;   // not a VST track: the Csound path plays it
                 targetTrackId = vt.id;
             }
             for (const MidiNote& n : mc.notes) {
@@ -4133,7 +4152,7 @@ std::vector<VstScript> buildVstScripts() {
     bool anySolo = false;
     for (const Track& t : g_proj.tracks) if (t.solo && !t.muted) anySolo = true;
     for (const Track& t : g_proj.tracks) {
-        if (t.kind != 3 || t.muted || (anySolo && !t.solo)) continue;
+        if ((t.kind != 3 && t.kind != 4) || t.muted || (anySolo && !t.solo)) continue;   // VSTi (3) AND VSTe (4): the clip code runs in C++ here
         for (const Clip& c : t.clips) {
             if (c.muted || c.code.empty()) continue;
             VstScript s;
@@ -4146,6 +4165,16 @@ std::vector<VstScript> buildVstScripts() {
                 double v = k < (int)t.vstInit.size() ? t.vstInit[(size_t)k] : 0.5;
                 s.params[k] = std::isfinite(v) ? std::min(1.0, std::max(0.0, v)) : 0.5;
             }
+            // Bind each slot to its timeline automation lane (vstPickName) so the C++ interpreter
+            // drives the slots the clip code does not write - the drawn ramps, no Csound.
+            for (int k = 0; k < 8; ++k) {
+                s.pickName[k] = k < (int)t.vstPickName.size() ? t.vstPickName[(size_t)k] : std::string();
+                if (!s.pickName[k].empty()) {
+                    auto it = t.automation.find(s.pickName[k]);
+                    if (it != t.automation.end())
+                        for (const AutoPoint& ap : it->second) s.autoPts[k].push_back({ap.t, ap.v});
+                }
+            }
             out.push_back(std::move(s));
         }
     }
@@ -4156,24 +4185,34 @@ std::vector<VstScript> buildVstScripts() {
 // SC's all get the mix through the realtime hook instead). Only while the VST engine runs.
 void ensureVstSoloOutput() {
     if (!g_vstEngineOn || !vstSolo().ready() || g_vstSoloOutput || g_vstRetryT > 0.0) return;   // no plugin: no stream
-    if (scHasSharedAudioOwner() || g_scSoloOutput || g_playing || g_testSound.running() || g_renderActive) return;
+    // SEPARATED ENGINES: the 4th engine owns the VST graph in EVERY mode. API Csound (whose stream
+    // mixes this engine via renderMix), PD and SC block a dedicated stream here; the command-line
+    // Csound opens ITS OWN device, so the VST engine still needs one in that mode.
+    if (scHasSharedAudioOwner() || g_scSoloOutput || g_testSound.running() || g_renderActive) return;
     if (!g_audioDevicesReady) refreshAudioDevices(false);
     if (g_proj.cs.outDev == -2) return;   // no output chosen: Settings already asks for one
-    auto output = std::make_unique<CawAudioOutput>();
     CawAudioSettings settings = pdAudioSettings();
-    auto capture = std::make_unique<MonitorCapture>(settings.sampleRate, settings.channels);
-    output->setMonitorCapture(capture.get());
     std::string error;
-    if (!output->open(settings, error)) {
-        logLine("[caw] VST engine output: " + error);
-        g_vstRetryT = 20.0;   // do not retry (and log) every frame
-        return;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (attempt == 1) {   // the selected device failed: re-enumerate, then fall back to the default output
+            refreshAudioDevices(true);
+            settings = pdAudioSettings();
+            if (settings.deviceLabel == "<selected device missing>") settings.deviceLabel.clear();   // empty label = PortAudio default
+        }
+        auto output = std::make_unique<CawAudioOutput>();
+        auto capture = std::make_unique<MonitorCapture>(settings.sampleRate, settings.channels);
+        output->setMonitorCapture(capture.get());
+        if (output->open(settings, error)) {
+            output->setExpectingAudio(false);
+            g_vstSoloCapture = std::move(capture);
+            g_vstSoloOutput = std::move(output);
+            g_vstSoloSnapshotSeq = 0;
+            logLine("[caw] VST engine: playing through " + g_vstSoloOutput->description());
+            return;
+        }
     }
-    output->setExpectingAudio(false);
-    g_vstSoloCapture = std::move(capture);
-    g_vstSoloOutput = std::move(output);
-    g_vstSoloSnapshotSeq = 0;
-    logLine("[caw] VST engine: playing through " + g_vstSoloOutput->description());
+    logLine("[caw] VST engine output: " + error + " (the selected device and the default both failed) - retrying in 2 s.");
+    g_vstRetryT = 2.0;   // retry quickly: while no stream carries audio, the 4th engine cannot render at all
 }
 
 // Any VST track - instrument OR effect. The 4th engine hosts both: an effect's parameters, picks
@@ -4196,8 +4235,8 @@ std::set<int> collectVstActiveTracks(const Project& project) {
     return ids;
 }
 
-// What the 4th engine processes: live M / S. Effects take part too - it is the effect rack while
-// Csound is off (with Csound on, g_vstHostedInCsound keeps this engine silent).
+// What the 4th engine processes: live M / S. Effects take part too - it is the effect rack in
+// every mode (SEPARATED ENGINES: this engine always hosts the VST graph, Csound never does).
 std::set<int> vstSoloActiveIds() {
     return collectVstActiveTracks(g_proj);
 }
@@ -4271,6 +4310,22 @@ void wireVstUiHooks() {
         g_apiProc.pushVstParamValue(trackId, paramIndex, value);
         if (g_vstEngineOn && trackIsVst(trackId)) vstSolo().pushParamValue(trackId, paramIndex, value);
     };
+    vstui::pushVstStateLive = [](int trackId, const std::string& blob) {
+        // SEPARATED ENGINES: the editor instance's full state (Kontakt's loaded .nki) reaches the
+        // 4th engine's instance through the STATE WORKER (vst_solo.h): setState runs neither on
+        // the audio thread nor on the UI thread - a sampler loading a patch must not deadlock
+        // either. The offline render gets the blob through collectVstJobs, so exports carry it too.
+        if (g_vstEngineOn) vstSolo().pushState(trackId, blob);
+    };
+#ifdef CAW_VST3
+    vstui::editorFeedSource = [](int trackId) -> std::shared_ptr<caw::IPlugin> {
+        // SEPARATED ENGINES: the 4th engine always hosts the VST graph, so its instances hear the
+        // real audio and the real notes. The editor instance replays that snapshot (processIdle)
+        // so the plugin's own GUI shows live analyzers / scopes / meters instead of a dead UI.
+        if (!g_vstEngineOn) return {};
+        return vstSolo().pluginOfTrack(trackId);
+    };
+#endif
     vstui::pushVstOutModeLive = [](int trackId, int mode) {
         g_apiProc.setVstOutModeLive(trackId, mode);
         if (g_vstEngineOn) vstSolo().setOutMode(trackId, mode);   // the effect may run in the VST engine
@@ -4281,18 +4336,18 @@ void wireVstUiHooks() {
         if (g_vstEngineOn) vstSolo().setInputMasks(masks);
         // The checkbox also changes the slot's configured state, so the jobs are re-pointed too:
         // an input that was off at Run can be switched ON live and start feeding at once.
-        if (g_langVst && g_liveCsound && g_useCsoundApi) g_apiProc.setVstWiring(collectVstJobs(g_proj, g_engineMeters, true));
+        if (g_langVst && g_liveCsound && g_useCsoundApi) pushVstTapsToCsound();   // SEPARATED: taps only - the VST graph lives in the 4th engine
         if (g_vstEngineOn) vstSolo().setWiring(collectVstEngineJobs());
         if (g_liveCsound && g_useCsoundApi) g_apiProc.setControlChannels(vstGateValues());   // an input switched off stops replacing
     };
     vstui::pushVstWiring = []() {   // an input mode / name changed: re-route the effect now, no Run
-        if (g_langVst && g_liveCsound && g_useCsoundApi) g_apiProc.setVstWiring(collectVstJobs(g_proj, g_engineMeters, true));
+        if (g_langVst && g_liveCsound && g_useCsoundApi) pushVstTapsToCsound();   // SEPARATED: taps only - the VST graph lives in the 4th engine
         if (g_vstEngineOn) vstSolo().setWiring(collectVstEngineJobs());
         if (g_liveCsound && g_useCsoundApi) g_apiProc.setControlChannels(vstGateValues());
     };
-    // A .vst3 finished loading into the editor: the engine applies it NOW (not up to 0.5 s later),
-    // and when the transport is already playing it comes up by itself - a VSTi track plays in
-    // every situation, also when Run VST was never pressed. A re-picked plugin also gets a new
+    // A .vst3 finished loading into the editor: the engine applies it NOW (not up to 0.5 s later)
+    // while it runs. The engine itself is only started by its own button (Run VST / the combined
+    // Run button) - Play and a plugin pick never start it. A re-picked plugin also gets a new
     // attempt after a failed load.
     vstui::notifyPluginLoaded = [](int trackId) {
         const Track* t = nullptr;
@@ -4300,9 +4355,9 @@ void wireVstUiHooks() {
         if (!t) return;
         g_vstFailedSig.clear(); g_vstFailedRetryT = 0.0;
         if (g_langVst && g_liveCsound && g_useCsoundApi)
-            g_apiProc.setVstWiring(collectVstJobs(g_proj, g_engineMeters, true));   // the Csound rack reloads the new .vst3 live, no Run and no delete / re-create
-        if (t->kind == 3 && !g_vstEngineOn) { if (g_timelineRun && g_langVst) startVstEngine(); return; }   // VST not enabled for the session: do not auto-run
-        if (g_vstEngineOn) vstui::prepareEditorPlugin(trackId, g_proj.cs.sr, g_proj.cs.ksmps > 0 ? g_proj.cs.ksmps : 512);
+            pushVstTapsToCsound();   // SEPARATED: Csound never reloads plugins - the 4th engine loads the new .vst3 by itself
+        if (!g_vstEngineOn) return;   // the engine is off: the plugin waits for Run VST
+        vstui::prepareEditorPlugin(trackId, pdAudioSettings().sampleRate, 512);   // SEPARATED: the editor format follows the audio device (the VST engine's own format) - never Csound's ksmps. Both VSTi and VSTe: an unprepared editor instance never processes, so its GUI (EQ waves, meters) stays dead.
         vstEngineCheckJobs(10.0f);   // past the 0.5 s gate: the changed plugin set is applied on this frame
     };
     // Values the engine's plugins are actually using: the Csound rack first, then the 4th engine
@@ -4320,8 +4375,9 @@ void wireVstUiHooks() {
 // whatever stream is open (or opens its own). It does not need Csound; when Csound runs too, the
 // notes written by clip code (note / cc / msg) and the P1..P8 channels are forwarded into it.
 void vstEngineJoinTransport() {   // notes + loop + position, from the current playhead
-    // The Csound rack needs nothing here: its own score plays the MIDI clips into every VSTi's note
-    // ring on the Csound clock. Only CAW's own VST engine (Csound off) gets the schedule pushed.
+    // SEPARATED ENGINES: the 4th engine hosts the VST graph in every mode, so IT gets the schedule
+    // pushed here (the CSD's CawVstNote helper instruments are dead code while separated - nothing
+    // consumes their note rings any more).
     const std::vector<VstSoloNote> notes = buildVstSoloNotes();
     if (!g_vstEngineOn) return;
     vstSolo().setNotes(notes);
@@ -4371,7 +4427,7 @@ bool applyVstInstrumentJobs(const std::vector<VstJob>& jobs) {   // (re)load the
 // stream. ONE function for every path (Run VST, a plugin picked later, a retry), so the order in
 // which the user does things can never leave the engine half-started.
 void vstEngineAfterLoad() {
-    vstSolo().setScripts(engineIsUp() ? std::vector<VstScript>() : buildVstScripts());   // clip code runs in this engine when Csound is off
+    vstSolo().setScripts(buildVstScripts());   // clip code ALWAYS runs here, in C++ - separated from Csound
     vstSolo().setWiring(collectVstEngineJobs());   // the effect inputs / output modes as configured now
     if (g_timelineRun) vstEngineJoinTransport();   // Play was already running: join it from the playhead
     else { vstSolo().setNotes(buildVstSoloNotes()); vstSolo().setLoop(timeline_loop::valid(g_proj), g_proj.loopStart, g_proj.loopEnd); }
@@ -4414,7 +4470,7 @@ void startVstEngine() {
     g_vstEngineOn = true;
     // Editor-side VST3 instances may have been opened before Run VST. Once the engine format is
     // known, negotiate it with those instances too (without starting a second audio processor).
-    vstui::prepareAllEditorPlugins(g_proj, g_proj.cs.sr, g_proj.cs.ksmps > 0 ? g_proj.cs.ksmps : 512);
+    vstui::prepareAllEditorPlugins(g_proj, pdAudioSettings().sampleRate, 512);   // SEPARATED: device format - the editor instances match the VST engine, never Csound's ksmps
     g_vstRetryT = 0.0;
     g_vstFailedSig.clear();
     g_vstFailedRetryT = 0.0;
@@ -4474,19 +4530,12 @@ void vstEngineCheckJobs(float dt) {
     g_vstJobsT += dt;
     if (g_vstJobsT < 0.5) return;
     g_vstJobsT = 0.0;
-    {   // Clip code: this engine interprets it only while Csound is off. A running Csound translates
-        // the same code and forwards its notes, so the scripts are empty then (no double notes).
-        static int scriptsMode = -1;
-        const bool csUp = engineIsUp();
-        vstSolo().setScripts(csUp ? std::vector<VstScript>() : buildVstScripts());
-        const int mode = csUp ? 0 : 1;
-        if (mode != scriptsMode) {
-            const bool hadMode = scriptsMode >= 0;
-            scriptsMode = mode;
-            if (!hadMode) { /* first check after Run VST: quiet */ }
-            else if (mode == 1) logLine("[caw] VST engine: Csound is off - the clip code (note / cc / msg, P1..P8) runs in the VST engine.");
-            else logLine("[caw] VST engine: Csound is on again - it translates the clip code and forwards its notes.");
-        }
+    {   // Clip code: this engine ALWAYS interprets it, in C++ - separated from Csound. Csound never
+        // translates VST clip code any more (it never loads VST plugins), so there are no double
+        // notes and no Csound-side parameter channels fighting the C++ interpreter.
+        static bool scriptsLogged = false;
+        vstSolo().setScripts(buildVstScripts());
+        if (!scriptsLogged) { scriptsLogged = true; logLine("[caw] VST engine: the clip code (note / cc / msg, P1..P8) runs in C++ here, separated from Csound."); }
     }
     pushVstActiveLive();   // whichever engine hosts the VST graph follows the live M / S state
     const std::vector<VstJob> jobs = collectVstEngineJobs();
@@ -4565,13 +4614,10 @@ void commandPlayFrom(double t, bool stopFirst) {
         int type = ev.automation ? 11 : 10;
         int ix = 0;
         if (!ev.automation && ev.name.rfind("CawVstNote_", 0) == 0) {
-            // MIDI-clip notes of the VSTi tracks. While Csound hosts the VST graph, its score fires
-            // the note helper (CawVstNote_<id>), which writes the note into the plugin's ring - the
-            // same transport and clock as the Csound clips. Without Csound hosting, CAW's 4th
-            // engine schedules them itself (audio-rate, loop-aware), so they are not sent here.
-            if (!g_vstHostedInCsound) continue;
-            type = 14;
-            ix = numberOf(g_engVstNotes, ev.name);
+            // SEPARATED ENGINES: Csound never hosts the VST graph, so its score never fires the
+            // CawVstNote helper instruments - CAW's 4th engine schedules the MIDI-clip notes
+            // itself (audio-rate, loop-aware; see vstEngineJoinTransport). Nothing to send here.
+            continue;
         } else {
             ix = ev.automation ? numberOf(g_engChans, ev.name) : numberOf(g_engClips, ev.name);
         }
@@ -4775,19 +4821,18 @@ void startEngine() {
             for (const auto& device : g_outDevs)
                 if (device.id == selected) { audio.deviceLabel = device.name; break; }
         }
-        {   // The whole VST graph lives in the engine while Csound runs: instruments AND effects in
-            // ONE rack, on Csound's block clock. The rack reads each track's note ring
-            // (cawvst_<id>_wr/tab - the score's CawVstNote_<id> writes the MIDI clip notes there)
-            // and parameter channels for clip code, renders instruments first so a VSTi feeds a
-            // VSTe in the same block, and mixes straight into the Csound output - the 4th engine's
-            // rules, on this engine. It goes silent while this one runs (g_vstHostedInCsound).
-            wireVstUiHooks();   // the panel edits reach THIS rack too (wiring, output mode, plugin change)
+        {   // SEPARATED ENGINES: Csound renders ONLY its own instruments - it never loads or owns
+            // VST plugins. The whole VST graph (instruments AND effects) lives in the independent
+            // 4th engine (vst_solo.h) on its own thread and FIFO, so opening a plugin editor,
+            // re-negotiating an instance or any plugin-side churn can never stall or race Csound's
+            // audio. Csound clip taps (engine 0) still reach VSTe inputs: this worker captures the
+            // named tap channels per ksmps cycle (setVstTaps) and the 4th engine's rack pops them.
+            wireVstUiHooks();   // the panel edits reach the 4th engine's rack (wiring, output mode, plugin change)
             vstui::captureAllParameters(g_proj);   // Run bakes exactly what the plugin GUIs show right now
-            // Every VST track is loaded whatever its M / S state: mute / solo are applied live, so a
-            // muted track must still be in the rack to come back without a Run.
+            // Every VST track is considered whatever its M / S state: mute / solo are applied live.
             std::vector<VstJob> rackJobs = collectVstJobs(g_proj, g_engineMeters, true);
-            if (!g_langVst) rackJobs.clear();   // VST unchecked for the session: no VST plugin is loaded either
-            g_apiProc.setVstJobs(rackJobs);
+            if (!g_langVst) rackJobs.clear();   // VST unchecked for the session: no taps either
+            g_apiProc.setVstTaps(collectVstTapChannels(rackJobs));   // taps only - Csound loads NO VST plugins
             g_apiProc.setVstActiveTracks(collectVstActiveTracks(g_proj));   // initial live M / S state
             g_apiProc.setVstInputMasks(collectVstInputMasks(g_proj));       // initial live input on/off state
             // Source gates (cawvstmix_<clip>_<id>): 1 = that master-mode effect replaces the clip,
@@ -4817,7 +4862,9 @@ void startEngine() {
     }
     g_playing = true;
     g_liveCsound = true;
-    g_vstHostedInCsound = g_useCsoundApi;   // the engine's rack owns the VST graph now; the 4th engine must not render
+    g_vstHostedInCsound = false;   // SEPARATED ENGINES: the 4th engine always owns the VST graph, Csound never does
+    if (g_langVst && g_useCsoundApi && !g_vstEngineOn && !collectVstEngineJobs().empty())
+        startVstEngine();   // VST tracks keep sounding with Csound: the 4th engine starts with Run Csound
     g_mixedPd = mixedRequested;
     if(g_mixedPd){g_pdTimelineEvents=std::move(mixedPlan);g_pdNeedsReload=false;g_pdPlanUpdateFailed=false;g_pdPlanT=0.0;}
     g_playWaiting = true;
@@ -5477,12 +5524,12 @@ void tickLiveCodeEdits() {
             if (t.kind == 5 || t.kind == 6) continue;   // PD / SC live in their own editors
             for (const Clip& c : t.clips) {
                 if (c.id != entry.first) continue;
-                if (engineIsUp()) applyLiveClipCode(c, t);
-                else if (g_vstEngineOn && t.kind == 3) vstOnly = true;
+                if (t.kind == 3 || t.kind == 4) vstOnly = true;   // SEPARATED: VST clip code always goes to the C++ interpreter - no Csound round-trip
+                else if (engineIsUp()) applyLiveClipCode(c, t);
                 break;
             }
         }
-        if (vstOnly) {   // no Csound: the VST engine interprets the edited clip code itself
+        if (vstOnly && g_vstEngineOn) {   // SEPARATED: the VST engine interprets the edited clip code itself, in C++
             vstSolo().setScripts(buildVstScripts());
             logLine("[caw] live code: the VST engine is using the edited clip code.");
         }
@@ -5695,6 +5742,7 @@ void pollProcesses(float dt) {
         g_pdTimelineEvents.clear();
         restoreScSoloOutput();
     }
+    vstui::captureParameters(g_proj);   // EVERY frame: the editor idle tick (plugin GUIs: EQ waves, synth meters, Kontakt keys) and the live editor-state poll (Kontakt's .nki -> engine). Without this they only ran on save / engine start / reload / export.
     vstEngineTick(dt);   // VST engine: log, own stream, plugin changes
     // The PD engine was rebuilt while the transport kept running (a different set of PD
     // clips). Rejoin as soon as its new stream is ready; PD then drives the clock again
@@ -5902,12 +5950,14 @@ void toggleTimelinePlay() {
         g_scTimelineSig = 0; g_scPlanT = 0.0; g_scLastPDTimelineTime = -1.0;
         mixedPdTransport(false);
     } else {
-        // VST tracks play in every situation: while Csound runs, its rack is the VST graph (nothing
-        // else to start); without it, Play brings the VST engine up. Csound / PD / SC are never
-        // started by Play.
-        if (!g_vstEngineOn && !g_vstHostedInCsound && anyVstTrack()) {
-            if (g_langVst) startVstEngine();
-            else playNotice("Enable VST in Settings > Languages - the VSTi tracks are skipped, the other engines play.", "Enable VST first");
+        // SEPARATED ENGINES: Play NEVER starts an engine any more. It only plays the timeline -
+        // with no engine up the playhead just moves, silently. The VST engine is started by its
+        // own button (Run VST / the combined Run button), Csound / PD / SC likewise.
+        if (anyVstTrack() && !g_vstEngineOn) {
+            playNotice(g_langVst
+                ? "Play only plays the timeline - press Run VST (or the combined Run button) to hear the VST tracks."
+                : "Enable VST in Settings > Languages and press Run VST to hear the VST tracks.",
+                g_langVst ? "VST engine is off" : "Enable VST first");
         }
         bool hasAudibleScClip = false;
         bool anyTrackSolo = false;
@@ -8069,7 +8119,7 @@ void drawArrange(float belowH, float rightW) {
                             auto it=g_pdMeterDb.find(t.id);
                             db=it==g_pdMeterDb.end()?-90.f:it->second[c];clipped=db>=0.f;
                         }
-                        if(t.kind==3 && g_vstEngineOn && c<2) {   // the instrument plugins render in the VST engine, not in the Csound layout
+                        if((t.kind==3 || t.kind==4) && g_vstEngineOn && c<2) {   // VSTi AND VSTe render in the VST engine, not in the Csound layout - the VSTe lane meter reads the same rack peaks
                             auto it=g_vstMeterDb.find(t.id);
                             db=it==g_vstMeterDb.end()?-90.f:it->second[c];clipped=db>=0.f;
                         }
@@ -9852,6 +9902,9 @@ void drawSettings() {
                 if (ImGui::InputInt("##autosave_minutes", &s.autosaveMinutes, 1, 5))
                     s.autosaveMinutes = std::min(120, std::max(1, s.autosaveMinutes));
                 ImGui::TextWrapped("A separate recovery file is saved next to the project. Unsaved projects use the CAW Autosaves folder in your home directory. The original project is never overwritten.");
+                ImGui::TextColored(head, "PLUGIN WINDOWS");
+                ImGui::Checkbox("Send audio & notes to plugin windows", &vstui::g_vstGuiSignal);
+                ImGui::TextWrapped("EQ analyzers, scopes, synth meters and Kontakt keys in the plugin's own window follow what the engine plays. Turn this off if a plugin's window misbehaves - loading screens and sound are not affected, only the signal display.");
                 ImGui::EndTabItem();
             }
 
@@ -12248,11 +12301,13 @@ void appFrame(float dt, bool visible) {
     pollProcesses(dt);
     pollTestAndScan(dt);
     if (!visible) {
-        // Keep transport, export completion, recording, autosave and plugin
-        // learning alive without rebuilding an invisible arrangement.
+        // Keep transport, export completion, recording, autosave, plugin
+        // learning and the VST editor instances alive without rebuilding an
+        // invisible arrangement.
         updateMeters(dt);
         updateRecording();
         vstui::serviceLearn(g_proj);
+        vstui::captureParameters(g_proj);   // the editor idle tick + state poll keep running while minimized
         if (g_playing && g_useCsoundApi) g_apiProc.setMasterGain(g_proj.cs.masterGain);
         if (g_scEngineOn) g_scEngine.setGain(g_proj.cs.masterGain);
         historyTick(dt);
@@ -12377,6 +12432,7 @@ void appRequestClose() {
     for (const auto& item : g_pdPatchBuffers) {
         if (item.second.dirty()) { g_askPdOnClose = true; return; }
     }
+    vstui::stopEditorWorker();   // the editor housekeeping thread joins before anything it touches is torn down
     vstui::captureParameters(g_proj);
     if (serializeProject(g_proj) != g_savedSnap) g_askSaveOnClose = true;
     else g_quitRequested = true;
