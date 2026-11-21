@@ -129,6 +129,21 @@ public:
         if (i >= 0 && onLiveEdit) onLiveEdit(i, (double)v);   // the editor's value used to be discarded: live sync could never see a knob turn
         return kResultOk;
     }
+    // Editor knob turns must also reach the PROCESSOR: the host only passes inputParameterChanges
+    // from the code rings, so a plugin's own editor (master FX single instance) never heard its GUI.
+    // SPSC ring written here (UI thread), drained in process() (audio thread).
+    void pushPendingEdit(int i, double v) {
+        const unsigned w = pendW_.load(std::memory_order_relaxed);
+        const unsigned n = (w + 1u) % kPendEditN;
+        if (n == pendR_.load(std::memory_order_acquire)) return;   // full: drop the oldest-free edit
+        pendEdit_[(size_t)w].idx.store(i, std::memory_order_relaxed);
+        pendEdit_[(size_t)w].val.store((float)v, std::memory_order_relaxed);
+        pendW_.store(n, std::memory_order_release);
+    }
+    static constexpr unsigned kPendEditN = 256;
+    struct PendEdit { std::atomic<int> idx{-1}; std::atomic<float> val{0.f}; };
+    PendEdit pendEdit_[kPendEditN];
+    std::atomic<unsigned> pendW_{0}, pendR_{0};
     tresult PLUGIN_API endEdit(ParamID) override { return kResultOk; }
     tresult PLUGIN_API restartComponent(int32) override { return kResultOk; }
     tresult PLUGIN_API resizeView(IPlugView* view, ViewRect* r) override { return resize && r ? resize(view, r) : kResultFalse; }
@@ -249,6 +264,7 @@ public:
                 if (i < 0 || i >= (int)params_.size() || params_[(size_t)i].readOnly) return;
                 v = std::min(1.0, std::max(0.0, v));
                 params_[(size_t)i].value = v;
+                handler_.pushPendingEdit(i, v);   // the processor hears the editor's knob on the next block (master FX single instance)
                 // Forward EVERY editor edit to the app: the running engine applies any parameter
                 // on the same block (not just the 8 picked ones). Deduped per parameter.
                 if (lastLive_.size() != params_.size()) lastLive_.assign(params_.size(), -2.0);
@@ -449,20 +465,39 @@ public:
         BusInfo bi{};   // the real channel counts: the process buffers must match the plugin's buses
         if (comp_->getBusInfo(kAudio, kInput, 0, bi) == kResultOk && bi.channelCount > 0) inBusCh_.store((int)bi.channelCount, std::memory_order_relaxed); else inBusCh_.store(2, std::memory_order_relaxed);
         if (comp_->getBusInfo(kAudio, kOutput, 0, bi) == kResultOk && bi.channelCount > 0) outBusCh_.store((int)bi.channelCount, std::memory_order_relaxed); else outBusCh_.store(2, std::memory_order_relaxed);
-        vstLog("audio buses: in " + std::to_string(inBusCh_.load()) + " ch, out " + std::to_string(outBusCh_.load()) + " ch"); }
+        latency_.store((int)proc_->getLatencySamples(), std::memory_order_relaxed);   // the plugin's own delay (oversampling / look-ahead): the dry/wet alignment uses it
+        vstLog("audio buses: in " + std::to_string(inBusCh_.load()) + " ch, out " + std::to_string(outBusCh_.load()) + " ch, latency " + std::to_string(latency_.load()) + " samples"); }
+    int latencySamples() const override { return latency_.load(std::memory_order_relaxed); }
     void process(const float* in, float* out, int frames, int ch, Endpoint& ep) override {
         // 1. MIDI events from the ring (cawsm, MIDI clips, device). CC / bend / aftertouch are
         //    mapped too now (see mapMidi): the transport stop's all-notes-off MUST reach the
         //    plugin, and a mapped CC drives its parameter live. The raw messages are also
         //    captured for the editor feed; the audio thread never waits on the UI for that.
         events_.clear(); changes_.clearQueue();
-        MidiMsg m; int guard = 0;
+        MidiMsg m; int32 qi; int guard = 0;
         while (ep.midiIn.pop(m) && ++guard < 512) {
             { std::unique_lock<std::mutex> lock(tapMutex_, std::try_to_lock); if (lock.owns_lock() && tapEvents_.size() < 256) tapEvents_.push_back(m); }
             mapMidi(m, events_, changes_, 0);
         }
         // 2. parameter changes from the ring (cawsp, automation lanes)
-        ParamMsg pm; int32 qi;
+        ParamMsg pm;
+        // The editor's own knob turns (SPSC ring from performEdit) reach the processor here:
+        // the host never forwards them by itself, so a single-instance plugin (master FX) ignored its GUI.
+        {
+            unsigned r = handler_.pendR_.load(std::memory_order_relaxed);
+            int drained = 0;
+            while (r != handler_.pendW_.load(std::memory_order_acquire) && drained < 128) {
+                const int pi2 = handler_.pendEdit_[r].idx.load(std::memory_order_relaxed);
+                const float pv = handler_.pendEdit_[r].val.load(std::memory_order_relaxed);
+                if (pi2 >= 0 && pi2 < (int)params_.size()) {
+                    auto* q = changes_.addParameterData(params_[(size_t)pi2].id, qi);
+                    int32 point;
+                    if (q) q->addPoint(0, (double)pv, point);
+                }
+                r = (r + 1u) % handler_.kPendEditN; ++drained;
+            }
+            handler_.pendR_.store(r, std::memory_order_release);
+        }
         // Initial editor values (restored before the graph went live) reach the processor across the
         // next blocks, a bounded number per block: a burst of thousands of changes in one block makes
         // some plugins stop processing (Arturia ARP 2600 goes silent). Automation below is applied
@@ -702,6 +737,7 @@ private:
     std::function<void(int, double)> liveHook_;   // app callback for every editor edit (all parameters)
     std::vector<double> lastLive_;                // last editor value forwarded per parameter (dedupe)
     bool instrument_ = false; std::string classId_; int maxBlock_ = 512;
+    std::atomic<int> latency_{0};
     bool systemScaling_ = false;
     std::vector<double> learnValues_;
     std::chrono::steady_clock::time_point nextLearnPoll_{};

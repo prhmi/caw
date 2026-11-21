@@ -31,6 +31,9 @@ struct IPlugin {
     virtual std::string classId() const = 0;               // the class the plugin actually loaded
     virtual bool isInstrument() const = 0;
     virtual void prepare(double sr, int maxBlock) = 0;
+    // The plugin's reported processing latency in samples (0 for most plugins; oversampled / look-ahead
+    // FX report their internal delay). The host uses it to align the raw source with the effect in mix mode.
+    virtual int latencySamples() const { return 0; }
     // Configure/activate the editor-side component when the host audio engine becomes ready.
     // This is deliberately separate from prepare(): the editor instance must not start audio processing.
     virtual void prepareEditor(double sr, int maxBlock) { (void)sr; (void)maxBlock; }

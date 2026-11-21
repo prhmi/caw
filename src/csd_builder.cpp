@@ -801,7 +801,7 @@ std::string buildOptions(const CsoundSettings& s, const std::string& mode) {
 std::vector<std::string> engineClipNames(const Project& p) {
     std::vector<std::string> out;
     std::unordered_set<std::string> seen;
-    for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6)
+    for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6 && t.kind != 7)
         for (const Clip& c : t.clips)
             if (seen.insert(c.name).second) out.push_back(c.name);
     return out;
@@ -827,7 +827,7 @@ std::string engineFilePrefix() {   // the command files: <prefix>serial.txt and 
 std::vector<std::string> engineChannelNames(const Project& p) {
     std::vector<std::string> out;
     std::unordered_set<std::string> seen;
-    for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6)
+    for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6 && t.kind != 7)
         for (const Clip& c : t.clips)
             for (const CawParam& prm : parseClip(c).params) {
                 const std::string n = channelName(c.name, prm.chn);
@@ -862,7 +862,7 @@ std::vector<TimelineEvent> timelineEvents(const Project& p, double from, bool in
     bool anySolo = false;
     for (const Track& t : p.tracks) if (t.solo && !t.muted) anySolo = true;
     for (const Track& t : p.tracks) {
-        if (t.kind == 5 || t.kind == 6) continue; // hosted elsewhere, never Csound source
+        if (t.kind == 5 || t.kind == 6 || t.kind == 7) continue; // hosted elsewhere (PD / SC / sample engine), never a Csound source
         const bool audible = !t.muted && (!anySolo || t.solo);
         std::vector<ParsedTrack> parsed;
         for (const Clip& c : t.clips) parsed.push_back(parseClipForTrack(c, t));
@@ -1068,9 +1068,21 @@ std::vector<VstInputRoute> resolveVstInputRoutes(const Project& p, const Track& 
                 if (match) { vstSource = &o; break; }
             }
         }
+        // A sample track (kind 7) renders in CAW's sample engine: its stereo mix reaches the rack
+        // through a per-track ring (engine 4, srcId = the track; a clip input hears the whole track,
+        // the same rule as a VST source).
+        const bool sampleSource = !pdOrScSource && !vstSource && in.mode != 2 && [&]() {
+            for (const Track& o : p.tracks) {
+                if (o.kind != 7) continue;
+                const bool match = in.mode == 0 ? o.name == in.name : std::any_of(o.clips.begin(), o.clips.end(),
+                        [&](const Clip& c) { return c.name == in.name; });
+                if (match) return true;
+            }
+            return false;
+        }();
         if (pdOrScSource) {
             r.lineCount = std::min(2, 8 - cursor);
-        } else if (vstSource) {
+        } else if (vstSource || sampleSource) {
             r.lineCount = std::min(2, 8 - cursor);
         } else if (in.mode == 2) {                            // master: always stereo
             r.lineCount = std::min(2, 8 - cursor);
@@ -1078,7 +1090,7 @@ std::vector<VstInputRoute> resolveVstInputRoutes(const Project& p, const Track& 
             const int room = 8 - cursor;
             if (in.mode == 0) {                               // track: every clip of that track, in project order
                 for (const Track& o : p.tracks)
-                    if (o.name == in.name && o.kind != 5 && o.kind != 6 && o.kind != 3 && o.kind != 4)
+                    if (o.name == in.name && o.kind != 5 && o.kind != 6 && o.kind != 3 && o.kind != 4 && o.kind != 7)
                         for (const Clip& c : o.clips) {
                             const int ch = std::max(1, parseClip(c, true).outChannels);
                             for (int k = 1; k <= ch && (int)r.chans.size() < room; ++k)
@@ -1087,7 +1099,7 @@ std::vector<VstInputRoute> resolveVstInputRoutes(const Project& p, const Track& 
             } else {                                          // clips: the channels of the clip with that name
                 int ch = 0;
                 for (const Track& o : p.tracks)
-                    if (o.kind != 5 && o.kind != 6 && o.kind != 3 && o.kind != 4)
+                    if (o.kind != 5 && o.kind != 6 && o.kind != 3 && o.kind != 4 && o.kind != 7)
                         for (const Clip& c : o.clips)
                             if (c.name == in.name) ch = std::max(ch, parseClip(c, true).outChannels);
                 for (int k = 1; k <= ch && (int)r.chans.size() < room; ++k)
@@ -1257,7 +1269,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
     std::vector<ProbeStream> probeData;
     std::set<std::string> busDeclared;
     if (tap) {   // meter buses must exist before the instruments that write to them
-        for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6)
+        for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6 && t.kind != 7)
             for (const Clip& c : t.clips) {
                 const int ch = parseClip(c, true).outChannels;
                 if (!busDeclared.insert(c.name).second) continue;
@@ -1270,7 +1282,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
     if (tap) {   // the taps accumulate (+=); clear them once per pass so the routed VSTe lines carry exactly the current pass (the monitor clears them again at the end when it runs)
         o << "instr CawVstTapClear\n";
         std::set<std::string> tcDone;
-        for (const Track& tc : p.tracks) if (tc.kind != 5 && tc.kind != 6) for (const Clip& tcc : tc.clips)
+        for (const Track& tc : p.tracks) if (tc.kind != 5 && tc.kind != 6 && tc.kind != 7) for (const Clip& tcc : tc.clips)
             if (tcDone.insert(tcc.name).second) {
                 const int tch = parseClip(tcc, true).outChannels;
                 for (int k = 1; k <= tch; ++k) o << "gaCawT_" << tcc.name << "_" << k << " = 0\n";
@@ -1289,7 +1301,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
         if (vt.kind == 4 && !vt.vstPath.empty()) vstGateIds.push_back(vt.id);
     if (!vstGateIds.empty()) {   // declare the gate channels up front (chn_k default = 0 = source audible)
         std::set<std::string> gateDecl;
-        for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6)
+        for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6 && t.kind != 7)
             for (const Clip& c : t.clips) {
                 if (!gateDecl.insert(c.name).second) continue;
                 for (int id : vstGateIds)
@@ -1298,7 +1310,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
     }
 
     for (const Track& t : p.tracks) {
-        if (t.kind == 5 || t.kind == 6) continue; // .pd path is not orchestra code
+        if (t.kind == 5 || t.kind == 6 || t.kind == 7) continue; // .pd path / sample engine audio is not orchestra code
         if (t.kind == 3 || t.kind == 4) o << vstOrchestra(p, t);   // then its clips are built like any other clip (CAW code translated first)
 
         // Every clip is its own instrument: own instr name, own code, own channels, own MIDI.
@@ -1491,7 +1503,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
                     for (int c = 1; c <= lm.channels; ++c) {
                         std::string sum;
                         std::set<std::string> seen;
-                        if (t.kind != 3 && t.kind != 4 && t.kind != 5 && t.kind != 6) for (const Clip& clip : t.clips) {
+                        if (t.kind != 3 && t.kind != 4 && t.kind != 5 && t.kind != 6 && t.kind != 7) for (const Clip& clip : t.clips) {
                             if (!seen.insert(clip.name).second) continue;
                             if (parseClip(clip, true).outChannels < c) continue;
                             sum += (sum.empty() ? "" : " + ") + std::string("gaCawT_") + clip.name + "_" + std::to_string(c);
@@ -1510,7 +1522,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
             }
             for (const std::string& name : busDeclared) {
                 int ch = 0;
-                for (const Track& t : p.tracks) if(t.kind != 5 && t.kind != 6) for (const Clip& c : t.clips) if (c.name == name) ch = std::max(ch, parseClip(c, true).outChannels);
+                for (const Track& t : p.tracks) if(t.kind != 5 && t.kind != 6 && t.kind != 7) for (const Clip& c : t.clips) if (c.name == name) ch = std::max(ch, parseClip(c, true).outChannels);
                 for (int c = 1; c <= ch; ++c) mon << "gaCawT_" << name << "_" << c << " = 0\n";
             }
             // Legacy scope data is only needed by the text fallback.
@@ -1706,7 +1718,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
         }
         for (const std::string& name : busDeclared) {   // the buses are summed anew in every control period
             int ch = 0;
-            for (const Track& t : p.tracks) if(t.kind != 5 && t.kind != 6) for (const Clip& c : t.clips) if (c.name == name) ch = std::max(ch, parseClip(c, true).outChannels);
+            for (const Track& t : p.tracks) if(t.kind != 5 && t.kind != 6 && t.kind != 7) for (const Clip& c : t.clips) if (c.name == name) ch = std::max(ch, parseClip(c, true).outChannels);
             for (int c = 1; c <= ch; ++c) o << "gaCawT_" << name << "_" << c << " = 0\n";
         }
         o << "endin\n\n";
@@ -1726,7 +1738,7 @@ std::string buildCsd(const Project& p, const std::string& mode, double fromTime,
 
 std::vector<std::string> recClipNames(const Project& p) {
     std::vector<std::string> out;
-    for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6)
+    for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6 && t.kind != 7)
         for (const Clip& c : t.clips)
             if (parseClip(c).hasRec && std::find(out.begin(), out.end(), c.name) == out.end()) out.push_back(c.name);
     return out;
@@ -1735,7 +1747,7 @@ std::vector<std::string> recClipNames(const Project& p) {
 std::vector<CawWriteTarget> cawWriteTargets(const Project& p) {
     std::vector<CawWriteTarget> out;
     std::set<std::pair<std::string, std::string>> seen;
-    for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6) for (const Clip& c : t.clips)
+    for (const Track& t : p.tracks) if (t.kind != 5 && t.kind != 6 && t.kind != 7) for (const Clip& c : t.clips)
         for (const std::string& channel : parseClip(c).writeChannels)
             if (seen.insert({c.name, channel}).second) out.push_back({c.name, channel});
     return out;

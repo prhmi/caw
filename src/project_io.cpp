@@ -1,5 +1,6 @@
 #include "project_io.h"
 #include "csd_builder.h"
+#include "master_fx.h"
 
 #include <algorithm>
 #include <cmath>
@@ -30,7 +31,7 @@ bool readString(std::istream& in, std::string& value) {
 namespace {
 void writeProject(std::ostream& out, const Project& p) {
     const CsoundSettings& s = p.cs;
-    out << "CAW_PROJECT 54\n"
+    out << "CAW_PROJECT 58\n"
         << s.sr << ' ' << s.ksmps << ' ' << s.nchnls << ' ' << s.nchnlsIn << ' '
         << std::setprecision(17) << s.zdbfs << ' ' << s.a4 << ' ' << s.bufSW << ' ' << s.bufHW << ' '
         << s.outDev << ' ' << s.inDev << ' ' << s.renderFormat << ' ' << s.tail << ' '
@@ -293,6 +294,46 @@ void writeProject(std::ostream& out, const Project& p) {
     out << "FFMPEG1\n";
     writeString(out, s.ffmpegExe);
     out << "LOOP1 " << (p.loopEnabled ? 1 : 0) << ' ' << std::setprecision(17) << p.loopStart << ' ' << p.loopEnd << '\n';
+    // version 55: audio clips (track kind 7): file, segments, rate, reverse, gain, view, volume points
+    out << "AUDIO1\n";
+    for (const Track& t : p.tracks) {
+        out << t.clips.size() << '\n';
+        for (const Clip& c : t.clips) {
+            writeString(out, c.audioFile);
+            out << c.audioSegs.size() << ' ' << std::setprecision(17) << c.audioRate << ' ' << (c.audioReverse ? 1 : 0) << ' '
+                << std::setprecision(9) << c.audioGain << ' ' << c.audioView << ' ' << c.audioGainPts.size() << '\n';
+            for (const AudioSeg& sg : c.audioSegs) out << std::setprecision(17) << sg.srcOffset << ' ' << sg.dur << '\n';
+            for (const AutoPoint& pt : c.audioGainPts) out << std::setprecision(17) << pt.t << ' ' << pt.v << ' ' << (pt.line ? 1 : 0) << '\n';
+        }
+    }
+    // version 56: sample clip output routing (as the source / custom in -> out map)
+    out << "AUDIOR1\n";
+    for (const Track& t : p.tracks) {
+        out << t.clips.size() << '\n';
+        for (const Clip& c : t.clips) {
+            out << c.audioRoute << ' ' << c.audioOutMap.size() << '\n';
+            for (int ch : c.audioOutMap) out << ch << '\n';
+        }
+    }
+    // version 58: the VSTi / VSTe full plugin state (Kontakt's loaded .nki etc.), one blob per track in order
+    out << "VSTSTATE1\n";
+    for (const Track& t : p.tracks) writeString(out, t.vstPatchState);
+    // version 57: the track volume sliders (0..2 linear, one per track in order)
+    out << "TRACKV1\n";
+    for (const Track& t : p.tracks) out << std::setprecision(9) << t.volume << '\n';
+    // version 57: the master FX chain (8 slots, in order: on, path, class, name, plugin state)
+    {
+        const auto fx = masterfx::rack().save();
+        out << "MASTERFX1\n";
+        for (int i = 0; i < masterfx::kSlots; ++i) {
+            const auto& s = fx[(size_t)i];
+            out << (s.on ? 1 : 0) << ' ';
+            writeString(out, s.path);
+            writeString(out, s.classId);
+            writeString(out, s.name);
+            writeString(out, s.state);
+        }
+    }
 }
 
 bool readMidiNote(std::istream& in, MidiNote& note) {
@@ -382,7 +423,7 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
     Project candidate;
     std::string magic;
     int version = 0;
-    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 54)) {
+    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 58)) {
         error = "This is not a supported CAW project file.";
         return false;
     }
@@ -695,7 +736,7 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
         for (Track& t : candidate.tracks) {
             size_t markCount = 0, shapeCount = 0;
             if (!(in >> t.kind >> t.lang >> t.autoMin >> t.autoMax >> markCount >> shapeCount) || markCount > 100000 || shapeCount > 10000) { error = "A track's kind is invalid."; return false; }
-            t.kind = std::min(6, std::max(0, t.kind)); // 5/6: SuperCollider / Pure Data tracks
+            t.kind = std::min(7, std::max(0, t.kind)); // 5/6: SuperCollider / Pure Data tracks, 7: sample track
             t.lang = 0;
             if (!(t.autoMax > t.autoMin)) t.autoMax = t.autoMin + 1.0;
             for (size_t i = 0; i < markCount; ++i) {
@@ -1093,6 +1134,86 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
             error = "The timeline loop is invalid."; return false;
         }
         candidate.loopEnabled = enabled != 0;
+    }
+    if (version >= 55) {
+        std::string marker;
+        if (!(in >> marker) || marker != "AUDIO1") { error = "The audio clip block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            size_t n = 0;
+            if (!(in >> n) || n > 100000 || n != track.clips.size()) { error = "The audio clip block does not match the clips."; return false; }
+            for (Clip& clip : track.clips) {
+                int segCount = 0, reverse = 0;
+                size_t nPts = 0;
+                if (!readString(in, clip.audioFile) ||
+                    !(in >> segCount >> clip.audioRate >> reverse >> clip.audioGain >> clip.audioView >> nPts) ||
+                    segCount < 0 || segCount > 100000 || nPts > 100000) { error = "An audio clip is invalid."; return false; }
+                clip.audioReverse = reverse != 0;
+                clip.audioRate = std::min(8.f, std::max(0.05f, clip.audioRate));
+                clip.audioGain = std::min(2.f, std::max(0.f, clip.audioGain));
+                clip.audioView = clip.audioView == 1 ? 1 : 0;   // old projects: only waveshape and spectrogram remain
+                clip.audioSegs.clear();
+                clip.audioGainPts.clear();
+                for (int k = 0; k < segCount; ++k) {
+                    AudioSeg sg;
+                    if (!(in >> sg.srcOffset >> sg.dur) || sg.srcOffset < -1e-9 || sg.dur <= 0.0) { error = "An audio segment is invalid."; return false; }
+                    clip.audioSegs.push_back(sg);
+                }
+                for (size_t k = 0; k < nPts; ++k) {
+                    AutoPoint pt;
+                    int line = 0;
+                    if (!(in >> pt.t >> pt.v >> line)) { error = "A volume point is invalid."; return false; }
+                    pt.line = line != 0;
+                    clip.audioGainPts.push_back(pt);
+                }
+            }
+        }
+    }
+    if (version >= 56) {
+        std::string marker;
+        if (!(in >> marker) || marker != "AUDIOR1") { error = "The audio routing block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            size_t n = 0;
+            if (!(in >> n) || n > 100000 || n != track.clips.size()) { error = "The audio routing block does not match the clips."; return false; }
+            for (Clip& clip : track.clips) {
+                size_t mapSize = 0;
+                if (!(in >> clip.audioRoute >> mapSize) || mapSize > 64) { error = "An audio routing entry is invalid."; return false; }
+                clip.audioRoute = std::min(1, std::max(0, clip.audioRoute));
+                clip.audioOutMap.clear();
+                for (size_t k = 0; k < mapSize; ++k) {
+                    int ch = 0;
+                    if (!(in >> ch) || ch < 0 || ch > 1024) { error = "An audio routing entry is invalid."; return false; }
+                    clip.audioOutMap.push_back(ch);
+                }
+            }
+        }
+    }
+    if (version >= 58) {
+        std::string stateMarker;
+        if (!(in >> stateMarker) || stateMarker != "VSTSTATE1") { error = "The VST patch state block is invalid."; return false; }
+        for (Track& track : candidate.tracks)
+            if (!readString(in, track.vstPatchState)) { error = "A VST patch state is invalid."; return false; }
+    }
+    if (version >= 57) {
+        std::string marker;
+        if (!(in >> marker) || marker != "TRACKV1") { error = "The track volume block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            float vol = 1.f;
+            if (!(in >> vol) || vol < 0.f || vol > 2.f) { error = "A track volume is invalid."; return false; }
+            track.volume = vol;
+        }
+        std::string fxMarker;
+        if (!(in >> fxMarker) || fxMarker != "MASTERFX1") { error = "The master FX block is invalid."; return false; }
+        std::array<masterfx::Rack::SaveSlot, masterfx::kSlots> slots;
+        for (int i = 0; i < masterfx::kSlots; ++i) {
+            auto& s = slots[(size_t)i];
+            int on = 0;
+            if (!(in >> on) || (on != 0 && on != 1) || !readString(in, s.path) ||
+                !readString(in, s.classId) || !readString(in, s.name) || !readString(in, s.state)) {
+                error = "A master FX slot is invalid."; return false;
+            }
+            s.on = on != 0;
+        }
+        masterfx::rack().restore(slots);   // the plugins load lazily when the Master FX window opens
     }
     if (version < 37) {
         for (Track& track : candidate.tracks) {

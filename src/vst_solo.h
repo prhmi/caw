@@ -160,6 +160,7 @@ public:
             { std::lock_guard<std::mutex> sl(stageMutex_); staged_.clear(); liveActive_ = activeIds_; }
             const size_t loadedNow = rack_.loaded();
             rackReady_ = ok && loadedNow > 0;
+            latencyByTrack_ = rack_.latencies();   // reported plugin latencies (dry/wet alignment) - control_ is already held here: refreshLatencies() would deadlock
             if (log_) {
                 if (jobs.empty()) log_("[caw] VST engine: no VST tracks.\n");
                 else if (loadedNow == 0) log_("[caw] VST engine: NO plugin could be loaded - see the lines above (is a .vst3 chosen in the instrument panel?).\n");
@@ -259,6 +260,8 @@ public:
         compiled.reserve(scripts.size());
         for (VstScript& s : scripts) {
             vstscript::Program prog = vstscript::Compiler().compile(s.code);
+            if (!prog.error.empty() && log_)   // the console shows CAW-code problems too (compiled on edit / engine start only, so this is not spammy)
+                log_("[caw] CAW code error (VST clip " + std::to_string(s.clipId) + " on track " + std::to_string(s.trackId) + "): " + prog.error);
             compiled.emplace_back(std::move(s), std::move(prog));
         }
         std::lock_guard<std::mutex> lock(scriptMutex_);
@@ -290,6 +293,23 @@ public:
     }
 
     bool ready() const { return rackReady_; }
+    // The largest reported plugin latency among the loaded instances (samples, 0 when none report).
+    // The raw source mix is delayed by this in mix mode, so the dry and the wet stay in sync.
+    int sourceLatencySamples() {
+        std::lock_guard<std::mutex> lock(control_);
+        int mx = 0;
+        for (const auto& kv : latencyByTrack_) mx = std::max(mx, kv.second);
+        return mx;
+    }
+    void refreshLatencies() {
+        std::lock_guard<std::mutex> lock(control_);
+        latencyByTrack_ = rack_.latencies();
+    }
+    int latencyFor(int trackId) {
+        std::lock_guard<std::mutex> lock(control_);
+        const auto it = latencyByTrack_.find(trackId);
+        return it != latencyByTrack_.end() ? it->second : 0;
+    }
     bool hasInstruments() const { return rackReady_ && !activeIds_.empty(); }
 
     // The app rebuilds the schedule on play / seek / edit-while-stopped.
@@ -393,7 +413,29 @@ public:
     // --- the audio-callback side -------------------------------------------------
     // Mixes this engine into the device stream (the SuperCollider hook contract).
     void renderMix(float* out, int frames, int channels) noexcept {
-        if (!rackReady_ || !out || frames <= 0 || channels < 1) return;
+        if (!out || frames <= 0 || channels < 1) return;
+        if (!rackReady_) {
+            // No plugin loaded: the timeline still PLAYS - the clip code's non-audio side (msg
+            // data out, P1..P8) runs on the device clock, like PD with DSP off. No hidden DSP.
+            if (playing_.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> render(renderMutex_, std::try_to_lock);
+                if (render.owns_lock()) {
+                    const double dt = (double)frames / (double)std::max(1, sr_);
+                    const double t0 = time_.load(std::memory_order_acquire);
+                    double t1 = t0 + dt;
+                    bool wrapped = false;
+                    if (loop_ && loopEnd_ > loopStart_ && t1 >= loopEnd_) { t1 = loopStart_ + std::max(0.0, t0 + dt - loopEnd_); wrapped = true; }
+                    for (size_t a = 0; a < active_.size();) {   // note-offs keep draining even without plugins
+                        if (active_[a].end <= t1) { fireNote(active_[a].trackId, 0x80, active_[a].pitch, 0); active_[a] = active_.back(); active_.pop_back(); }
+                        else ++a;
+                    }
+                    tickScripts(t0, dt);
+                    if (wrapped) { scriptsReset_.store(true, std::memory_order_release); for (const ActiveNote& a : active_) fireNote(a.trackId, 0x80, a.pitch, 0); active_.clear(); cursor_.store(0, std::memory_order_relaxed); }
+                    time_.store(t1, std::memory_order_release);
+                }
+            }
+            return;
+        }
         if (!renderDue()) return;
         std::unique_lock<std::mutex> render(renderMutex_, std::try_to_lock);   // never block the soundcard callback
         if (!render.owns_lock() || !rackReady_) return;
@@ -646,6 +688,7 @@ private:
     std::atomic<bool> driving_{false};
     std::atomic<long long> lastActivityMs_{0};
     bool loop_ = false; double loopStart_ = 0.0, loopEnd_ = 0.0;   // control_ guarded
+    std::map<int, int> latencyByTrack_;   // control_ guarded: reported plugin latency per track (dry/wet alignment)
     std::vector<ActiveNote> active_;    // audio thread only
     bool scriptActive_ = false;         // audio thread only: a clip-code program is running now
     bool idle_ = false;                 // audio thread only: the plugins are not rendering

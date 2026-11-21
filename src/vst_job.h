@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <cstdint>
+#include <functional>
 // One VST3 track as the Csound engine thread sees it.
 struct VstJob {
     int id = 0;                    // Track::id: the Csound channels are cawvst_<id>_...
@@ -81,12 +82,25 @@ struct CawScRing {
             r.store((rpos + 1) % CAP, std::memory_order_release);
         }
     }
+    // Drops the buffered audio (a consumer that starts late would otherwise stay a whole ring
+    // behind forever: the backlog never drains once both sides run at the same rate).
+    void reset() { r.store(0, std::memory_order_release); w.store(0, std::memory_order_release); }
+    size_t queued() const {   // frames waiting (not thread-safe to combine with pop, but fine for a heuristic)
+        const size_t wv = w.load(std::memory_order_acquire), rv = r.load(std::memory_order_acquire);
+        return (wv + CAP - rv) % CAP;
+    }
+    void skip(size_t frames) {   // consumer-side catch-up: jump ahead to the newest audio
+        const size_t q = queued();
+        if (frames > q) frames = q;
+        r.store((r.load(std::memory_order_relaxed) + frames) % CAP, std::memory_order_release);
+    }
 };
 // Handoff of engine-side realtime mixes to the VST rack (set once before the rack starts).
 struct VstEngineAudio {
     const std::atomic<const float*>* pdMix = nullptr;  // the latest Pure Data render (interleaved, pdMixChannels)
     int pdMixChannels = 2;
     CawScRing* scRing = nullptr;                       // the SuperCollider mix (stereo, device scale)
+    std::function<CawScRing*(int)> sampleRing;         // a sample track's stereo mix ring (engine 4): the callback pushes, the rack pops
 };
 // One note of the MIDI clips of the VSTi tracks, as the app hands them to CAW's own VST engine
 // (the 4th engine, while Csound is off). It plays them on its block clock. While Csound hosts,

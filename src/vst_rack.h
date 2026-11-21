@@ -231,6 +231,23 @@ public:
         std::shared_ptr<Graph> g = currentGraph();
         return g ? g->rts.size() : 0;   // how many plugins really loaded
     }
+    // The plugin's reported latency for one track's instance (samples), 0 when absent. Used to
+    // align the raw source with the effect's output in mix mode (dry/wet delay fix).
+    int latencyFor(int trackId) const {
+        std::shared_ptr<Graph> g = currentGraph();
+        if (!g) return 0;
+        for (const Rt& rt : g->rts)
+            if (rt.job.id == trackId && rt.inst && rt.inst->plug)
+                return rt.inst->plug->latencySamples();
+        return 0;
+    }
+    // All loaded instances' reported latencies (track id -> samples). Read on the UI thread only.
+    std::map<int, int> latencies() const {
+        std::shared_ptr<Graph> g = currentGraph();
+        std::map<int, int> m;
+        if (g) for (const Rt& rt : g->rts) if (rt.inst && rt.inst->plug) m[rt.job.id] = rt.inst->plug->latencySamples();
+        return m;
+    }
     // Unload every plugin. A real teardown (a new project, Unload, the rack going away) - NOT a
     // plugin change: that reuses every instance that still matches. The caller makes sure
     // process() is not running on another thread while this runs.
@@ -432,6 +449,26 @@ public:
         const auto isReplaced = [&](int id) {
             return std::find(replacedNow.begin(), replacedNow.end(), id) != replacedNow.end();
         };
+        // Dry/wet alignment for VSTi sources in mix mode: a latency-reporting effect delivers its
+        // output later than the source's direct master mix, so the direct mix is delayed by the
+        // effect's reported latency (the effect itself still receives the UNDELAYED source).
+        std::map<int, int> dryDelayOf;
+        for (const Rt& e : rts) {
+            if (e.job.instrument) continue;
+            if (activeValid && active && active->find(e.job.id) == active->end()) continue;
+            const auto om = outModesLocal.find(e.job.id);
+            if ((om != outModesLocal.end() ? om->second : e.job.outMode) != 1) continue;   // mix mode only (replace mutes the source anyway)
+            const int lat = e.inst && e.inst->plug ? e.inst->plug->latencySamples() : 0;
+            if (lat <= 0 || lat > 20000) continue;
+            for (int s = 0; s < 8; ++s) {
+                const auto& src = e.job.inputs[s];
+                if (!src.on || src.lineCount <= 0 || src.engine != 3 || src.srcId == e.job.id) continue;
+                const auto mk = masksUse->find(e.job.id);
+                if (mk != masksUse->end() && !((mk->second >> s) & 1u)) continue;   // input switched off live
+                int& d = dryDelayOf[src.srcId];
+                if (lat > d) d = lat;
+            }
+        }
         // A "master" input hears the whole master: the replaced instruments are part of it (they
         // only stop being mixed themselves - the effect still gets their sound, like any source).
         std::vector<const Rt*> replacedInstr;
@@ -444,9 +481,23 @@ public:
             for (const auto& src : r.job.inputs)
                 if (src.on && src.engine == 2 && src.lineCount > 0) needSc = true;
         if (needSc && ea_ && ea_->scRing) {
+            if (ea_->scRing->queued() > (size_t)block_ * 4) ea_->scRing->skip(ea_->scRing->queued() - (size_t)block_);   // stale (a late / idle consumer): catch up to the newest audio
             scScratch_.resize((size_t)block_ * 2);
             ea_->scRing->pop(scScratch_.data(), (size_t)block_);
         } else needSc = false;
+        // One pull per block per sample-track ring (several VSTe tracks may consume the same mix).
+        samplePop_.clear();
+        for (const Rt& r : rts)
+            for (const auto& src : r.job.inputs)
+                if (src.on && src.engine == 4 && src.lineCount > 0 && !samplePop_.count(src.srcId)) {
+                    CawScRing* ring = (ea_ && ea_->sampleRing) ? ea_->sampleRing(src.srcId) : nullptr;
+                    if (ring) {
+                        if (ring->queued() > (size_t)block_ * 4) ring->skip(ring->queued() - (size_t)block_);   // stale (idle consumer while the sample engine kept pushing): never stay seconds behind
+                        auto& buf = samplePop_[src.srcId];
+                        buf.resize((size_t)block_ * 2);
+                        ring->pop(buf.data(), (size_t)block_);
+                    }
+                }
         // Notes of the VSTi tracks arrive through the note ring above (the host's transport wrote
         // them: Csound's score via CawVstNote_<id>, or the 4th engine via pushMidi).
         for (Rt& r : rts) {
@@ -587,6 +638,11 @@ public:
                         } else if (src.engine == 2) {   // the SuperCollider mix (device scale): line 1 = L, line 2 = R
                             const int mc = k == 0 ? 0 : 1;
                             if (needSc) for (int n = 0; n < block_; ++n) r.in[(std::size_t)n * 8 + outLine] = scScratch_[(std::size_t)n * 2 + mc];
+                        } else if (src.engine == 4) {   // a sample track: its stereo mix from CAW's sample engine (device scale)
+                            const int mc = k == 0 ? 0 : 1;
+                            auto it = samplePop_.find(src.srcId);
+                            if (it != samplePop_.end())
+                                for (int n = 0; n < block_; ++n) r.in[(std::size_t)n * 8 + outLine] = it->second[(std::size_t)n * 2 + mc];
                         } else if (src.engine == 3) {   // a VSTi / VSTe source: wire its stereo output here directly
                             const int mc = k == 0 ? 0 : 1;   // line 1 = L, line 2 = R - the same channels the source adds to the master
                             const Rt* srcRt = nullptr;
@@ -747,7 +803,29 @@ public:
             // by the app), a VSTi / VSTe source is skipped here (it already published its output
             // for the effects above) - so a re-wire or an AUDIO OUTPUT switch never needs a Run.
             if (isReplaced(r.job.id)) continue;
-            for (int i = 0; i < block_; ++i) for (int c = 0; c < nchan_ && c < chPass; ++c) add(spout, (size_t)i * nchan_ + c, r.out[(size_t)i * chPass + c] * fullScale);
+            const auto dd = dryDelayOf.find(r.job.id);
+            if (dd != dryDelayOf.end() && dd->second > 0) {
+                // Delay the source's own master output by the consuming effect's reported latency.
+                constexpr long long kDryCap = 60000;   // frames the ring holds (max compensable latency ~1.25 s @ 48 kHz)
+                const size_t need = (size_t)kDryCap * (size_t)chPass;
+                if ((int)r.dryDelayBuf.size() < (int)need) { r.dryDelayBuf.assign(need, 0.f); r.dryW = 0; }
+                for (int i = 0; i < block_; ++i) {
+                    const size_t pos = (size_t)(r.dryW % kDryCap);
+                    for (int c = 0; c < chPass; ++c) r.dryDelayBuf[pos * (size_t)chPass + (size_t)c] = r.out[(size_t)i * chPass + c];
+                    ++r.dryW;
+                }
+                for (int i = 0; i < block_; ++i) {
+                    const long long idx = r.dryW - (long long)block_ - (long long)dd->second + (long long)i;
+                    for (int c = 0; c < nchan_ && c < chPass; ++c) {
+                        float v = 0.f;
+                        if (idx >= 0 && idx < r.dryW - kDryCap) { /* slot overwritten by an over-long delay: silence */ }
+                        else if (idx >= 0) v = r.dryDelayBuf[(size_t)(idx % kDryCap) * (size_t)chPass + (size_t)c];
+                        add(spout, (size_t)i * nchan_ + (size_t)c, v * fullScale);
+                    }
+                }
+            } else {
+                for (int i = 0; i < block_; ++i) for (int c = 0; c < nchan_ && c < chPass; ++c) add(spout, (size_t)i * nchan_ + c, r.out[(size_t)i * chPass + c] * fullScale);
+            }
         }
         // The clip taps chnmixed the current pass into the cawtap_* channels while Csound ran
         // (perform happens before this call), and they were read in the loop above - so clear them
@@ -762,6 +840,7 @@ private:
     std::vector<VstPickUpdate> pendingPicks_;          // live re-picks queued by the UI
     std::vector<VstParamValue> pendingValues_;         // live GUI edits for ANY parameter, queued by the UI
     std::vector<float> scScratch_;                     // one SC-mix pull per block, shared by all consumers
+    std::map<int, std::vector<float>> samplePop_;      // one pull per block per sample-track ring (engine 4 inputs)
     LogFn log_;                                        // kept from init so process() can log diagnostics
     std::vector<VstJob> jobs_;      // the loaded job set (the 4th engine reuses a matching init)
     bool soloMode_ = false;         // true when this rack is the app-side 4th engine (no Csound channels)
@@ -789,6 +868,9 @@ private:
         bool wasActive = true;   // a track coming back from mute force-syncs its plugin to the channels
         double manual[8] = {}; bool manualActive[8] = {}; long long manualUntil[8] = {};   // live manual overrides
         double prevLane[8] = {};   // the raw lane values of the previous block (detects automation movement)
+        int dryDelay = 0;                  // the source's own master output is delayed by this (samples): dry/wet alignment with a latency-reporting consuming VSTe (mix mode)
+        std::vector<float> dryDelayBuf;    // ring for that delay (cap frames * chPass), allocated on first use
+        long long dryW = 0;                // absolute frames pushed into dryDelayBuf
         double loggedManual[8] = {}; bool loggedActive[8] = {};   // live-param logging state
         bool unpickedWarned[8] = {};   // solo mode: P slot written by clip code but not picked (warn once)
         long long inSilentSince = 0, inHintAt = 0, outSilentSince = 0, outHintAt = 0;   // silence diagnostics
@@ -985,6 +1067,7 @@ private:
                     if (src.mode == 2) sum += "master";
                     else if (src.engine == 1) sum += "PureData mix";
                     else if (src.engine == 2) sum += "SuperCollider mix";
+                    else if (src.engine == 4) sum += "\"" + src.name + "\" (sample track mix)";
                     else if (src.engine == 3) sum += "\"" + src.name + "\" (VST output)";
                     else sum += "\"" + src.name + "\" (Csound clip taps, " + std::to_string(src.csChans.size()) + " ch)";
                 }

@@ -8,6 +8,14 @@
 struct AutoPoint { double t; double v; bool line = false; };   // line: inside a Pen 2 stroke, no dot is shown (only the start and the end of the stroke have dots)            // time in seconds, value
 struct MidiNote  { double start; double dur; int pitch = 60; int velocity = 100; int quarter = 0; };   // quarter (score sign only, no sound change): 0 none, 1 quarter sharp, 2 quarter flat, 3 koron // MIDI p4 note and p5 velocity
 
+// One piece of source audio inside an audio clip: from srcOffset (source seconds), playing dur
+// source seconds at the clip's rate. A cut makes two clips with one segment each; a join merges
+// the segments of the clips into one (the timeline plays the segments one after the other).
+struct AudioSeg {
+    double srcOffset = 0.0;   // position in the source file (seconds)
+    double dur = 0.0;         // length in SOURCE seconds (the clip time this takes = dur / rate)
+};
+
 // One clip on a lane = one independent Csound instrument.
 // Every clip owns its instr name, its code, its color and its MIDI notes.
 struct Clip {
@@ -36,6 +44,16 @@ struct Clip {
     bool midiEnabled = false;             // MIDI switch in the clip editor
     std::string pFieldRules;              // copy/p-field rules, edited separately from Csound code
     int lang = 0;                         // always 0 = Csound (kept so old project files still load)
+    // audio clip (track kind 7): the timeline plays the audio file of this clip
+    std::string audioFile;                // absolute path of the audio file (WAV natively, other formats through FFmpeg)
+    std::vector<AudioSeg> audioSegs;      // the source segments of the clip (source seconds); empty = invalid
+    float audioRate = 1.0f;               // basic time-stretch: speed and pitch together (resample)
+    bool audioReverse = false;            // the segments play backwards
+    float audioGain = 1.0f;               // clip gain
+    int audioView = 0;                    // 0 waveshape, 1 spectrogram
+    int audioRoute = 0;                   // output routing: 0 = as the source (mono -> ch 1, stereo -> ch 1-2 ...), 1 = custom
+    std::vector<int> audioOutMap;         // legacy saved routing (round65 projects); custom routing now lives in the clip's code (out1 = in1)
+    std::vector<AutoPoint> audioGainPts;  // volume automation inside the clip (t = clip seconds, v = gain 0..2)
     bool editorOpen = false;              // UI-only state, not serialized
 };
 
@@ -145,6 +163,7 @@ struct Track {
     int id = 0;                                      // stable editor-window identity
     bool muted = false;
     bool solo = false;
+    float volume = 1.f;                              // track volume 0..2, linear (1 = unity); applied to the sample engine (other engines follow)
     bool deleteSelected = false;
     int folderId = 0;                                // 0 = not in a folder group, else the id of a TrackFolder of the project (the tracks of a folder sit next to each other)
     bool midiHidden = false;                         // the MIDI lane is hidden (data kept)
@@ -166,6 +185,7 @@ struct Track {
     std::vector<double> vstInit;                     // value of each picked parameter when it was picked (start value of kP1..kP8)
     std::string vstPath;                             // the .vst3 file
     std::string vstClassId;                          // the plugin class inside it (32 hex); empty = first audio class
+    std::string vstPatchState;                       // SEPARATED ENGINES: the plugin's full state (Kontakt's loaded .nki etc.), saved with the project (v58)
     std::map<uint32_t, double> vstParameterState;     // writable parameter IDs and normalized values
     // VSTe audio output (replaces the legacy vstOut / vstOutMaster pair for the UI):
     //   0 = master (replace): the VSTe output goes to the master, the source tracks' own master

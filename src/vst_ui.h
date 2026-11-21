@@ -38,7 +38,7 @@
 namespace vstui {
 struct Slot {
     bool open = false, autoTried = false;
-    bool systemScaling = true, loadedSystemScaling = true;
+    bool systemScaling = true, loadedSystemScaling = true;   // systemScaling unused: the setting is global now (g_editorSystemScaling)
     int learn = -1;                       // slot (0..7) that waits for a knob turn in the plugin window, -1 = none
     std::string err, pluginFilter, paramFilter, loadedPath, loadedClassId;
     std::string note;                     // one-line result of the last load (e.g. which picks moved to the new plugin)
@@ -52,6 +52,7 @@ struct Slot {
     std::map<size_t, int> slotParam;   // slot k -> the parameter index it held last frame (a re-pick reseeds the baseline)
     std::set<int> hiddenInputs;        // input slots the user collapsed in the AUDIO INPUTS list (UI only)
     std::string pushedState;           // SEPARATED ENGINES: last full plugin state captured from this editor instance
+    std::string restoredState;         // SEPARATED ENGINES: the saved patch state already queued to this editor instance
                                        // (Kontakt's loaded .nki - binary state, not a parameter) and pushed to the engine
     std::chrono::steady_clock::time_point statePollT{};   // next editor-state poll (2 s cadence)
 #endif
@@ -95,6 +96,36 @@ inline std::function<void(int, const std::string&)> pushVstStateLive;   // (trac
 // plugin's own window (EQ analyzers, scopes, synth meters, Kontakt keys). Off = the editor
 // instances are still ticked silently (loading screens stay alive) but receive no signal.
 inline bool g_vstGuiSignal = true;
+// General for ALL VST editors (Settings > Editor): let Windows scale the plugin editor
+// (bitmap scaling). Off if editors draw cropped / blurry or clicks land on the wrong knob.
+inline bool g_editorSystemScaling = true;
+
+inline std::string niceName(const std::string& path, const std::string& classId = std::string());   // defined below
+
+// Applies the editor scaling to every loaded plugin (only the window is recreated, the patch
+// and the sound keep running).
+inline void applyEditorSystemScaling(Project& proj, bool enabled) {
+#ifdef CAW_VST3
+    for (const Track& track : proj.tracks) {
+        if (track.kind != 3 && track.kind != 4) continue;
+        auto it = slots().find(track.id);
+        if (it == slots().end() || !it->second.plugin) continue;
+        Slot& s = it->second;
+        if (s.loadedSystemScaling == enabled) continue;
+        s.loadedSystemScaling = enabled;
+        try {
+            s.plugin->setEditorSystemScaling(enabled);
+            if (s.plugin->editorVisible()) {
+                s.plugin->closeEditor();
+                std::string err;
+                if (!s.plugin->showEditor(niceName(track.vstPath, track.vstClassId) + " (" + track.name + ")", err)) s.err = err;
+            }
+        } catch (...) { /* a scaling change must not take down the UI */ }
+    }
+#else
+    (void)proj; (void)enabled;
+#endif
+}
 
 // The EDITOR HOUSEKEEPING WORKER. Kontakt (and other samplers) serialize state and component
 // work with locks that also involve their own GUI thread - which IS the host's UI thread.
@@ -107,6 +138,8 @@ struct EditorTask {
     std::shared_ptr<caw::IPlugin> plugin;
     caw::EditorFeed feed;
     bool wantState = false;
+    bool light = false;                // transport playing: small processIdle block (GUI meters alive, audio protected)
+    std::string setState;              // restore: apply a saved patch state (never on the UI / audio thread)
 };
 inline std::map<int, EditorTask> g_editorTaskMap;
 inline std::mutex g_editorTaskMutex;
@@ -115,6 +148,7 @@ inline std::atomic<bool> g_editorWorkerOn{false};
 inline std::thread g_editorWorkerThread;
 inline bool g_editorWorkerStarted = false;
 inline std::atomic<bool> g_editorFeedLogged{false};   // one-shot log: the first feed that reaches an editor instance
+inline std::function<bool()> editorPlaybackBusy;      // true while the transport plays: the plugin-GUI housekeeping throttles down (heavy GUIs cost audio glitches)
 inline std::mutex g_capturedStateMutex;
 inline std::deque<std::pair<int, std::string>> g_capturedStates;   // worker -> UI: captured blobs (Slot.pushedState, collectVstJobs embedding)
 
@@ -135,6 +169,7 @@ inline void startEditorWorker() {
                 if (!g_editorWorkerOn) break;
                 EditorTask& task = entry.second;
                 if (!task.plugin) continue;
+                const bool busy = editorPlaybackBusy && editorPlaybackBusy();   // transport playing: light housekeeping only (a heavy plugin GUI costs the audio thread glitches)
                 if (task.wantState) {
                     try {
                         const std::string blob = task.plugin->getState();
@@ -144,12 +179,19 @@ inline void startEditorWorker() {
                         }
                     } catch (...) { /* a state capture failure must not kill the worker */ }
                 }
+                if (!task.setState.empty()) {
+                    try { task.plugin->setState(task.setState); } catch (...) { /* a state restore failure must not kill the worker */ }
+                }
+                // a state load / capture is heavy (Kontakt's .nki): while the transport plays, skip the
+                // GUI feed this round so the audio thread keeps its CPU
+                if (busy && (!task.setState.empty() || task.wantState)) continue;
                 const bool hasFeed = task.feed.frames > 0 || !task.feed.events.empty();
                 if (hasFeed && !g_editorFeedLogged) {   // one-shot: confirms the engine snapshot reaches the editor instances
                     g_editorFeedLogged = true;
                     try { caw::vstLog("[caw] editor housekeeping: first feed delivered to a plugin window (" + std::to_string(task.feed.frames) + " frames, " + std::to_string(task.feed.events.size()) + " MIDI events)"); } catch (...) {}
                 }
-                const int n = task.feed.frames > 0 ? std::min(512, std::max(64, task.feed.frames)) : 256;
+                // light mode while playing: a small block keeps the GUI meters alive without the full DSP load
+                const int n = task.light ? 128 : (task.feed.frames > 0 ? std::min(512, std::max(64, task.feed.frames)) : 256);
                 try { task.plugin->processIdle(n, hasFeed ? &task.feed : nullptr); }
                 catch (...) { /* the app must survive a misbehaving plugin */ }
             }
@@ -173,7 +215,9 @@ inline struct EditorWorkerGuard {
 inline void queueEditorTasks(Project& project) {
     static std::chrono::steady_clock::time_point lastBatch{};
     const auto nowT = std::chrono::steady_clock::now();
-    const bool due = nowT - lastBatch >= std::chrono::milliseconds(80);
+    const bool busy = editorPlaybackBusy && editorPlaybackBusy();   // the transport plays: throttle the plugin GUIs (they cost audio glitches)
+    const auto interval = std::chrono::milliseconds(busy ? 240 : 80);
+    const bool due = nowT - lastBatch >= interval;
     if (due) lastBatch = nowT;
     bool any = false;
     for (Track& t : project.tracks) {
@@ -184,7 +228,10 @@ inline void queueEditorTasks(Project& project) {
         if (!s.plugin->editorVisible()) continue;   // hidden window: nothing to tick, nothing to poll
         EditorTask task;
         task.plugin = s.plugin;
-        if (nowT - s.statePollT > std::chrono::seconds(2)) { s.statePollT = nowT; task.wantState = true; }
+        task.light = busy;
+        // restore: a saved patch state (project v58) reaches the plugin here - one shot per state change
+        if (!t.vstPatchState.empty() && t.vstPatchState != s.restoredState) { task.setState = t.vstPatchState; s.restoredState = t.vstPatchState; }
+        if (nowT - s.statePollT > std::chrono::seconds(busy ? 8 : 2)) { s.statePollT = nowT; task.wantState = true; }
         if (g_vstGuiSignal && editorFeedSource) {
             if (auto src = editorFeedSource(t.id)) {
                 try { src->takeEditorFeed(task.feed); } catch (...) { task.feed = caw::EditorFeed{}; }
@@ -273,7 +320,7 @@ inline void startScan(bool rescan = false) {
         c.done = true;
     }).detach();
 }
-inline std::string niceName(const std::string& path, const std::string& classId = std::string()) {
+inline std::string niceName(const std::string& path, const std::string& classId) {   // default declared above
     std::string first;   // no class chosen (old project): the first class the scanner found for the file
     for (const auto& i : catalogSnapshot()) {
         if (i.path != path) continue;
@@ -338,7 +385,7 @@ inline bool loadPlugin(Slot& s, Track& t, const std::string& path, const std::st
             oldTitles.push_back(idx >= 0 && (size_t)idx < old.size() ? old[(size_t)idx].title : std::string());
     }
     auto p = caw::makeVst3Plugin(); std::string err;
-    p->setEditorSystemScaling(s.systemScaling);
+    p->setEditorSystemScaling(g_editorSystemScaling);
     // This copy only shows the plugin; the sound is made by a separate engine instance.
     bool ok = false;
     try { ok = p->load(path, classId, err); } catch (...) { err = "the plugin failed while loading"; }
@@ -373,13 +420,14 @@ inline bool loadPlugin(Slot& s, Track& t, const std::string& path, const std::st
         // track is pinned to that exact class from now on.
         t.vstClassId = p->classId().empty() ? classId : p->classId();
         s.plugin = std::move(p); t.vstPath = path; s.loadedPath = path; s.loadedClassId = t.vstClassId;
-        s.loadedSystemScaling = s.systemScaling; s.learn = -1;
+        s.loadedSystemScaling = g_editorSystemScaling; s.learn = -1;
         s.autoTried = true;   // loaded here: the panel must not load the same plugin a second time next frame
         // Fresh baselines: the values this plugin has right now are the agreed ones. Without this
         // the poll below reads the new defaults as "the user moved the knob", overwrites vstInit
         // and pushes them to the engine - which is how a mapping got reset by picking a plugin.
         s.sync.clear(); s.syncSeen.clear(); s.slotParam.clear();
         s.pushedState.clear(); s.statePollT = {};   // SEPARATED ENGINES: a new plugin must not receive the previous one's patch state
+        s.restoredState.clear();   // the saved patch state (project v58) is queued to the plugin by the housekeeping worker
         // Every knob turned in this plugin's own window reaches the running engine at once
         // (all parameters, not just the 8 picked slots). trackId by value: no dangling lane refs.
         const int liveTrackId = t.id;
@@ -478,6 +526,9 @@ inline void syncLiveParameters(Project& project) {
         for (const auto& e : got) {
             auto cit = slots().find(e.first);
             if (cit != slots().end() && cit->second.plugin) cit->second.pushedState = e.second;
+            // keep the loaded patch on the TRACK: the project save writes it (Kontakt's .nki survives save/load)
+            for (Track& t : project.tracks)
+                if (t.id == e.first && (t.kind == 3 || t.kind == 4)) t.vstPatchState = e.second;
         }
     }
     for (Track& t : project.tracks) {
@@ -624,7 +675,7 @@ inline void drawMappings(Project& proj, Track& t, Slot& s, float scale) {
         ImGui::EndTable();
     }
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
-    if (t.kind == 4) {   // AUDIO OUTPUT mix/replace only makes sense for an effect; an instrument always sends its audio to the master like the other engines
+    if (false) {   // the FX only / FX+Source output mode now sits in the track header, next to the plugin window button
     ImGui::TextColored(ImVec4(1.f, .66f, .20f, 1.f), "AUDIO OUTPUT");
     const char* outLabels[] = { "Master (replace source)", "Mix (source + VSTe)" };
     int om = t.vstOutMode == 1 ? 1 : 0;
@@ -642,26 +693,12 @@ inline void drawMappings(Project& proj, Track& t, Slot& s, float scale) {
 #ifdef _WIN32
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
     ImGui::TextColored(ImVec4(1.f, .66f, .20f, 1.f), "EDITOR");
-    ImGui::Checkbox("Windows compatibility scaling", &s.systemScaling);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Let Windows scale the editor (bitmap scaling). Turn off if the editor is cropped, draws blurry or mouse clicks land on the wrong knob.");
-    if (s.systemScaling != s.loadedSystemScaling) {
-        ImGui::SameLine();
-        if (ImGui::Button("Apply##editorscale")) {
-            // Reattach the editor instead of reloading the plugin: the patch, the saved
-            // mapping and the sound keep running, only the window is recreated.
-            s.loadedSystemScaling = s.systemScaling;
-            s.plugin->setEditorSystemScaling(s.systemScaling);
-            s.plugin->closeEditor();
-            std::string err;
-            if (!s.plugin->showEditor(niceName(t.vstPath, t.vstClassId) + " (" + t.name + ")", err)) s.err = err;
-        }
-    }
     if (ImGui::Button("Reopen editor##editorreattach")) {
         s.plugin->closeEditor();
         std::string err;
         if (!s.plugin->showEditor(niceName(t.vstPath, t.vstClassId) + " (" + t.name + ")", err)) s.err = err;
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Closes and reopens the plugin's own window. Use it if the editor drew wrong or lost its graphics.");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Closes and reopens the plugin's own window. Use it if the editor drew wrong or lost its graphics.\n\nThe Windows compatibility scaling of ALL editors is now a general setting: Settings > Editor > Plugin windows.");
 #endif
 }
 
@@ -796,6 +833,18 @@ inline void drawWindows(Project& proj) {
                 std::string err; if (!s.plugin->showEditor(niceName(t.vstPath, t.vstClassId) + " (" + t.name + ")", err)) s.err = err; else s.err.clear();
             }
             if (!s.plugin) ImGui::EndDisabled();
+            if (t.kind == 4) {   // the output mode right next to the open-plugin button: renamed Master/Mix
+                ImGui::SameLine();
+                static const char* fxModes[] = {"FX only", "FX+Source"};
+                int om = t.vstOutMode == 1 ? 1 : 0;
+                ImGui::SetNextItemWidth(84.f * scale);
+                if (caw_ui::combo("##audio_out_mode2", &om, fxModes, 2)) {
+                    t.vstOutMode = om == 1 ? 1 : 0;
+                    t.vstOutMaster = t.vstOutMode == 1;   // keep the legacy field in sync for older builds / save migration
+                    if (pushVstOutModeLive) pushVstOutModeLive(t.id, t.vstOutMode);   // live: flips the source gates + the rack's replace, no Run needed
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("FX only: the VSTe output replaces the source tracks' own master output (their meters go gray).\nFX+Source: the source tracks keep sounding to the master alongside the VSTe (all meters keep their color).\n\nSwitching works while the engine plays. Inputs can be re-wired while it plays too - no Run needed.");
+            }
             if (!scanDone) { ImGui::SameLine(); ImGui::TextDisabled("Scanning..."); }
             if (inst) {   // VSTi: the sound only starts once NOTES reach the plugin
                 bool hasNotes = false;
@@ -810,8 +859,8 @@ inline void drawWindows(Project& proj) {
             if (!inst) {   // VSTe: the audio inputs - one row per configured input, more can be added
                 ImGui::Spacing();
                 ImGui::TextColored(ImVec4(1.f, .66f, .20f, 1.f), "AUDIO INPUTS");
-                ImGui::TextWrapped("Each input feeds the plugin on its own line(s); a stereo source takes two lines, nothing is mixed down. master = the project master mix (no name needed). Unchecked = silent, but the row stays.");
-                static const char* inModes[] = { "track", "clips", "master" };
+                ImGui::TextWrapped("Each insert feeds the plugin on its own line(s); a stereo source takes two lines, nothing is mixed down. master = the project master mix. Unchecked = silent. '-' removes the insert (the slot is freed).");
+                static const char* inModes[] = { "track", "clips" };   // master was removed: the mix goes through the track / clip sources
                 int configured = 0, shown = 0, hidden = 0;
                 for (int i = 0; i < 8; ++i) if (!t.vstInputs[i].name.empty() || t.vstInputs[i].mode == 2 || t.vstInputs[i].on) ++configured;
                 for (int i = 0; i < 8; ++i) if (s.hiddenInputs.count(i)) ++hidden;
@@ -826,55 +875,51 @@ inline void drawWindows(Project& proj) {
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Turn this input on / off. Works while the engine plays - the later inputs move up, the row stays here.");
                     if (in.on != wasOn) pushInputMaskLive(t);
                     ImGui::SameLine();
-                    if (ImGui::SmallButton("-##in_hide")) { s.hiddenInputs.insert(i); }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Collapse this row (the input keeps its settings; bring it back with 'Show hidden')");
+                    if (ImGui::SmallButton("-##in_remove")) {   // REMOVE: the slot is freed (settings cleared), not hidden
+                        in.on = false;
+                        in.name.clear();
+                        in.mode = 0;
+                        pushInputMaskLive(t);
+                        if (pushVstWiring) pushVstWiring();
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove this input: the slot is freed and another input can use it (the row disappears). Works while the engine plays.");
                     ImGui::SameLine();
                     ImGui::TextDisabled("%d", shown);
                     ImGui::SameLine();
                     ImGui::SetNextItemWidth(90.f * scale);
-                    int m = in.mode;
-                    if (caw_ui::combo("##in_mode", &m, inModes, 3)) { in.mode = std::min(2, std::max(0, m)); if (pushVstWiring) pushVstWiring(); }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("track = every clip of the named track; clips = the clip with that name; master = the project master mix (including the VSTi).\n\nOn/off and a new mode / name are wired at once, with Csound running or with the VST engine - no Run needed. A clip added after Run has no tap yet: Run once for it.");
+                    int m = in.mode == 2 ? 0 : in.mode;
+                    if (caw_ui::combo("##in_mode", &m, inModes, 2)) { in.mode = std::min(1, std::max(0, m)); if (pushVstWiring) pushVstWiring(); }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("track = every clip of the named track; clips = the clip with that name.\n\nOn/off and a new source are wired at once, with Csound running or with the VST engine - no Run needed. A clip added after Run has no tap yet: Run once for it.");
                     ImGui::SameLine();
-                    if (in.mode != 2) {   // track / clips: a name; master needs no name
-                        ImGui::SetNextItemWidth(120.f * scale);
-                        char nb[96]; std::snprintf(nb, sizeof nb, "%s", in.name.c_str());
-                        const char* hint = in.mode == 0 ? "Track name..." : "Clip name...";
-                        ImGui::InputTextWithHint("##in_name", hint, nb, sizeof nb);
-                        if (in.name != nb) in.name = nb;
-                        if (ImGui::IsItemDeactivatedAfterEdit() && pushVstWiring) pushVstWiring();
-                        ImGui::SameLine();
-                        if (ImGui::SmallButton("+##in_pick")) ImGui::OpenPopup("vst_in_pick");
-                        if (ImGui::BeginPopup("vst_in_pick")) {
+                    if (in.mode != 2) {   // track / clips: the source as the SAME dropbox style, listing all possible inputs
+                        ImGui::SetNextItemWidth(160.f * scale);
+                        const std::string preview = in.name.empty()
+                            ? (in.mode == 0 ? "(no source)" : "(no clip)")
+                            : in.name;
+                        bool changed = false;
+                        if (caw_ui::beginCombo("##in_name", preview.c_str())) {
                             if (in.mode == 0) {
-                                // every source track, also one that has no clips yet. VSTi / VSTe tracks
-                                // are sources too: the rack wires the source plugin's stereo output into
-                                // the slot (engine 3). The track itself is never offered (feedback loop).
-                                for (const Track& o : proj.tracks) if ((o.kind == 0 || o.kind == 3 || o.kind == 4 || o.kind == 5 || o.kind == 6) && o.id != t.id) {
-                                    const char* kindText = o.kind == 0 ? "Csound" : o.kind == 3 ? "VSTi" : o.kind == 4 ? "VSTe" : o.kind == 5 ? "SuperCollider" : "Pure Data";
-                                    const std::string sub = o.clips.empty() ? "no clips yet" : std::to_string(o.clips.size()) + (o.clips.size() == 1 ? " clip" : " clips");
-                                    const std::string tag = std::string(kindText) + "  (" + sub + ")";
-                                    const float tagW = ImGui::CalcTextSize(tag.c_str()).x;
-                                    const float leftX = ImGui::GetCursorPosX(), rightX = ImGui::GetContentRegionMax().x;
-                                    if (ImGui::Selectable(o.name.c_str(), o.name == in.name, ImGuiSelectableFlags_None, ImVec2(rightX - leftX, 0.f))) {
+                                for (const Track& o : proj.tracks) if ((o.kind == 0 || o.kind == 3 || o.kind == 4 || o.kind == 5 || o.kind == 6 || o.kind == 7) && o.id != t.id) {
+                                    const char* kindText = o.kind == 0 ? "Csound" : o.kind == 3 ? "VSTi" : o.kind == 4 ? "VSTe" : o.kind == 5 ? "SuperCollider" : o.kind == 7 ? "Sample" : "Pure Data";
+                                    const std::string tag = std::string(o.name) + "  (" + kindText + ")";
+                                    if (ImGui::Selectable(tag.c_str(), o.name == in.name)) {
                                         in.name = o.name;
-                                        if (!in.on) { in.on = true; pushInputMaskLive(t); }   // picking a source also turns the row on, so the VSTe hears it at once
-                                        ImGui::CloseCurrentPopup(); if (pushVstWiring) pushVstWiring();
+                                        changed = true;
+                                        if (!in.on) { in.on = true; pushInputMaskLive(t); }   // picking a source also turns the row on
                                     }
-                                    ImGui::SameLine(std::max(leftX + ImGui::CalcTextSize(o.name.c_str()).x + ImGui::GetStyle().ItemSpacing.x, rightX - tagW));
-                                    ImGui::TextDisabled("%s", tag.c_str());
                                 }
                             } else {
                                 std::set<std::string> seen;
                                 for (const Track& o : proj.tracks) if (o.kind != 1 && o.kind != 2) for (const Clip& c : o.clips)
-                                    if (seen.insert(c.name).second && ImGui::Selectable(c.name.c_str(), c.name == in.name)) {
+                                    if (seen.insert(c.name).second && ImGui::Selectable(c.name.c_str(), c.name == in.name)) {   // sample clips resolve to their track's mix (like VST clips)
                                         in.name = c.name;
-                                        if (!in.on) { in.on = true; pushInputMaskLive(t); }   // picking a source also turns the row on
-                                        ImGui::CloseCurrentPopup(); if (pushVstWiring) pushVstWiring();
+                                        changed = true;
+                                        if (!in.on) { in.on = true; pushInputMaskLive(t); }
                                     }
                             }
-                            ImGui::EndPopup();
+                            ImGui::EndCombo();
                         }
+                        if (changed && pushVstWiring) pushVstWiring();
                     } else {
                         ImGui::TextDisabled("(master mix)");
                     }
@@ -884,8 +929,7 @@ inline void drawWindows(Project& proj) {
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bring back the collapsed input rows");
                 if (hidden > 0) { ImGui::SameLine(); ImGui::TextDisabled("%d hidden", hidden); }
                 if (configured < 8) {
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("+ Add input")) {
+                    if (ImGui::SmallButton("+##in_add")) {   // next line, not beside the rows
                         for (int i = 0; i < 8; ++i)
                             if (!(t.vstInputs[i].on || !t.vstInputs[i].name.empty() || t.vstInputs[i].mode == 2)) {
                                 t.vstInputs[i].on = true;
@@ -895,7 +939,7 @@ inline void drawWindows(Project& proj) {
                         pushInputMaskLive(t);   // the new slot's on/off state
                         if (pushVstWiring) pushVstWiring();   // its (empty) source is resolved at once
                     }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add another input (up to 8). The checkbox works live; the VST engine wires the new input at once, with Csound running press Run Csound again.");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add another insert (input) to the VSTe chain, up to 8. The checkbox works live; the VST engine wires the new input at once, with Csound running press Run Csound again.");
                 }
                 ImGui::SameLine();
                 ImGui::TextDisabled("%d / 8", configured);

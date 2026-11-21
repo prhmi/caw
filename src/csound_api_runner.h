@@ -35,6 +35,9 @@ public:
                       float gain, int wavFormat, const std::string& wavPath, std::string& error,
                       int outputChannels = 0);
     void setMasterGain(float linear);
+    // true = the CAW master chain applies the master gain on the device buffer (the engine
+    // must not apply it again). The offline renderer keeps its own gain.
+    void setHostGainExternal(bool external);
     // Publish a completed command-file number to the engine thread.
     void setCommandSerial(int serial);
     void setVstJobs(const std::vector<VstJob>& jobs);   // the whole VST graph: instruments AND effects (call before start)

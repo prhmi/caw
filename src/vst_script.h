@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <regex>
@@ -32,12 +33,12 @@ struct Expr {
 };
 
 struct Stmt {
-    enum Kind { Every, When, Assign, Note, Cc, Msg, Skip } kind = Skip;
-    ExprP a, b, c;         // Every: interval | When: condition | Assign: value | Note: pitch/vel/len | Cc: num/val | Msg: status/d1/d2
+    enum Kind { Every, When, Assign, Note, Cc, Msg, Play, Once, Skip } kind = Skip;
+    ExprP a, b, c;         // Every: interval | When: condition | Assign: value | Note: pitch/vel/len | Cc: num/val | Msg: status/d1/d2 | Play: start/dur/speed
     int var = -1;          // Assign target: variable index
     int slot = -1;         // Assign target: P slot (0..7)
     char op = 0;           // Assign: 0 set, else + - * /
-    int id = -1;           // Every: runtime state slot
+    int id = -1;           // Every: runtime state slot | Once: 1 = already ran
     std::vector<Stmt> body, otherwise;
 };
 
@@ -46,21 +47,26 @@ struct Program {
     std::vector<std::string> varNames;
     bool writesP[8] = {false, false, false, false, false, false, false, false};
     int states = 0;        // runtime state doubles (Every timers, smooth values)
+    bool hasPlay = false;  // the code contains play: grains (the sample engine runs only them, not the straight file)
     bool ok = true;
+    std::string error;     // human-readable parse problems (empty = clean); valid parts still run
 };
 
 // One tick of the clip: t = seconds since the clip started (Csound's timeinsts()), dur = the
 // clip length (p3), pitch / vel = p4 / p5, p = the current P1..P8 values (0..1).
 struct Env {
     double t = 0.0, dur = 1.0, dt = 0.0, pitch = 0.0, vel = 0.0;
+    double read = 0.0;    // sample engine: the clip's current source position in seconds (the playhead sweeps the file)
     double p[8] = {0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
 };
 
 struct Events {
     struct Note { int pitch = 60, vel = 100; double len = 0.5; };
     struct Midi { int status = 0, d1 = 0, d2 = 0; };
+    struct Grain { double at = 0.0; double start = 0.0, dur = 0.1, speed = 1.0; };   // sample engine: one grain (speed < 0 plays it backwards)
     std::vector<Note> notes;
     std::vector<Midi> midi;
+    std::vector<Grain> grains;
 };
 
 struct Runtime {
@@ -259,6 +265,13 @@ private:
                 ++i_;
                 auto call = node(Expr::Call);
                 call->fn = id == "cpsmidinn" ? "mtof" : id;
+                {
+                    // a function the interpreter does not know evaluates to 0 silently: report it at compile time
+                    static const char* kKnown[] = {"lfo", "tri", "sqr", "saw", "rnd", "rand", "uni", "smooth", "line", "clip", "min", "max", "abs", "sin", "cos", "int", "sqrt", "mtof", "level"};
+                    bool known = false;
+                    for (const char* f : kKnown) if (call->fn == f) { known = true; break; }
+                    if (!known) prog_.error += (prog_.error.empty() ? "" : "; ") + std::string("unknown function \"") + call->fn + "\"";
+                }
                 if (!(cur().t == Token::Sym && cur().text == ")")) {
                     int nargs = 0;
                     for (;;) {
@@ -282,7 +295,11 @@ private:
             if (id == "dur") { ExprP e = node(Expr::Var); e->index = -4; return e; }
             if (id == "time") { ExprP e = node(Expr::Var); e->index = -5; return e; }
             if (id == "pi") { ExprP e = node(Expr::Var); e->index = -6; return e; }
+            if (id == "read") { ExprP e = node(Expr::Var); e->index = -7; return e; }   // the clip's source position at the playhead (seconds)
             if (id == "in") { ExprP e = node(Expr::Num); e->num = 0.0; return e; }   // no audio input in the VST engine
+            if (id.size() == 3 && id[0] == 'i' && id[1] == 'n' && id[2] >= '1' && id[2] <= '8') {   // in1..in8: the input channel number (sample routing: out1 = in1)
+                ExprP e = node(Expr::Num); e->num = (double)(id[2] - '0'); return e;
+            }
             ExprP e = node(Expr::Var); e->index = varIndex(id); return e;
         }
         return nullptr;
@@ -320,6 +337,7 @@ inline double eval(const ExprP& e, const Env& env, Runtime& rt) {
         if (e->index == -4) return env.dur;
         if (e->index == -5) return env.t;
         if (e->index == -6) return 3.141592653589793;
+        if (e->index == -7) return env.read;   // "read": the clip's source position at the playhead (sample engine)
         return e->index >= 0 && (size_t)e->index < rt.vars.size() ? rt.vars[(size_t)e->index] : 0.0;
     case Expr::Param: return e->index >= 0 && e->index < 8 ? env.p[e->index] : 0.0;
     case Expr::Un: {
@@ -351,7 +369,7 @@ inline double eval(const ExprP& e, const Env& env, Runtime& rt) {
             const int type = f == "tri" ? 1 : (f == "sqr" ? 2 : (f == "saw" ? 3 : 0));
             return shape(freq * env.t, type);
         }
-        if (f == "rnd") {
+        if (f == "rnd" || f == "rand") {   // rand: alias of rnd (rand(n) = 0..n, rand(a, b) = a..b)
             if (!e->a) return rt.nextRand();
             const double x = eval(e->a, env, rt);
             if (!e->b) return rt.nextRand() * x;   // rnd(n): 0..n
@@ -411,6 +429,12 @@ inline void runOne(const Stmt& s, Env& env, Runtime& rt, Events& out) {
         if (eval(s.a, env, rt) != 0.0) run(s.body, env, rt, out);
         else run(s.otherwise, env, rt, out);
         return;
+    case Stmt::Once:   // init-once (like Csound i-rate): runs the body a single time per voice
+        if (s.id >= 0 && (size_t)s.id < rt.state.size() && std::isnan(rt.state[(size_t)s.id])) {
+            rt.state[(size_t)s.id] = 1.0;
+            run(s.body, env, rt, out);
+        }
+        return;
     case Stmt::Assign: {
         double v = eval(s.a, env, rt);
         if (s.slot >= 0) {
@@ -449,6 +473,21 @@ inline void runOne(const Stmt& s, Env& env, Runtime& rt, Events& out) {
                             std::min(127, std::max(0, (int)std::lround(eval(s.b, env, rt)))),
                             std::min(127, std::max(0, (int)std::lround(eval(s.c, env, rt))))});
         return;
+    case Stmt::Play: {   // one grain of the clip's own file: start (s), duration (s), pitch/speed (negative = reverse)
+        Events::Grain gr;
+        gr.at = env.t;
+        gr.start = std::max(0.0, eval(s.a, env, rt));
+        gr.dur = std::max(0.005, eval(s.b, env, rt));
+        gr.speed = eval(s.c, env, rt);
+        if (!std::isfinite(gr.start) || gr.start < 0.0) gr.start = 0.0;
+        if (!std::isfinite(gr.dur)) gr.dur = 0.1;
+        gr.dur = std::min(30.0, gr.dur);   // a runaway duration cannot hold a voice forever
+        if (!std::isfinite(gr.speed)) gr.speed = 1.0;
+        if (std::fabs(gr.speed) < 0.02) gr.speed = gr.speed < 0.0 ? -0.02 : 0.02;
+        if (std::fabs(gr.speed) > 16.0) gr.speed = gr.speed < 0.0 ? -16.0 : 16.0;
+        out.grains.push_back(gr);
+        return;
+    }
     case Stmt::Skip: return;
     }
 }
@@ -525,6 +564,24 @@ inline void Compiler::statement(const std::string& line, std::vector<Stmt>& out)
         out.push_back(std::move(s)); return;
     }
     if (has("csound:")) return;   // raw Csound needs the Csound engine
+    // one grain of the clip's own file:  play: "startpoint", "duration", "pitch/speed"
+    if (has("play:") || has("play ")) {
+        const char* pre = has("play:") ? "play:" : "play ";
+        const std::string rest = detail::trim(line.substr(std::strlen(pre)));
+        const auto a = detail::splitArgs(rest);
+        auto clean = [](const std::string& s) {
+            std::string t = detail::trim(s);
+            if (t.size() >= 2 && t.front() == '"' && t.back() == '"') t = t.substr(1, t.size() - 2);
+            return t;
+        };
+        Stmt s; s.kind = Stmt::Play;
+        s.a = expr(clean(a.size() > 0 ? a[0] : "0"));
+        s.b = expr(clean(a.size() > 1 ? a[1] : "0.1"));
+        s.c = expr(clean(a.size() > 2 ? a[2] : "1"));
+        if (!s.a || !s.b || !s.c) return;
+        prog_.hasPlay = true;
+        out.push_back(std::move(s)); return;
+    }
     // assignment:  name op= value
     size_t eq = std::string::npos;
     for (size_t i = 0; i < line.size(); ++i) {
@@ -564,13 +621,14 @@ inline std::vector<Stmt> Compiler::parseBlock() {
         if (line == "@ELSE") return out;   // the caller consumes it
         ++pos_;
         if (line == "{") continue;
-        if (detail::startsWith(line, "every ") || detail::startsWith(line, "when ")) {
+        if (detail::startsWith(line, "every ") || detail::startsWith(line, "when ") || detail::startsWith(line, "once")) {
             const bool every = detail::startsWith(line, "every ");
-            ExprP head = expr(line.substr(every ? 6 : 5));
-            if (!head) { skipBlock(); continue; }
+            const bool once = detail::startsWith(line, "once");
+            ExprP head = once ? nullptr : expr(line.substr(every ? 6 : 5));
+            if (!head && !once) { skipBlock(); continue; }
             if (pos_ < lines_.size() && lines_[pos_] == "{") ++pos_;
-            Stmt s; s.kind = every ? Stmt::Every : Stmt::When; s.a = head;
-            if (every) s.id = nextState_++;
+            Stmt s; s.kind = once ? Stmt::Once : (every ? Stmt::Every : Stmt::When); s.a = head;
+            if (every || once) s.id = nextState_++;
             s.body = parseBlock();
             if (pos_ < lines_.size() && lines_[pos_] == "@ELSE") {
                 ++pos_;
@@ -580,7 +638,10 @@ inline std::vector<Stmt> Compiler::parseBlock() {
             out.push_back(std::move(s));
             continue;
         }
+        const size_t before = out.size();
         statement(line, out);
+        if (out.size() == before)   // the statement was dropped: bad keyword, wrong argument count, bad expression ...
+            prog_.error += (prog_.error.empty() ? "" : "; ") + std::string("cannot parse: \"") + line + "\"";
     }
     return out;
 }
@@ -624,7 +685,7 @@ inline Program Compiler::compile(const std::string& code) {
     }
     prog_.body = parseBlock();
     prog_.states = nextState_;
-    prog_.ok = true;
+    prog_.ok = true;   // the valid parts run even with reported errors: ok stays true so the engine is not disabled
     return prog_;
 }
 

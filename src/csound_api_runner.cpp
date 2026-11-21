@@ -142,6 +142,7 @@ struct CsoundApiRunner::Impl {
     std::vector<std::pair<std::string, std::string>> orcQueue;   // clip name, instrument definition
     std::atomic<int> code{0};
     std::atomic<float> masterGain{1.f};
+    std::atomic<bool> hostGainExternal{false};   // the CAW master chain applies the gain on the device buffer: the engine must not apply it twice
     std::unique_ptr<MonitorCapture> capture;
     std::unique_ptr<MonitorCapture> outputCapture;
     int outputMonitorChannels = 0;
@@ -616,15 +617,16 @@ struct CsoundApiRunner::Impl {
                         if (pd) pd->deliverHub(hubValues);
                     }
                 }
-                const float gain = masterGain.load(std::memory_order_relaxed);
+                const float gain = masterGain.load(std::memory_order_relaxed);   // used by the offline WAV writer
+                const float hostGain = hostGainExternal.load(std::memory_order_relaxed) ? 1.f : gain;   // the CAW master chain applies the gain on the device buffer
                 if (hostOutput) {
                     const size_t sampleCount = (size_t)blockSize * nchan;
                     if (sampleBytes == 8) {
                         double* data = static_cast<double*>(const_cast<void*>(buffer));
-                        for (size_t i = 0; i < sampleCount; ++i) data[i] *= gain;
+                        for (size_t i = 0; i < sampleCount; ++i) data[i] *= hostGain;
                     } else {
                         float* data = static_cast<float*>(const_cast<void*>(buffer));
-                        for (size_t i = 0; i < sampleCount; ++i) data[i] *= gain;
+                        for (size_t i = 0; i < sampleCount; ++i) data[i] *= hostGain;
                     }
                     const bool ok = sampleBytes == 8
                         ? output.push(static_cast<const double*>(buffer), blockSize, stopRequested)
@@ -922,6 +924,9 @@ bool CsoundApiRunner::startOffline(const std::string& path, int sampleRate, int 
 }
 void CsoundApiRunner::setMasterGain(float linear) {
     if (std::isfinite(linear)) d->masterGain.store(std::max(0.f, std::min(2.f, linear)), std::memory_order_relaxed);
+}
+void CsoundApiRunner::setHostGainExternal(bool external) {
+    d->hostGainExternal.store(external, std::memory_order_relaxed);
 }
 void CsoundApiRunner::setVstJobs(const std::vector<VstJob>& jobs) {
     // A new job set means a fresh Csound instance: cached channel pointers and the live M / S state

@@ -9,6 +9,7 @@
 #include <d3d11.h>
 #include <shellapi.h>
 #include <string>
+#include <cstring>
 #include <chrono>
 
 static ID3D11Device* g_dev = nullptr;
@@ -75,7 +76,19 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DROPFILES: {
         HDROP drop = (HDROP)wp;
         char path[MAX_PATH] = {};
-        if (DragQueryFileA(drop, 0, path, MAX_PATH) > 0) appOpenProjectPath(path);
+        if (DragQueryFileA(drop, 0, path, MAX_PATH) > 0) {
+            const size_t len = std::strlen(path);
+            const bool project = len > 4 && (path[len - 4] == '.') &&
+                (path[len - 3] == 'c' || path[len - 3] == 'C') &&
+                (path[len - 2] == 'a' || path[len - 2] == 'A') &&
+                (path[len - 1] == 'w' || path[len - 1] == 'W');
+            if (project) appOpenProjectPath(path);
+            else {
+                POINT pt;
+                DragQueryPoint(drop, &pt);
+                appQueueFileDrop(path, pt.x, pt.y);
+            }
+        }
         DragFinish(drop);
         return 0;
     }

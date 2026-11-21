@@ -24,6 +24,13 @@
 // host-pumped real-time source (SuperCollider) into the same device stream.
 using CawRealtimeSourceFn = void (*)(void*, float*, unsigned long, int) noexcept;
 
+// MASTER CHAIN: applied to the FINAL device mix of every CAW audio stream (the app installs it:
+// master FX chain, then master gain). Called on the audio thread inside the PortAudio callback,
+// before the monitor capture. Null / disabled = the mix goes out untouched.
+using CawMasterChainFn = void (*)(float*, unsigned long, int) noexcept;
+inline CawMasterChainFn g_masterChainFn = nullptr;
+inline std::atomic<bool> g_masterChainEnabled{false};
+
 struct CawAudioSettings {
     std::string deviceLabel; // Csound's exact device label, empty = default
     int sampleRate = 48000;
@@ -199,6 +206,8 @@ private:
             self.tail_.store(self.head_.load(std::memory_order_acquire), std::memory_order_release);
             std::fill(dst, dst + (size_t)frames * self.channels_, 0.f);
             self.mixRealtime(dst, frames);
+            if (g_masterChainEnabled.load(std::memory_order_relaxed) && g_masterChainFn)
+                g_masterChainFn(dst, frames, self.channels_);
             self.captureOutput(dst, frames);
             self.playedPosition_.store(-1, std::memory_order_release);
             self.flushDone_.store(request, std::memory_order_release);
@@ -221,6 +230,8 @@ private:
         }
         std::fill(dst + n * self.channels_, dst + (size_t)frames * self.channels_, 0.f);
         self.mixRealtime(dst, frames);
+        if (g_masterChainEnabled.load(std::memory_order_relaxed) && g_masterChainFn)
+            g_masterChainFn(dst, frames, self.channels_);
         self.captureOutput(dst, frames);
         if (n < frames && head > 0 && self.expectingAudio_.load(std::memory_order_relaxed)) self.underflows_.fetch_add(1, std::memory_order_relaxed);
         self.tail_.store(tail + n, std::memory_order_release);
