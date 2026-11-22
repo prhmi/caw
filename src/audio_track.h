@@ -842,6 +842,11 @@ public:
                         feedBuf_[(size_t)i * (size_t)channels + (size_t)c] = kv.second[(size_t)i * 8 + (size_t)c];
                 feedFn_(kv.first, feedBuf_.data(), frames, channels);
             }
+        // Manual clip auditions (kind 2) sound with the transport STOPPED; the VST effects wired
+        // to that track still have to render them. Published every block for the rack's awake check.
+        int manual = 0;
+        for (const Voice& v : voices_) if (v.spec.kind == 2) ++manual;
+        manualVoices_.store(manual, std::memory_order_relaxed);
     }
 
     // ---- control (UI thread)
@@ -883,6 +888,9 @@ public:
         if (voices_.size() > 128) voices_.erase(voices_.begin());
     }
     int clipVoiceCount() const { std::lock_guard<std::mutex> lock(mu_); int n = 0; for (const Voice& v : voices_) if (v.spec.kind == 0) ++n; return n; }
+    // A manual clip audition (kind 2 voice) is sounding with the transport stopped: whatever
+    // consumes this engine's audio (a VSTe wired to a sample track) must keep rendering.
+    bool manualAuditionActive() const { return manualVoices_.load(std::memory_order_relaxed) > 0; }
     // per-track meter peaks per output channel (max since the last take, one call per UI frame)
     std::map<int, std::array<float, 8>> takeTrackPeaks() {
         std::lock_guard<std::mutex> lock(mu_);
@@ -939,6 +947,7 @@ private:
     std::vector<float> feedBuf_;                                // interleaved scratch for the feed callback
     std::atomic<int> sr_{48000};
     std::atomic<long long> frames_{0};
+    std::atomic<int> manualVoices_{0};   // manual auditions (kind 2) sounding this block - read by the VST rack's awake check
 
     float trackGainFor(int trackId) const {
         const auto it = trackGains_.find(trackId);

@@ -2,8 +2,7 @@
 #include "csd_builder.h"
 #include "caw_toggles.h"
 #include "vst_lang.h"
-#include "monitor_fft.h"
-#include "monitor_frame.h"
+#include "monitor_view.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>

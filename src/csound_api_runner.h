@@ -1,5 +1,5 @@
 #pragma once
-#include "monitor_capture.h"
+#include "monitor_view.h"   // (was monitor_capture.h, phase-1 merge)
 #include "audio_output.h"
 #include "caw_hub.h"
 #include "vst_job.h"

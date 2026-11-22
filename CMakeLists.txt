@@ -160,7 +160,7 @@ if(CAW_VST3)
 endif()
 # ------------------------------------------------------------------ CAW
 set(CAW_SOURCES
-  src/app.cpp src/audio_devices.cpp src/csd_builder.cpp src/csound_api_runner.cpp
+  src/app.cpp src/engine_dispatch.cpp src/ui_panels.cpp src/ui_timeline.cpp src/audio_devices.cpp src/csd_builder.cpp src/csound_api_runner.cpp
   src/platform.cpp src/process_runner.cpp src/project_io.cpp src/score_svg.cpp src/pd_backend.cpp src/svg_raster.cpp
   ${CAW_TEXTEDITOR_DIR}/TextEditor.cpp
   ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -170,7 +170,7 @@ if(WIN32)
   list(APPEND CAW_SOURCES src/main.cpp res/caw.rc
     ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp)
   add_executable(caw WIN32 ${CAW_SOURCES})
-  target_link_libraries(caw PRIVATE d3d11 dxgi d3dcompiler dwmapi ws2_32 ole32 shell32 comdlg32 propsys)
+  target_link_libraries(caw PRIVATE d3d11 dxgi d3dcompiler dwmapi ws2_32 ole32 shell32 comdlg32 propsys dbghelp)
   target_compile_definitions(caw PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
   if(MSVC)
     target_compile_options(caw PRIVATE /utf-8)

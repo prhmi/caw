@@ -1,7 +1,7 @@
 #include "score_svg.h"
 #include "csd_builder.h"
 #include "marks_gfx.h"
-#include "monitor_math.h"
+#include "monitor_view.h"
 #include <algorithm>
 #include <cmath>
 #include <complex>

@@ -1,7 +1,7 @@
 #include "csound_api_runner.h"
 #include "vst_rack.h"
 #include "wav_writer.h"
-#include "audio_channels.h"
+#include "timeline_edit.h"   // (was audio_channels.h, phase-1 merge)
 #include "platform.h"
 #include "pd_host_mixer.h"
 #include <algorithm>

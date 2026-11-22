@@ -76,7 +76,7 @@ namespace vsttaps {
     }
     inline void clear() { std::lock_guard<std::mutex> g(registryLock()); registry().clear(); }
 }
-#include "monitor_capture.h"
+#include "monitor_view.h"   // (was monitor_capture.h, phase-1 merge)
 #include "caw_bus.h"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -145,13 +145,18 @@ public:
     // applyStateNow() is called by the engine's state worker while it HOLDS the render mutex,
     // so the audio callback skips blocks instead of deadlocking.
 #ifdef CAW_VST3
-    void applyStateNow(int trackId, const std::string& blob) {
+    void applyStateNow(int trackId, const std::string& blob, const std::string& originPath = {}, const std::string& originClassId = {}) {
         if (blob.empty()) return;
         std::shared_ptr<Graph> graph;
         { std::lock_guard<std::mutex> lock(graphMutex_); graph = graph_; }
         if (!graph) return;
         for (Rt& r : graph->rts) {
             if (r.job.id != trackId || !r.inst) continue;
+            // The blob must come from the plugin the track runs NOW: a capture that was in flight
+            // while the user switched the plugin is stale and would make the new plugin reject its
+            // own load (kHs: "Expected 'filter' but got 'equalizer'").
+            if (!originPath.empty() && r.job.path != originPath) return;
+            if (!originClassId.empty() && !r.job.classId.empty() && r.job.classId != originClassId) return;
             if (r.inst->appliedState == blob) return;   // already applied - also dedupes the creation path
             try {
                 r.plug->setState(blob);

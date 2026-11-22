@@ -192,7 +192,11 @@ struct Track {
     //       output is suppressed and their meters are drawn gray.
     //   1 = mix: the VSTe output goes to the master AND the source tracks keep sounding to the
     //       master; every meter keeps its default color.
-    int vstOutMode = 0;
+    // Default = MIX: a freshly added effect (EQ, compressor ...) must process the source WHILE the
+    // source keeps sounding. "FX only" (replace) is the special mode - on a default replace, a
+    // flat EQ is literally the same sound routed through the tap path, so the effect "does nothing"
+    // and the level shifts by the tap path's gain.
+    int vstOutMode = 1;
     // The 8 VSTe input lines. Each line is an independent source with its own on/off switch:
     //   mode 0 = track (name = a track name), 1 = clips (name = a clip name), 2 = master (no name).
     // A source fills as many of the 8 plugin input channels as it has outputs (a stereo source

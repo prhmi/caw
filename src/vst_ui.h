@@ -50,11 +50,15 @@ struct Slot {
     std::map<int, double> sync;
     std::set<int> syncSeen;
     std::map<size_t, int> slotParam;   // slot k -> the parameter index it held last frame (a re-pick reseeds the baseline)
+    // ALL parameter values of the editor instance as of the last sweep, for plugins whose GUI does
+    // not call back through performEdit (kilohearts): a change here is a knob the engine has not
+    // seen yet. Cheap getters, ~25 ms cadence - never getState().
+    std::vector<double> paramSnapshot;
+    std::chrono::steady_clock::time_point paramPollT{};
     std::set<int> hiddenInputs;        // input slots the user collapsed in the AUDIO INPUTS list (UI only)
     std::string pushedState;           // SEPARATED ENGINES: last full plugin state captured from this editor instance
     std::string restoredState;         // SEPARATED ENGINES: the saved patch state already queued to this editor instance
                                        // (Kontakt's loaded .nki - binary state, not a parameter) and pushed to the engine
-    std::chrono::steady_clock::time_point statePollT{};   // next editor-state poll (2 s cadence)
 #endif
 };
 inline std::map<int, Slot>& slots() { static std::map<int, Slot> s; return s; }
@@ -91,7 +95,7 @@ inline void prepareAllEditorPlugins(Project& project, double sampleRate, int blo
 // synth's meters follow the notes that sound - the plugin window stops looking dead.
 #ifdef CAW_VST3
 inline std::function<std::shared_ptr<caw::IPlugin>(int)> editorFeedSource;   // app wires it: the ENGINE instance of a track
-inline std::function<void(int, const std::string&)> pushVstStateLive;   // (trackId, full state blob) the editor's loaded patch reaches the engine (wired by app.cpp)
+inline std::function<void(int, const std::string&, const std::string&, const std::string&)> pushVstStateLive;   // (trackId, blob, originPath, originClassId) the editor's loaded patch reaches the engine (wired by app.cpp)
 // The signal-display option (Settings > General): send the engine's audio + notes into the
 // plugin's own window (EQ analyzers, scopes, synth meters, Kontakt keys). Off = the editor
 // instances are still ticked silently (loading screens stay alive) but receive no signal.
@@ -127,19 +131,23 @@ inline void applyEditorSystemScaling(Project& proj, bool enabled) {
 #endif
 }
 
-// The EDITOR HOUSEKEEPING WORKER. Kontakt (and other samplers) serialize state and component
-// work with locks that also involve their own GUI thread - which IS the host's UI thread.
-// Round 48 ran getState()/processIdle() per frame on the UI thread: opening a plugin window
-// while the engine ran deadlocked the whole app. Now the UI thread only ENQUEUES a task
-// (a shared_ptr copy + a small feed snapshot); this worker runs processIdle and getState
-// (~12 Hz), so a slow or blocking plugin stalls only itself - the UI, the audio and the
-// engine's state worker all stay free. Latest task per track wins, so the queue cannot grow.
+// The EDITOR REALTIME TICK (one worker for every plugin window). A real DAW runs one plugin
+// instance and its GUI is fed while the audio runs. CAW runs a separate EDITOR instance, so this
+// worker replays the ENGINE instance's own audio (lock-free ring, Vst3Plugin::takeEditorFeed) at
+// ~60 Hz: EQ analyzers, scopes and meters move at realtime speed, with no timer jumps.
+//   - ProcessIdle must never run on the UI thread: Kontakt-class plugins serialize component
+//     work with locks that also involve their own GUI thread (which IS the host's UI thread).
+//   - The full plugin state is captured ONLY after the user changed something in the window
+//     (the plugin marks itself dirty on every knob / preset message - see
+//     IPlugin::stateDirty). No timer polls getState(): a kHs-class editor stalls while its state
+//     is serialized, and a blob with volatile fields would be re-applied forever.
 struct EditorTask {
     std::shared_ptr<caw::IPlugin> plugin;
-    caw::EditorFeed feed;
-    bool wantState = false;
-    bool light = false;                // transport playing: small processIdle block (GUI meters alive, audio protected)
+    std::string originPath, originClassId;   // which plugin instance a state capture came from: a blob must never reach a different plugin (kHs bundles reject a foreign node type with an error dialog)
     std::string setState;              // restore: apply a saved patch state (never on the UI / audio thread)
+    uint64_t restoreGen = 0;           // a published restore is applied once, even if the UI thread stalls
+    bool signal = true;                // g_vstGuiSignal when published: feed the engine's audio / notes into the window
+    bool visible = true;               // hidden after an edit: only the state capture runs (no feed, no idle DSP)
 };
 inline std::map<int, EditorTask> g_editorTaskMap;
 inline std::mutex g_editorTaskMutex;
@@ -148,52 +156,107 @@ inline std::atomic<bool> g_editorWorkerOn{false};
 inline std::thread g_editorWorkerThread;
 inline bool g_editorWorkerStarted = false;
 inline std::atomic<bool> g_editorFeedLogged{false};   // one-shot log: the first feed that reaches an editor instance
-inline std::function<bool()> editorPlaybackBusy;      // true while the transport plays: the plugin-GUI housekeeping throttles down (heavy GUIs cost audio glitches)
+inline std::atomic<uint64_t> g_restoreGen{0};
+inline std::function<bool()> editorPlaybackBusy;      // true while any engine renders sound (diagnostics / hooks)
+inline std::function<bool()> editorStateCaptureBlocked;   // true while sound is AUDIBLE: the capture then runs under the render-pause guard below
+inline std::function<bool()> engineRestartBusy;           // the rack is creating / freeing plugin instances: no editor work this round (a framework must not see an instance freed under it)
+inline std::function<bool(const std::function<void()>&)> editorStateCaptureGuard;   // runs fn while the engine's rendering is paused (the engine instance is idle, the audio plays from the FIFO): the plugin->getState capture cannot contend with the engine instance, so the patch still reaches the engine while the transport plays
+inline std::atomic<int> g_stateApplyTrackId{-1};      // the engine's state worker is applying a patch to THIS track's engine instance right now: the editor housekeeping pauses that plugin (kHs-class frameworks deadlock when two of their instances are touched at once)
 inline std::mutex g_capturedStateMutex;
-inline std::deque<std::pair<int, std::string>> g_capturedStates;   // worker -> UI: captured blobs (Slot.pushedState, collectVstJobs embedding)
+struct CapturedState { int trackId = 0; std::string blob, originPath, originClassId; };
+inline std::deque<CapturedState> g_capturedStates;   // worker -> UI: captured blobs (Slot.pushedState, collectVstJobs embedding)
 
 inline void startEditorWorker() {
     if (g_editorWorkerStarted) return;
     g_editorWorkerStarted = true;
     g_editorWorkerOn = true;
     g_editorWorkerThread = std::thread([] {
+        std::map<int, uint64_t> appliedRestoreGen;   // worker thread only
+        std::map<int, int> skipTicks;                // a heavy GUI processes less often; the ring keeps the recent audio
+        // Last patch pushed per track. A plugin that re-arms stateDirty after every apply (some
+        // editors bump volatile fields in getState) would otherwise push a "new" blob forever:
+        // each engine apply resets the window's analyzer mid-view. Same blob = nothing to push.
+        struct LastCapture { std::string path, classId, blob; };
+        std::map<int, LastCapture> lastCapture;
         while (g_editorWorkerOn) {
-            std::map<int, EditorTask> tasks;
             {
                 std::unique_lock<std::mutex> lock(g_editorTaskMutex);
-                g_editorTaskCv.wait_for(lock, std::chrono::milliseconds(80),
-                                        [] { return !g_editorTaskMap.empty() || !g_editorWorkerOn.load(); });
-                tasks.swap(g_editorTaskMap);
+                if (g_editorTaskMap.empty())
+                    g_editorTaskCv.wait(lock, [] { return !g_editorTaskMap.empty() || !g_editorWorkerOn.load(); });
+                else
+                    g_editorTaskCv.wait_for(lock, std::chrono::milliseconds(16), [] { return !g_editorWorkerOn.load(); });
             }
+            if (!g_editorWorkerOn) break;
+            std::map<int, EditorTask> tasks;
+            { std::lock_guard<std::mutex> lock(g_editorTaskMutex); tasks = g_editorTaskMap; }
             for (auto& entry : tasks) {
                 if (!g_editorWorkerOn) break;
                 EditorTask& task = entry.second;
                 if (!task.plugin) continue;
-                const bool busy = editorPlaybackBusy && editorPlaybackBusy();   // transport playing: light housekeeping only (a heavy plugin GUI costs the audio thread glitches)
-                if (task.wantState) {
-                    try {
-                        const std::string blob = task.plugin->getState();
-                        if (!blob.empty()) {
-                            if (pushVstStateLive) pushVstStateLive(entry.first, blob);   // -> the engine's state worker (never the audio thread)
-                            { std::lock_guard<std::mutex> l(g_capturedStateMutex); g_capturedStates.emplace_back(entry.first, blob); }
-                        }
-                    } catch (...) { /* a state capture failure must not kill the worker */ }
-                }
-                if (!task.setState.empty()) {
+                if (g_stateApplyTrackId.load(std::memory_order_acquire) == entry.first) continue;   // a patch is being applied to this track's ENGINE instance: keep the editor instance completely idle (framework deadlock guard)
+                if (engineRestartBusy && engineRestartBusy()) continue;   // instances are being created / freed: touch nothing this round
+                // Restore a saved patch (project load) - once per published generation.
+                if (!task.setState.empty() && task.restoreGen > appliedRestoreGen[entry.first]) {
+                    appliedRestoreGen[entry.first] = task.restoreGen;
+                    lastCapture.erase(entry.first);   // the restored patch is not a capture: a later edit pushes once
                     try { task.plugin->setState(task.setState); } catch (...) { /* a state restore failure must not kill the worker */ }
                 }
-                // a state load / capture is heavy (Kontakt's .nki): while the transport plays, skip the
-                // GUI feed this round so the audio thread keeps its CPU
-                if (busy && (!task.setState.empty() || task.wantState)) continue;
-                const bool hasFeed = task.feed.frames > 0 || !task.feed.events.empty();
-                if (hasFeed && !g_editorFeedLogged) {   // one-shot: confirms the engine snapshot reaches the editor instances
-                    g_editorFeedLogged = true;
-                    try { caw::vstLog("[caw] editor housekeeping: first feed delivered to a plugin window (" + std::to_string(task.feed.frames) + " frames, " + std::to_string(task.feed.events.size()) + " MIDI events)"); } catch (...) {}
+                // Capture the full state only when the USER changed something and the mouse has
+                // settled (a window being moved never captures: editors freeze mid-drag).
+                if (task.plugin->stateDirty() && task.plugin->msSinceLastTouch() > 250.0 && !task.plugin->windowBusy()) {
+                    auto capture = [&]() {
+                        const std::string blob = task.plugin->getState();
+                        if (!blob.empty()) {
+                            LastCapture& last = lastCapture[entry.first];
+                            if (last.path == task.originPath && last.classId == task.originClassId && last.blob == blob) return;
+                            last.path = task.originPath; last.classId = task.originClassId; last.blob = blob;
+                            if (pushVstStateLive) pushVstStateLive(entry.first, blob, task.originPath, task.originClassId);   // -> the engine's state worker (never the audio thread)
+                            std::lock_guard<std::mutex> l(g_capturedStateMutex);
+                            g_capturedStates.push_back({entry.first, blob, task.originPath, task.originClassId});
+                        }
+                    };
+                    bool ran = true;
+                    try {
+                        const bool audible = editorStateCaptureBlocked && editorStateCaptureBlocked();
+                        // Sound is audible: hold the engine quiet around the capture (the engine
+                        // instance is idle then, the audio keeps playing from the FIFO) - the patch
+                        // STILL reaches the engine instance while the transport plays. An apply in
+                        // flight or an engine reload just skips this round.
+                        if (audible && editorStateCaptureGuard) ran = editorStateCaptureGuard(capture);
+                        else capture();   // nothing audible: a stall cannot glitch the audio
+                    } catch (...) { /* a state capture failure must not kill the worker */ }
+                    if (ran) task.plugin->markStateCaptured();
                 }
-                // light mode while playing: a small block keeps the GUI meters alive without the full DSP load
-                const int n = task.light ? 128 : (task.feed.frames > 0 ? std::min(512, std::max(64, task.feed.frames)) : 256);
-                try { task.plugin->processIdle(n, hasFeed ? &task.feed : nullptr); }
-                catch (...) { /* the app must survive a misbehaving plugin */ }
+                int& skip = skipTicks[entry.first];
+                if (!task.visible) continue;   // window closed right after an edit: its capture above still runs
+                if (skip > 0) { --skip; continue; }
+                const auto tickStart = std::chrono::steady_clock::now();
+                // Realtime feed: drain the engine's ring, one prepared block per processIdle, so
+                // the editor instance hears exactly what the engine rendered since the last tick.
+                bool fed = false;
+                std::shared_ptr<caw::IPlugin> src;
+                if (task.signal && g_vstGuiSignal && editorFeedSource) src = editorFeedSource(entry.first);
+                if (src) {
+                    caw::EditorFeed feed;
+                    for (int k = 0; k < 8; ++k) {
+                        try { if (!src->takeEditorFeed(feed)) break; } catch (...) { break; }
+                        if (feed.frames <= 0 && feed.events.empty()) break;
+                        try { task.plugin->processIdle(feed.frames > 0 ? feed.frames : 128, &feed); } catch (...) { /* the app must survive a misbehaving plugin */ }
+                        fed = true;
+                        if (feed.frames > 0 && !g_editorFeedLogged.load(std::memory_order_relaxed)) {
+                            g_editorFeedLogged.store(true, std::memory_order_relaxed);
+                            try { caw::vstLog("[caw] editor tick: engine audio reaches the plugin window (" + std::to_string(feed.frames) + " frames per block)"); } catch (...) {}
+                        }
+                    }
+                }
+                // No engine audio (stopped, or signal display off): a silent block keeps loading
+                // screens finishing and meters decaying - the window never looks dead.
+                if (!fed) {
+                    try { task.plugin->processIdle(256, nullptr); } catch (...) { /* a misbehaving plugin must not kill the worker */ }
+                }
+                const double ms = (double)std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - tickStart).count() / 1000.0;
+                if (ms > 12.0) skip = (int)std::min(4.0, ms / 8.0);   // a heavy GUI (Kontakt-class) ticks less often: the audio core keeps its headroom
             }
         }
     });
@@ -210,37 +273,34 @@ inline void stopEditorWorker() {
 inline struct EditorWorkerGuard {
     ~EditorWorkerGuard() { stopEditorWorker(); }
 } g_editorWorkerGuard;
-// UI thread, once per frame: hand every visible editor its latest task. The heavy calls happen
-// on the worker (see above); here we only copy a shared_ptr and a small feed snapshot.
+// UI thread, once per frame: publish which plugin windows exist and are visible. The worker
+// ticks them at 60 Hz on its own; here we only copy a shared_ptr per window and one-shot
+// restore data. The map is replaced every frame, so a closed window stops being ticked.
 inline void queueEditorTasks(Project& project) {
-    static std::chrono::steady_clock::time_point lastBatch{};
-    const auto nowT = std::chrono::steady_clock::now();
-    const bool busy = editorPlaybackBusy && editorPlaybackBusy();   // the transport plays: throttle the plugin GUIs (they cost audio glitches)
-    const auto interval = std::chrono::milliseconds(busy ? 240 : 80);
-    const bool due = nowT - lastBatch >= interval;
-    if (due) lastBatch = nowT;
-    bool any = false;
+    static std::map<int, EditorTask> next;   // UI thread only
+    next.clear();
     for (Track& t : project.tracks) {
         if (t.kind != 3 && t.kind != 4) continue;
         auto it = slots().find(t.id);
         if (it == slots().end() || !it->second.plugin) continue;
         Slot& s = it->second;
-        if (!s.plugin->editorVisible()) continue;   // hidden window: nothing to tick, nothing to poll
+        const bool visible = s.plugin->editorVisible();
+        if (!visible && !s.plugin->stateDirty()) continue;   // hidden window: nothing to tick (an un-captured edit still gets its capture)
         EditorTask task;
         task.plugin = s.plugin;
-        task.light = busy;
+        task.visible = visible;
+        task.originPath = s.loadedPath; task.originClassId = s.loadedClassId;   // the capture must carry its source plugin: a blob captured from the PREVIOUS plugin must never reach the new one
+        task.signal = g_vstGuiSignal;
         // restore: a saved patch state (project v58) reaches the plugin here - one shot per state change
-        if (!t.vstPatchState.empty() && t.vstPatchState != s.restoredState) { task.setState = t.vstPatchState; s.restoredState = t.vstPatchState; }
-        if (nowT - s.statePollT > std::chrono::seconds(busy ? 8 : 2)) { s.statePollT = nowT; task.wantState = true; }
-        if (g_vstGuiSignal && editorFeedSource) {
-            if (auto src = editorFeedSource(t.id)) {
-                try { src->takeEditorFeed(task.feed); } catch (...) { task.feed = caw::EditorFeed{}; }
-            }
+        if (!t.vstPatchState.empty() && t.vstPatchState != s.restoredState) {
+            task.setState = t.vstPatchState;
+            s.restoredState = t.vstPatchState;
+            task.restoreGen = ++g_restoreGen;
         }
-        { std::lock_guard<std::mutex> lock(g_editorTaskMutex); g_editorTaskMap[t.id] = std::move(task); }
-        any = true;
+        next[t.id] = std::move(task);
     }
-    if (any || !g_editorTaskMap.empty()) { g_editorTaskCv.notify_one(); startEditorWorker(); }
+    { std::lock_guard<std::mutex> lock(g_editorTaskMutex); g_editorTaskMap.swap(next); }
+    if (!g_editorTaskMap.empty()) { g_editorTaskCv.notify_one(); startEditorWorker(); }
 }
 #endif
 
@@ -370,7 +430,15 @@ inline bool loadPlugin(Slot& s, Track& t, const std::string& path, const std::st
     // so the new plugin would open with the old plugin's settings - wrong on screen, often silent.
     // The working 38_bridge_19 build did exactly this clear; it is why picking a plugin from
     // another company first "fixed" the next pick from the same company.
-    if (newPlugin) t.vstParameterState.clear();
+    if (newPlugin) {
+        t.vstParameterState.clear();
+        // The project-saved patch state belongs to the plugin that was on this track when it was
+        // saved (kHs: "Expected 'filter' but got 'equalizer'"). A fresh pick must not inherit it:
+        // collectVstJobs falls back to this blob for a new engine instance, and the editor restore
+        // queues it to the plugin window. The project file still has it - reloading the project
+        // restores the original plugin with its patch.
+        t.vstPatchState.clear();
+    }
 #ifdef _WIN32
     static bool com = false; if (!com) { OleInitialize(nullptr); com = true; }   // many plugins expect COM on the thread that loads them
 #endif
@@ -426,8 +494,9 @@ inline bool loadPlugin(Slot& s, Track& t, const std::string& path, const std::st
         // the poll below reads the new defaults as "the user moved the knob", overwrites vstInit
         // and pushes them to the engine - which is how a mapping got reset by picking a plugin.
         s.sync.clear(); s.syncSeen.clear(); s.slotParam.clear();
-        s.pushedState.clear(); s.statePollT = {};   // SEPARATED ENGINES: a new plugin must not receive the previous one's patch state
-        s.restoredState.clear();   // the saved patch state (project v58) is queued to the plugin by the housekeeping worker
+        s.paramSnapshot.clear(); s.paramPollT = {};   // a new plugin seeds its own values: never push the previous plugin's
+        s.pushedState.clear();   // SEPARATED ENGINES: a new plugin must not receive the previous one's patch state
+        s.restoredState.clear();   // the saved patch state (project v58) is queued to the plugin by the editor tick
         // Every knob turned in this plugin's own window reaches the running engine at once
         // (all parameters, not just the 8 picked slots). trackId by value: no dangling lane refs.
         const int liveTrackId = t.id;
@@ -513,7 +582,8 @@ inline void pushInputMaskLive(Track& t) {
 //     the running engine at once, like an effect VST in a host;
 //   - engine-side changes (automation on a lane, another sender of the same channel) are mirrored
 //     back into the plugin GUI so the knobs follow what is audible.
-// Only the 8 picked parameters (kP1..kP8) have an engine path; other knobs apply on the next Run.
+// Every parameter reaches the engine: the 8 picks through the lane/P-slider path above, all the
+// others through the value sweep below (plugins like kilohearts' do not report GUI edits).
 inline void syncLiveParameters(Project& project) {
 #ifdef CAW_VST3
     // The editor instances are ticked and their state captured on the HOUSEKEEPING WORKER (see
@@ -521,14 +591,23 @@ inline void syncLiveParameters(Project& project) {
     // run on the UI thread: opening Kontakt's window while the engine ran froze the whole app.
     queueEditorTasks(project);
     {   // the worker's captured blobs -> Slot.pushedState (collectVstJobs embeds it at engine start / reload / export)
-        std::deque<std::pair<int, std::string>> got;
+        // A capture that was in flight while the user switched this track's plugin is STALE: only
+        // accept a blob whose origin (path + class) still matches the slot's loaded plugin -
+        // applying a Slice EQ blob to kHs Filter is exactly the "Expected 'filter' but got
+        // 'equalizer'" error dialog.
+        std::deque<CapturedState> got;
         { std::lock_guard<std::mutex> l(g_capturedStateMutex); got.swap(g_capturedStates); }
         for (const auto& e : got) {
-            auto cit = slots().find(e.first);
-            if (cit != slots().end() && cit->second.plugin) cit->second.pushedState = e.second;
+            auto cit = slots().find(e.trackId);
+            const bool samePlugin = cit != slots().end() && cit->second.plugin &&
+                cit->second.loadedPath == e.originPath &&
+                (cit->second.loadedClassId.empty() || e.originClassId.empty() || cit->second.loadedClassId == e.originClassId);
+            if (!samePlugin) continue;
+            cit->second.pushedState = e.blob;
+            cit->second.restoredState = e.blob;   // the editor produced it: never echo it back as a restore
             // keep the loaded patch on the TRACK: the project save writes it (Kontakt's .nki survives save/load)
             for (Track& t : project.tracks)
-                if (t.id == e.first && (t.kind == 3 || t.kind == 4)) t.vstPatchState = e.second;
+                if (t.id == e.trackId && (t.kind == 3 || t.kind == 4)) t.vstPatchState = e.blob;
         }
     }
     for (Track& t : project.tracks) {
@@ -573,6 +652,31 @@ inline void syncLiveParameters(Project& project) {
                         if (p.index == idx) { t.vstParameterState[p.id] = engine; break; }
                 }
             }
+        }
+        // EVERY other parameter: kilohearts-class editors do NOT report a knob turn through
+        // IComponentHandler::performEdit, so without this sweep only the 8 picks ever reach the
+        // engine instance - the VSTe EQ then processes with its old/default curve while the
+        // single-instance master FX follows its own GUI exactly. Sweep the editor instance's
+        // values (cheap getters - no getState(), no timer stall) and push every change to the
+        // engine instance. Picked parameters stay with the automation path above.
+        const bool watched = s.open || s.plugin->editorVisible();
+        const auto now = std::chrono::steady_clock::now();
+        if (!watched) { s.paramSnapshot.clear(); s.paramPollT = {}; continue; }
+        if (now - s.paramPollT < std::chrono::milliseconds(25)) continue;
+        s.paramPollT = now;
+        std::vector<double> cur;
+        const int np = s.plugin->readParameterValues(cur);
+        if (np <= 0) continue;
+        if ((int)s.paramSnapshot.size() != np) { s.paramSnapshot.swap(cur); continue; }   // first sweep / plugin change: seed only
+        for (int i = 0; i < np; ++i) {
+            const double v = cur[(size_t)i];
+            if (std::fabs(v - s.paramSnapshot[(size_t)i]) <= 1e-6) continue;
+            s.paramSnapshot[(size_t)i] = v;
+            if ((size_t)i < params.size() && params[(size_t)i].readOnly) continue;
+            if (std::find(t.vstPick.begin(), t.vstPick.end(), i) != t.vstPick.end()) continue;   // the lane / P-slider path owns the picks
+            if (pushVstParamLive) pushVstParamLive(t.id, i, v);
+            for (const caw::PluginParam& p : params)
+                if (p.index == i) { t.vstParameterState[p.id] = v; break; }   // the saved params stay current for the next Run / export
         }
     }
 #else
@@ -863,6 +967,8 @@ inline void drawWindows(Project& proj) {
                 static const char* inModes[] = { "track", "clips" };   // master was removed: the mix goes through the track / clip sources
                 int configured = 0, shown = 0, hidden = 0;
                 for (int i = 0; i < 8; ++i) if (!t.vstInputs[i].name.empty() || t.vstInputs[i].mode == 2 || t.vstInputs[i].on) ++configured;
+                if (configured == 0)
+                    ImGui::TextColored(ImVec4(1.f, .72f, .30f, 1.f), "No audio input yet: this effect processes silence (the source plays dry and the plugin seems to do nothing). Turn row 1 on and pick a source track or clip.");
                 for (int i = 0; i < 8; ++i) if (s.hiddenInputs.count(i)) ++hidden;
                 for (int i = 0; i < 8; ++i) {
                     Track::VstInput& in = t.vstInputs[i];

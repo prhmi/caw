@@ -2,6 +2,7 @@
 #define NOMINMAX
 #endif
 #include "app.h"
+#include "crash_dump.h"
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
@@ -103,6 +104,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int) {
+    cawcrash::install();
     ImGui_ImplWin32_EnableDpiAwareness();
     const float dpi = ImGui_ImplWin32_GetDpiScaleForMonitor(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY));
 

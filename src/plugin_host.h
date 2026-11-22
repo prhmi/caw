@@ -9,11 +9,11 @@ namespace caw {
 struct PluginParam { int index = 0; unsigned id = 0; std::string title, units; double def = 0, value = 0; int steps = 0; bool readOnly = false; };
 struct MidiMsg;   // caw_bus.h
 
-// SEPARATED ENGINES: one snapshot of what the ENGINE instance just rendered - its input audio and
-// the MIDI it dispatched - drained by vstui::queueEditorTasks (the editor housekeeping worker) and replayed on the
-// EDITOR instance (processIdle) so plugin GUIs show live content: an EQ gets real audio for its
-// analyzer waves, a synth gets the notes for its meters. Without this the editor instance only
-// ever processes silence and every plugin window looks dead.
+// SEPARATED ENGINES: one block of what the ENGINE instance just rendered - its input audio and
+// the MIDI it dispatched - drained by the editor tick (vstui::startEditorWorker) and replayed on
+// the EDITOR instance (processIdle) so plugin GUIs show live content: an EQ gets real audio for
+// its analyzer waves, a synth gets the notes for its meters. The engine streams into a ring and
+// the tick drains it at the rate the audio runs, so the GUI moves at realtime speed.
 struct EditorFeed {
     std::vector<float> audio;        // interleaved stereo of the block (empty = silence)
     int frames = 0;                  // frames in audio (audio.size() == frames * 2)
@@ -54,18 +54,35 @@ struct IPlugin {
     // the plugin's own window changes a parameter. This is how ANY editor knob reaches the
     // running engine in real time (not just the 8 picked parameters).
     virtual void setLiveEditHook(std::function<void(int, double)> hook) { (void)hook; }
-    // SEPARATED ENGINES: UI-thread idle tick for the EDITOR instance (not the audio one). Kontakt
+    // SEPARATED ENGINES: idle tick for the EDITOR instance (not the audio one). Kontakt
     // and other sampler-style plugins only finish their loading screen and move their meters when
-    // their component is processed. Called at a low cadence from vstui::queueEditorTasks; the
-    // engine instance on the audio path is untouched. `feed` (optional) carries the engine's last
-    // block - real input audio for an EQ's analyzer, the dispatched notes for a synth's meters -
-    // so the plugin window shows what the engine actually does. Default no-op.
+    // their component is processed. Called ~60 Hz from the editor tick (vstui::startEditorWorker);
+    // the engine instance on the audio path is untouched. `feed` (optional) carries the engine's
+    // next block - real input audio for an EQ's analyzer, the dispatched notes for a synth's
+    // meters - so the plugin window shows what the engine actually does. Default no-op.
     virtual void processIdle(int frames, const EditorFeed* feed = nullptr) { (void)frames; (void)feed; }
-    // The engine-side snapshot for the editor feed, drained by the UI thread. Returns false when
-    // nothing was captured yet. Default: no feed.
+    // The engine-side snapshot for the editor feed, drained by the editor's realtime tick. One
+    // call returns at most one prepared block (the ring only ever holds what the engine
+    // produced, so draining at 60 Hz replays the engine's audio at exactly realtime speed).
+    // Returns false when nothing was captured yet. Default: no feed.
     virtual bool takeEditorFeed(EditorFeed& out) { (void)out; return false; }
+    // Editor interaction state. A real DAW captures the full plugin state when the USER changed
+    // something, not on a timer: polling getState() on a kHs-class editor stalls its GUI and
+    // re-applies a blob that embeds volatile data forever. The editor marks itself dirty on
+    // every knob / preset message (setParamNormalized, restartComponent) and reports how long
+    // ago the user last touched it and whether its window is being moved / resized.
+    virtual bool stateDirty() const { return false; }
+    virtual void markStateCaptured() {}
+    virtual double msSinceLastTouch() const { return 1e9; }
+    virtual bool windowBusy() const { return false; }
     virtual std::string getState() const = 0;              // for saving into the project
     virtual void setState(const std::string& blob) = 0;
+    // Every parameter's current normalized value, in parameter-index order. Cheap getters only:
+    // this is how the host detects an editor knob turn for plugins whose GUI does not report
+    // edits through IComponentHandler::performEdit (kilohearts' Slice EQ does not) - the value
+    // then still reaches the engine instance, exactly like a single-instance host. Never
+    // serializes state. Returns the number of values stored.
+    virtual int readParameterValues(std::vector<double>& out) const { out.clear(); return 0; }
 };
 std::unique_ptr<IPlugin> makeVst3Plugin();
 std::vector<std::string> scanVst3(const std::vector<std::string>& extraDirs);   // finds *.vst3

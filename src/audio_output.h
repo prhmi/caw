@@ -1,7 +1,7 @@
 #pragma once
 #include "audio_device_match.h"
 #include "caw_audio_host.h"
-#include "monitor_capture.h"
+#include "monitor_view.h"   // (was monitor_capture.h, phase-1 merge)
 #include <portaudio.h>
 #include <algorithm>
 #include <atomic>

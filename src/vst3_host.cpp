@@ -120,11 +120,13 @@ public:
     std::function<int(ParamID)> indexOf;
     std::function<void(int, double)> onLiveEdit;   // every editor knob turn with its normalized value
     std::function<tresult(IPlugView*, ViewRect*)> resize;
+    std::function<void()> onInteract;   // the user changed something in the editor: the full state is due (no timer polls it any more)
     void clearTouches() { std::lock_guard<std::mutex> lock(touchMutex); touches.clear(); }
     int popTouch() { std::lock_guard<std::mutex> lock(touchMutex); if (touches.empty()) return -1; int i = touches.front(); touches.pop_front(); return i; }
     tresult PLUGIN_API beginEdit(ParamID) override { return kResultOk; }
     tresult PLUGIN_API performEdit(ParamID id, ParamValue v) override {
         const int i = indexOf ? indexOf(id) : -1;
+        if (onInteract) onInteract();
         if (learning && i >= 0) { std::lock_guard<std::mutex> lock(touchMutex); if (touches.size() < 256) touches.push_back(i); }
         if (i >= 0 && onLiveEdit) onLiveEdit(i, (double)v);   // the editor's value used to be discarded: live sync could never see a knob turn
         return kResultOk;
@@ -145,8 +147,7 @@ public:
     PendEdit pendEdit_[kPendEditN];
     std::atomic<unsigned> pendW_{0}, pendR_{0};
     tresult PLUGIN_API endEdit(ParamID) override { return kResultOk; }
-    tresult PLUGIN_API restartComponent(int32) override { return kResultOk; }
-    tresult PLUGIN_API resizeView(IPlugView* view, ViewRect* r) override { return resize && r ? resize(view, r) : kResultFalse; }
+    tresult PLUGIN_API restartComponent(int32) override { if (onInteract) onInteract(); return kResultOk; }    tresult PLUGIN_API resizeView(IPlugView* view, ViewRect* r) override { return resize && r ? resize(view, r) : kResultFalse; }
     tresult PLUGIN_API queryInterface(const TUID _iid, void** obj) override {
         QUERY_INTERFACE(_iid, obj, FUnknown::iid, IComponentHandler)
         QUERY_INTERFACE(_iid, obj, IComponentHandler::iid, IComponentHandler)
@@ -160,19 +161,40 @@ public:
 class Vst3Plugin : public IPlugin {
     std::atomic<int> inBusCh_{2}, outBusCh_{2};   // channel count of the plugin's first audio input / output bus (queried at prepare)
     bool editorComponentActive_ = false;
+    // The EDITOR instance is touched by two threads: the housekeeping worker (processIdle, state
+    // capture) and the UI thread (open / close / re-attach / state restore). kHs-class plugins are
+    // not safe against that: one call at a time, and the window never tears down mid-process.
+    mutable std::mutex editorApiMutex_;
     bool editorProcessing_ = false;   // SEPARATED ENGINES: the editor instance runs processIdle() ticks
     bool editorLogged_ = false;       // one-shot log: confirms the editor instance began processing (and setProcessing's return)
     double editorSetupSr_ = 0.0;
     int editorSetupBlock_ = 0;
     std::vector<std::vector<float>> inScratch_, outScratch_;   // de-interleaved process scratch for any channel count
     // SEPARATED ENGINES: what this instance heard and dispatched, captured for the EDITOR
-    // instance's feed (EQ analyzers, synth meters). tapAudio_ / tapEvents_ are written on the
-    // thread that runs process() (the rack's render thread) and drained by the UI thread in
-    // takeEditorFeed(); heldNotes_ only lives on the process() thread.
+    // instance's feed (EQ analyzers, synth meters). A REAL DAW runs one instance and its GUI is
+    // fed as the audio runs. CAW runs two, so the engine instance streams its input into a
+    // lock-free SPSC ring (tapRing_) and the editor's realtime tick drains it: a 60 Hz tick
+    // replays exactly the frames the engine produced, i.e. realtime-speed meters / analyzers.
+    // The ring is preallocated and the producer never waits on the consumer. tapEvents_ is
+    // drained under tapMutex_ (the producer only try-locks it: it must never block the audio).
+    static constexpr size_t kTapCap = 8192;   // frames (interleaved stereo): ~170 ms at 48 kHz
     std::mutex tapMutex_;
-    std::vector<float> tapAudio_;            // interleaved stereo (2 ch) of the last rendered block
-    int tapFrames_ = 0;
+    std::vector<float> tapRing_ = std::vector<float>(kTapCap * 2, 0.f);
+    std::atomic<size_t> tapWrite_{0};        // total frames ever written (monotonic)
+    std::atomic<size_t> tapRead_{0};         // total frames drained (monotonic)
     std::deque<MidiMsg> tapEvents_;          // dispatched MIDI since the last drain (capped)
+    // Editor interaction: see IPlugin::stateDirty / windowBusy.
+    std::atomic<bool> stateDirty_{false};
+    std::atomic<bool> windowBusy_{false};
+    std::atomic<bool> hostParam_{false};     // the HOST is setting a parameter (slider / automation): not a user edit
+    std::atomic<double> lastTouchMs_{0.0};   // steady_clock ms
+    struct HostParamGuard {
+        std::atomic<bool>& f;
+        explicit HostParamGuard(std::atomic<bool>& a) : f(a) { f.store(true, std::memory_order_relaxed); }
+        ~HostParamGuard() { f.store(false, std::memory_order_relaxed); }
+    };
+    static double nowMs() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+    void touchEditor() { lastTouchMs_.store(nowMs(), std::memory_order_relaxed); stateDirty_.store(true, std::memory_order_relaxed); }
     std::set<int> heldNotes_;                // channel * 128 + pitch of note-ons with no note-off yet
     // The controller's MIDI CC / bend / aftertouch -> parameter assignment, cached ONCE at load on
     // the UI thread (IMidiMapping is documented "[UI-thread & Connected]" - it must never be
@@ -181,6 +203,7 @@ class Vst3Plugin : public IPlugin {
 public:
     void setEditorSystemScaling(bool enabled) override { systemScaling_ = enabled; }
     void closeEditor() override {
+        std::lock_guard<std::mutex> api(editorApiMutex_);   // never tear the window down while the worker is inside the plugin
 #ifdef _WIN32
         EditorDpiContext dpi(systemScaling_);
         if (view_) { view_->setFrame(nullptr); if (viewAttached_) view_->removed(); viewAttached_ = false; view_ = nullptr; }
@@ -258,6 +281,12 @@ public:
                     (componentCP ? "yes" : "no") + " controller=" + (controllerCP ? "yes" : "no"));
             }
             handler_.indexOf = [this](ParamID id) { for (const PluginParam& p : params_) if (p.id == id) return p.index; return -1; };
+            // A real DAW captures the full plugin state when the USER changed something (the
+            // editor tick takes it once the mouse settles), never on a timer: a state poll stalls
+            // kHs-class editors and re-applies a blob with volatile fields forever. Slice EQ-style
+            // plugins echo host-driven setParamNormalized as performEdit too, so a host set is not
+            // a user edit.
+            handler_.onInteract = [this] { if (!hostParam_.load(std::memory_order_relaxed)) touchEditor(); };
             // The editor's knob turns arrive here as performEdit calls: keep the parameter cache
             // fresh so the UI live sync (syncLiveParameters) sees every editor edit next frame.
             handler_.onLiveEdit = [this](int i, double v) {
@@ -320,6 +349,7 @@ public:
     std::string classId() const override { return classId_; }
     void prepareEditor(double sr, int maxBlock) override {
         if (!proc_ || !comp_ || sr <= 0.0 || maxBlock <= 0) return;
+        std::lock_guard<std::mutex> api(editorApiMutex_);
         if (editorComponentActive_ && std::fabs(editorSetupSr_ - sr) < 0.01 && editorSetupBlock_ == maxBlock) return;
         // The UI instance is separate from the real-time audio instance. Configure and activate
         // its component only after the host engine has a real format; processIdle() (vstui::
@@ -346,14 +376,16 @@ public:
         editorSetupBlock_ = maxBlock;
         vstLog("editor: component prepared for engine " + std::to_string((int)sr) + " Hz / " + std::to_string(maxBlock) + " frames");
     }
-    // SEPARATED ENGINES: UI-thread idle tick for the EDITOR instance. Kontakt (and other
-    // sampler-style plugins) only finish their loading screen and move their meters when their
-    // component is processed. Runs a small block at ~12 Hz (vstui::queueEditorTasks); no engine
+    // SEPARATED ENGINES: idle tick for the EDITOR instance. Kontakt (and other sampler-style
+    // plugins) only finish their loading screen and move their meters when their component is
+    // processed. The editor tick (vstui::startEditorWorker) runs a block every ~16 ms; no engine
     // connection: the engine instance on the audio path is a different object and is unaffected.
     // With a feed, the block carries the ENGINE instance's real input audio and dispatched MIDI,
-    // so EQ analyzers draw the actual signal and synth meters follow the notes that sound.
+    // drained from the engine's ring at the rate the engine produced it, so EQ analyzers and
+    // meters run at realtime speed.
     void processIdle(int frames, const EditorFeed* feed) override {
         if (!proc_ || !comp_ || !editorComponentActive_ || frames <= 0) return;
+        std::lock_guard<std::mutex> api(editorApiMutex_);
         // VST3: IAudioProcessor::setProcessing is OPTIONAL. Many plugins (and VST2 adapters)
         // return kResultFalse from setProcessing(true) - the spec says the host must then just
         // call process() anyway. The engine path already does this; the editor instance must
@@ -391,22 +423,85 @@ public:
         AudioBusBuffers ib{}, ob{}; ib.numChannels = nIn; ib.channelBuffers32 = ins; ob.numChannels = nOut; ob.channelBuffers32 = outs;
         events_.clear(); changes_.clearQueue();
         if (feed) for (const MidiMsg& m : feed->events) mapMidi(m, events_, changes_, 0);
+        // The window's own knob turns reach the processor through this instance's performEdit ring
+        // exactly like master FX's single instance (Vst3Plugin::process drains it). The editor
+        // instance IS the window's DSP: skip this and its processed-audio display (Slice EQ's
+        // spectrum analyzer, meters) keeps drawing the patch from load time while the engine -
+        // fed through the value sweep - plays the edited one.
+        {
+            unsigned r = handler_.pendR_.load(std::memory_order_relaxed);
+            int drained = 0; int32 qi = 0;
+            while (r != handler_.pendW_.load(std::memory_order_acquire) && drained < 128) {
+                const int pi = handler_.pendEdit_[r].idx.load(std::memory_order_relaxed);
+                const float pv = handler_.pendEdit_[r].val.load(std::memory_order_relaxed);
+                if (pi >= 0 && pi < (int)params_.size()) {
+                    auto* q = changes_.addParameterData(params_[(size_t)pi].id, qi);
+                    int32 point;
+                    if (q) q->addPoint(0, (double)pv, point);
+                }
+                r = (r + 1u) % handler_.kPendEditN; ++drained;
+            }
+            handler_.pendR_.store(r, std::memory_order_release);
+        }
+        // Host-set values queued by setParam (the 8 picked slots mirrored from the engine).
+        {
+            std::lock_guard<std::mutex> lock(initParamMutex_);
+            int sent = 0; int32 qi = 0;
+            for (auto it = initialParameters_.begin(); it != initialParameters_.end(); ) {
+                if (sent >= 128) break;
+                if (it->first < 0 || it->first >= (int)params_.size()) { it = initialParameters_.erase(it); continue; }
+                auto* q = changes_.addParameterData(params_[it->first].id, qi);
+                int32 point;
+                if (q) q->addPoint(0, it->second, point);
+                it = initialParameters_.erase(it);
+                ++sent;
+            }
+        }
         ProcessData d{}; d.processMode = kRealtime; d.symbolicSampleSize = kSample32; d.numSamples = frames;
         d.numInputs = nIn > 0 ? 1 : 0; d.inputs = nIn > 0 ? &ib : nullptr; d.numOutputs = 1; d.outputs = &ob;
         d.inputEvents = feed && !feed->events.empty() ? &events_ : nullptr;
         d.inputParameterChanges = &changes_;
         proc_->process(d);
     }
-    // The UI drains this instance's engine snapshot for the editor feed. Copies everything out
-    // under a short lock - the render thread must never wait on the UI.
+    // The editor tick drains this instance's engine snapshot for the feed. Copies everything out
+    // without ever blocking the render thread: audio comes from the SPSC ring (the producer only
+    // stores an index), MIDI from a try-lock. One call returns at most one prepared block, so
+    // draining every tick replays the engine's audio at the engine's own rate.
     bool takeEditorFeed(EditorFeed& out) override {
-        std::lock_guard<std::mutex> lock(tapMutex_);
-        out.audio = tapAudio_;
-        out.frames = tapFrames_;
-        out.events.assign(tapEvents_.begin(), tapEvents_.end());
-        tapEvents_.clear();
+        out.audio.clear();
+        out.frames = 0;
+        out.events.clear();
+        size_t r = tapRead_.load(std::memory_order_relaxed);
+        size_t w = tapWrite_.load(std::memory_order_acquire);
+        if (w - r > kTapCap) r = w - kTapCap;   // the consumer fell behind: drop the oldest
+        const int block = editorSetupBlock_ > 0 ? editorSetupBlock_ : 512;
+        int n = (int)std::min<size_t>(w - r, (size_t)block);
+        if (n > 0) {
+            out.audio.resize((size_t)n * 2);
+            for (int i = 0; i < n; ++i) {
+                const size_t src = ((r + (size_t)i) & (kTapCap - 1)) * 2;
+                out.audio[(size_t)i * 2] = tapRing_[src];
+                out.audio[(size_t)i * 2 + 1] = tapRing_[src + 1];
+            }
+            out.frames = n;
+            tapRead_.store(r + (size_t)n, std::memory_order_release);
+        }
+        {
+            std::unique_lock<std::mutex> lock(tapMutex_, std::try_to_lock);
+            if (lock.owns_lock() && !tapEvents_.empty()) {
+                out.events.assign(tapEvents_.begin(), tapEvents_.end());
+                tapEvents_.clear();
+            }
+        }
         return out.frames > 0 || !out.events.empty();
     }
+    bool stateDirty() const override { return stateDirty_.load(std::memory_order_relaxed); }
+    void markStateCaptured() override { stateDirty_.store(false, std::memory_order_relaxed); }
+    double msSinceLastTouch() const override {
+        const double t = lastTouchMs_.load(std::memory_order_relaxed);
+        return t <= 0.0 ? 1e9 : nowMs() - t;
+    }
+    bool windowBusy() const override { return windowBusy_.load(std::memory_order_relaxed); }
     // One MIDI message from a ring (the engine's or the editor tick's replay) into VST3 events /
     // parameter changes. CC 120 / 123 (all sound / all notes off) become real note-offs for every
     // note this instance still sees as held: the transport stop sends exactly those, and a plugin
@@ -503,6 +598,8 @@ public:
         // some plugins stop processing (Arturia ARP 2600 goes silent). Automation below is applied
         // after the initials of the same block, so the current lane always wins.
         int sentInitial = 0;
+        {
+        std::lock_guard<std::mutex> lock(initParamMutex_);   // the UI thread's setParam may be filling it
         for (auto it = initialParameters_.begin(); it != initialParameters_.end(); ) {
             if (sentInitial >= 128) break;
             if (it->first < 0 || it->first >= (int)params_.size()) { it = initialParameters_.erase(it); continue; }
@@ -510,6 +607,7 @@ public:
             if (q) q->addPoint(0, it->second, pi);
             it = initialParameters_.erase(it);
             ++sentInitial;
+        }
         }
         while (ep.paramIn.pop(pm) && pm.paramIndex >= 0 && pm.paramIndex < (int)params_.size()) {
             auto* q = changes_.addParameterData(params_[pm.paramIndex].id, qi); int32 pi;
@@ -538,19 +636,23 @@ public:
         proc_->process(d);
         if (out) for (int c = 0; c < ch; ++c) for (int i = 0; i < frames; ++i)
             out[(size_t)i * ch + c] = c < nOut ? outScratch_[(size_t)c][(size_t)i] : 0.f;   // channels the plugin does not have stay silent
-        // SEPARATED ENGINES: capture the first stereo pair of this block for the EDITOR
-        // instance's feed (EQ analyzers, scopes). Instruments capture silence - their GUI
-        // meters move on the dispatched notes, not on input audio. Never waits on the UI.
+        // SEPARATED ENGINES: stream the first stereo pair of this block into the editor's ring
+        // (EQ analyzers, scopes). Instruments stream silence - their GUI meters move on the
+        // dispatched notes, not on input audio. The audio thread never waits on the editor: a
+        // full ring just drops the newest frames, and the consumer paces itself by what is there.
         {
-            std::unique_lock<std::mutex> lock(tapMutex_, std::try_to_lock);
-            if (lock.owns_lock()) {
-                if (tapAudio_.size() != (size_t)frames * 2) tapAudio_.assign((size_t)frames * 2, 0.f);
-                const int ncap = in ? std::min(2, nIn) : 0;
-                for (int i = 0; i < frames; ++i)
-                    for (int c = 0; c < 2; ++c)
-                        tapAudio_[(size_t)i * 2 + (size_t)c] = c < ncap ? in[(size_t)i * ch + c] : 0.f;
-                tapFrames_ = frames;
+            size_t w = tapWrite_.load(std::memory_order_relaxed);
+            const size_t r = tapRead_.load(std::memory_order_acquire);
+            const size_t used = w >= r ? w - r : kTapCap;
+            const size_t room = used < kTapCap ? kTapCap - used : 0;
+            const int ncap = in ? std::min(2, nIn) : 0;
+            const int put = (int)std::min<size_t>((size_t)frames, room);
+            for (int i = 0; i < put; ++i) {
+                const size_t dst = ((w + (size_t)i) & (kTapCap - 1)) * 2;
+                tapRing_[dst] = ncap > 0 ? in[(size_t)i * ch] : 0.f;
+                tapRing_[dst + 1] = ncap > 1 ? in[(size_t)i * ch + 1] : 0.f;
             }
+            if (put > 0) tapWrite_.store(w + (size_t)put, std::memory_order_release);
         }
         // 4. publish the last parameter values so code can read them (cawgp)
         if (ep.paramLast.size() == params_.size()) for (size_t i = 0; i < params_.size(); ++i) ep.paramLast[i].store((float)params_[i].value);
@@ -562,9 +664,10 @@ public:
 #endif
         if (ctrl_ && i >= 0 && i < (int)params_.size() && !params_[i].readOnly) {
             v = std::min(1.0, std::max(0.0, v));
+            HostParamGuard hostSet(hostParam_);   // the plugin may echo this as performEdit: not a user edit
             ctrl_->setParamNormalized(params_[i].id, v);
             params_[i].value = v;
-            initialParameters_[i] = v;
+            { std::lock_guard<std::mutex> lock(initParamMutex_); initialParameters_[i] = v; }
         }
     }
     double getParam(int i) const override {
@@ -573,6 +676,19 @@ public:
 #endif
         if (i < 0 || i >= (int)params_.size()) return 0.0;
         return ctrl_ ? ctrl_->getParamNormalized(params_[i].id) : params_[i].value;
+    }
+    // Bulk normalized values for host-side change detection. ONE DPI context for the whole
+    // sweep (a per-parameter context switch would cost more than the getters themselves).
+    int readParameterValues(std::vector<double>& out) const override {
+        const int n = (int)params_.size();
+        if (!ctrl_ || n <= 0) { out.clear(); return 0; }
+#ifdef _WIN32
+        EditorDpiContext dpi(systemScaling_);
+#endif
+        out.resize((size_t)n);
+        for (int i = 0; i < n; ++i)
+            out[(size_t)i] = params_[(size_t)i].readOnly ? 0.0 : ctrl_->getParamNormalized(params_[(size_t)i].id);
+        return n;
     }
     bool editorVisible() const override {
 #ifdef _WIN32
@@ -621,6 +737,7 @@ public:
         return changed;
     }
     bool showEditor(const std::string& title, std::string& err) override {
+        std::lock_guard<std::mutex> api(editorApiMutex_);
 #ifdef _WIN32
         EditorDpiContext dpiContext(systemScaling_);
         if (!ctrl_) { err = "this plugin has no controller"; return false; }
@@ -692,6 +809,7 @@ public:
     // via VstRack::pushState). Base64 keeps the blob text-safe on the way through the app.
     std::string getState() const override {
         if (!comp_) return {};
+        std::lock_guard<std::mutex> api(editorApiMutex_);
         try {
             Steinberg::MemoryStream state;
             if (comp_->getState(&state) != kResultTrue) return {};
@@ -707,6 +825,7 @@ public:
     }
     void setState(const std::string& blob) override {
         if (!comp_ || blob.empty()) return;
+        std::lock_guard<std::mutex> api(editorApiMutex_);
         std::string raw;
         if (!base64Decode(blob, raw)) { vstLog("state: blob is not base64 - skipped (" + std::to_string(blob.size()) + " chars)"); return; }
         if (raw.empty()) return;
@@ -733,7 +852,7 @@ private:
     Steinberg::IPtr<IComponent> comp_; Steinberg::IPtr<IEditController> ctrl_; Steinberg::IPtr<IAudioProcessor> proc_;
     EventList events_{}; ParameterChanges changes_{16};
     VstAudioBuffers audioBuffers_;
-    std::vector<PluginParam> params_; std::map<int, double> initialParameters_;
+    std::vector<PluginParam> params_; std::map<int, double> initialParameters_; std::mutex initParamMutex_;   // setParam (UI) vs process/processIdle drain
     std::function<void(int, double)> liveHook_;   // app callback for every editor edit (all parameters)
     std::vector<double> lastLive_;                // last editor value forwarded per parameter (dedupe)
     bool instrument_ = false; std::string classId_; int maxBlock_ = 512;
@@ -812,7 +931,12 @@ private:
     }
     static LRESULT CALLBACK editorProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         auto* self = reinterpret_cast<Vst3Plugin*>(GetWindowLongPtr(h, GWLP_USERDATA));
-        if (m == WM_CLOSE) { ShowWindow(h, SW_HIDE); return 0; }
+        // A modal move/size loop keeps the plugin's GUI thread busy: no state capture then (some
+        // editors serialize getState with their own UI locks and freeze mid-drag). Moving a
+        // window changes no sound, so it does not arm a capture either.
+        if (self && (m == WM_ENTERSIZEMOVE || m == WM_EXITSIZEMOVE))
+            self->windowBusy_.store(m == WM_ENTERSIZEMOVE, std::memory_order_relaxed);
+        if (m == WM_CLOSE) { if (self) self->touchEditor(); ShowWindow(h, SW_HIDE); return 0; }   // closed right after an edit: the tick still captures it
         if (m == WM_DPICHANGED && self && self->viewAttached_) {
             const RECT* suggested = reinterpret_cast<const RECT*>(l);
             if (suggested) SetWindowPos(h, nullptr, suggested->left, suggested->top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
