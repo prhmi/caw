@@ -1,4 +1,7 @@
 #include "platform.h"
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -106,8 +109,18 @@ std::string cawOwnFolder() {
     const fs::path dir = cawExeDir();
     if (dir.empty()) return {};
     return dir.u8string();
+#elif defined(__APPLE__)
+    char buf[4096] = {};
+    uint32_t size = sizeof buf;
+    if (_NSGetExecutablePath(buf, &size) != 0) return {};
+    std::error_code ec;
+    const fs::path exe = fs::weakly_canonical(fs::u8path(buf), ec);
+    return (ec ? fs::u8path(buf) : exe).parent_path().u8string();
 #else
-    return {};
+    std::error_code ec;
+    const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (ec) return {};
+    return exe.parent_path().u8string();
 #endif
 }
 

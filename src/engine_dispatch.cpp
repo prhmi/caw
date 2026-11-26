@@ -4162,7 +4162,7 @@ std::string cawExportDir(const char* kind) {
 // The offline render carries the FROZEN tracks' sound through their rendered WAVs (the offline
 // host decodes them and feeds them as engine-4 sample-ring inputs - see setOfflineSampleStreams).
 // The live sample engine does not run offline, so these streams ARE the locked sources' voices.
-static std::map<int, CsoundApiRunner::OfflineSampleStream> collectOfflineSampleStreams(const Project& p) {
+std::map<int, CsoundApiRunner::OfflineSampleStream> collectOfflineSampleStreams(const Project& p) {
     std::map<int, CsoundApiRunner::OfflineSampleStream> out;
     for (const Track& tr : p.tracks)
         if (trackFrozen(tr) && !tr.freezePath.empty())

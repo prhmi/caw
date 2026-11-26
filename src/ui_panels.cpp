@@ -1,6 +1,7 @@
 #include "app_shared.h"
 #include <mutex>
 #include <ctime>
+#include "platform.h"
 
 // src/ui_panels.cpp (phase 2: extracted from app.cpp; the shared state is app_state.h, the
 //  internal declarations are app_internal.h - all included through app_shared.h.)
@@ -149,11 +150,9 @@ void logLine(const std::string& s) {
         std::lock_guard<std::mutex> lock(s_logMu);
         static FILE* s_logFile = nullptr;
         if (!s_logFile) {
-            char exe[MAX_PATH] = {};
-            if (GetModuleFileNameA(nullptr, exe, MAX_PATH)) {
-                std::string base = exe;
-                const size_t slash = base.find_last_of("\\/");
-                if (slash != std::string::npos) base.resize(slash + 1);
+            const std::string own = cawOwnFolder();   // the folder of caw.exe / caw (portable)
+            {
+                const std::string base = own.empty() ? std::string() : own + "/";
                 s_logFile = fopen((base + "caw_log.txt").c_str(), "a");
                 if (s_logFile) {
                     time_t now = time(nullptr);
@@ -167,11 +166,8 @@ void logLine(const std::string& s) {
             long long size = ftell(s_logFile);
             if (size > 8 * 1024 * 1024) {   // rotate: a runaway log must not grow forever
                 fclose(s_logFile);
-                char exe[MAX_PATH] = {};
-                GetModuleFileNameA(nullptr, exe, MAX_PATH);
-                std::string base = exe;
-                const size_t slash = base.find_last_of("\\/");
-                if (slash != std::string::npos) base.resize(slash + 1);
+                const std::string own = cawOwnFolder();
+                const std::string base = own.empty() ? std::string() : own + "/";
                 s_logFile = fopen((base + "caw_log.txt").c_str(), "w");
                 if (s_logFile) fprintf(s_logFile, "---- log rotated ----\n");
             }
