@@ -1358,7 +1358,11 @@ std::vector<PluginInfo> scanVst3Info(const std::vector<std::string>& extra,
 }
 // User folders from Settings > Programs > VST3, kept in <home>/.caw_vst3_dirs (one per line).
 static std::string vstDirsFile() {
-    const char* home = std::getenv(_WIN32 ? "USERPROFILE" : "HOME");
+#ifdef _WIN32
+    const char* home = std::getenv("USERPROFILE");
+#else
+    const char* home = std::getenv("HOME");
+#endif
     return home ? (fs::u8path(home) / ".caw_vst3_dirs").u8string() : std::string();
 }
 static std::mutex g_vstDirsMutex;
