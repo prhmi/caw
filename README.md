@@ -155,6 +155,60 @@ The same lane drives every kind of engine:
 
 ---
 
+## Score generation
+
+CAW draws a **contemporary-music score** of the project: a mix of staff notation and graphic notation. **No external library is used.** The whole renderer is CAW's own C++ code (`score_svg.cpp`, `marks_gfx.h`):
+
+- It builds the score as a list of shapes (lines, rectangles, curves, text).
+- The same list is written to **SVG** files and drawn in CAW's live **Score** preview window.
+- Note heads, sharps, flats, quarter-tones and koron are drawn as vector curves, not with a music font.
+
+**Two kinds of score:**
+
+| Kind | Result |
+|---|---|
+| **Overview** | the whole piece on one page |
+| **Detailed (full score)** | A4 landscape pages: a cover, then systems reading left to right and top to bottom, then cue-list pages. Each clip gets a cue number, time and parameters |
+
+The full score is written as one SVG per page, plus an **HTML** file holding all pages. Open it and print (Ctrl+P, A4 landscape) to get a **PDF**.
+
+**Where the content comes from:**
+
+| Source | Shown as |
+|---|---|
+| tracks and clips | one lane per track (tracks with the same name share a lane), clip names, cue numbers, times |
+| MIDI clips and written notes | notes on a staff with clefs; quarter-tones and koron |
+| automation lanes | curves under their track |
+| markers | comments, rehearsal letters, cues (Q), code shown in a monospace font |
+| graph tracks | graphic shapes: grain cloud, glissando, swell… |
+| **Render audio** (measured) | the real loudness shape and spectral centroid of every clip |
+| the rendered WAV (optional) | a spectrogram strip |
+
+**Written notes:** a clip can carry hand-written notes. Space separates notes, `:` gives a relative length, `-` is a rest, `+` makes a chord:
+```
+C4 E4:2 - G3+D4        # Cq4 quarter sharp, Eqb4 quarter flat, Bd3 koron
+```
+
+**Measured shapes:** without measurement, clip shapes are drawn from their envelopes. With **Render audio** and score analysis on, CAW adds a hidden Csound instrument (`CawScoreProbe`) to the render. Every 50 ms it writes the following for each clip:
+- loudness, with Csound's `rms`;
+- spectral centroid, with `pvsanal` + `pvscent`;
+- anything the clip sends to the score.
+
+The score then draws the real sound.
+
+```csound
+chnset kVal, "score"     ; plot a number or signal on the score under this clip
+chnset Stext, "score"    ; write text on the score
+```
+
+Named streams can be set up under **Edit cawscore**. A signal stream is plotted as a min/max envelope plus its own spectrum frames, taken with `pvsanal` and grouped into logarithmic bands.
+
+**Spectrogram:** CAW reads the rendered WAV itself (16/24/32-bit or float) and mixes it to mono. It then runs its own FFT: 4096 points, or 8192 at 96 kHz and above, with a Hann window and about 12 columns per second. The result is grouped into 40 logarithmic bands from 40 Hz to 16 kHz, with a 70 dB range.
+
+**Options:** colour or black-and-white, overview or detailed, spectrum on/off, and lanes merged by track name.
+
+---
+
 ## Build
 
 **Windows:** install Visual Studio with *Desktop development with C++* and Git, then run `build.bat`.
