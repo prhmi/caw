@@ -183,7 +183,7 @@ void pushBtnOn(ImVec4 c) {
 }
 
 // Vector logo (res/logo.svg) drawn once per size it is shown at, so it is never scaled: About, welcome window, splash.
-inline bool hasClips(const Track& t) { return t.kind == 0 || t.kind == 3 || t.kind == 4 || t.kind == 5 || t.kind == 6 || t.kind == 7; }
+// hasClips(): defined in app_internal.h
 
 
 // automation editing

@@ -22,7 +22,9 @@ void clearSampleRings();
 void scRealtimeSource(void* context, float* output, unsigned long frames, int channels) noexcept;
 void attachScRealtimeSource(CawAudioSettings& settings);
 void pushBtnOn(ImVec4 c);
-inline bool hasClips(const Track& t);
+// A track that holds clips (Csound, VSTi, VSTe, SC, PD, sample). Defined HERE, in the header:
+// an inline function only declared here and defined in app.cpp is invisible to the other files (GCC link error).
+inline bool hasClips(const Track& t) { return t.kind == 0 || t.kind == 3 || t.kind == 4 || t.kind == 5 || t.kind == 6 || t.kind == 7; }
 bool isPenTool();
 int scopeDiv();
 int scopeWindowMs();
