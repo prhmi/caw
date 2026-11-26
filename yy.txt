@@ -1,1 +1,9 @@
 https://fineartsinfo.org/up/cGFycGFyLDE3ODA4NTI4NTIh2_2zJJ9-Q
+
+
+sudo sed -i -e 's|http://[a-z.]*archive.ubuntu.com|http://old-releases.ubuntu.com|g' \
+            -e 's|http://security.ubuntu.com|http://old-releases.ubuntu.com|g' \
+            /etc/apt/sources.list.d/ubuntu.sources
+
+
+grep URIs /etc/apt/sources.list.d/ubuntu.sources
