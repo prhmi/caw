@@ -150,7 +150,7 @@ void logLine(const std::string& s) {
         std::lock_guard<std::mutex> lock(s_logMu);
         static FILE* s_logFile = nullptr;
         if (!s_logFile) {
-            const std::string own = cawOwnFolder();   // the folder of caw.exe / caw (portable)
+            const std::string own = plat::cawOwnFolder();   // the folder of caw.exe / caw (portable)
             {
                 const std::string base = own.empty() ? std::string() : own + "/";
                 s_logFile = fopen((base + "caw_log.txt").c_str(), "a");
@@ -166,7 +166,7 @@ void logLine(const std::string& s) {
             long long size = ftell(s_logFile);
             if (size > 8 * 1024 * 1024) {   // rotate: a runaway log must not grow forever
                 fclose(s_logFile);
-                const std::string own = cawOwnFolder();
+                const std::string own = plat::cawOwnFolder();
                 const std::string base = own.empty() ? std::string() : own + "/";
                 s_logFile = fopen((base + "caw_log.txt").c_str(), "w");
                 if (s_logFile) fprintf(s_logFile, "---- log rotated ----\n");
