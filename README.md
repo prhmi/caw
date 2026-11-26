@@ -2,7 +2,7 @@
 
 A timeline DAW where every clip is **code**. Csound, Pure Data, SuperCollider, VST3 plugins and audio samples play side by side on one timeline, share automation lanes, and send audio and control values to each other.
 
-- **Engines:** Csound · Pure Data (libpd) · SuperCollider · VST3 instruments (VSTi) and effects (VSTe) · sample tracks
+- **Engines:** Csound (libcsound64) · Pure Data (libpd) · SuperCollider (libscsynth)· VST3 instruments (VSTi) and effects (VSTe) · sample tracks
 - **Live coding:** edit a clip while it plays, press **Run** (Alt+Enter), and the engine takes the new code at once
 - **Virtual soundcard:** projects can be 1–64 channels; anything wider than your audio setting folds down (channel k → k mod N)
 - **Platforms:** Windows (main). macOS and Linux build with `build.sh` (see *Build*)
