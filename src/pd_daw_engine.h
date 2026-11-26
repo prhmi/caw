@@ -1,6 +1,9 @@
 #pragma once
+#include "pd_cables.h"
+#include "track_gain.h"
 #include "audio_output.h"
 #include "caw_hub.h"
+#include "pd_live_ring.h"
 #include "pd_backend.h"
 #include "pd_frame_scheduler.h"
 #include "pd_isolated_libraries.h"
@@ -8,6 +11,9 @@
 #include "pd_plan_update.h"
 #include "pd_control_queue.h"
 #include "pd_timeline.h"
+#include "pd_channels.h"
+#include "caw_audio_bus.h"
+#include "caw_audio_in.h"
 #include <atomic>
 #include <array>
 #include <chrono>
@@ -22,8 +28,9 @@
 class PdDawEngine {
 public:
     struct Meter {
+        static constexpr int CH = 8;   // a patch's dac~ can use any width; every channel gets its own peak
         int trackId;
-        std::array<std::atomic<float>,2> peak;
+        std::array<std::atomic<float>,CH> peak;
         explicit Meter(int id):trackId(id){for(auto& p:peak)p.store(0.f);}
     };
     struct Clip {
@@ -38,6 +45,10 @@ public:
         bool silenceNoticeSent=false;
         bool notes[128]{};
         bool active=false;   // between start() and stop(): the patch is sounding
+        // CAW AUDIO BUSES: one port per cawbrecv / cawbsend line of the patch (created on first tick)
+        std::vector<std::pair<pd_control_syntax::BusLink,std::shared_ptr<cawbus::Port>>> busPorts;
+        std::vector<float> busIn, busLr, cableOut;   // 64 * kInputChannels inputs, 64 * 2 stereo scratch, 64 * 16 cable sends
+        cawin::Reader mic;                            // this clip's read position in the soundcard input
     };
     class Sink : public pd_frame_scheduler::Sink {
     public:
@@ -86,18 +97,48 @@ public:
                 number(*c,"cawget-"+a.name,static_cast<float>(automationValue(a,
                     static_cast<double>(c->timelineFrame)/std::max(1,c->sampleRate))));
             if(!c){error="PD clip "+std::to_string(id)+": unknown clip instance.";return false;}
-            if(!c->pd->processTick(out,error)){
+            // INPUTS: [adc~ 1..8] = the soundcard input (microphone), [adc~ 9..24] = the CAW cables
+            // this patch receives with [cawr~ name]. OUTPUTS: [dac~ 1..N] = the track, then the 16
+            // channels [caws~ name] writes into its cables (never the master).
+            if(c->busIn.size()!=(size_t)64*PdBackend::kInputChannels)c->busIn.assign((size_t)64*PdBackend::kInputChannels,0.f);
+            if(c->busLr.size()<128)c->busLr.assign(128,0.f);
+            if(c->cableOut.size()!=(size_t)64*PdBackend::kCableOutChannels)c->cableOut.assign((size_t)64*PdBackend::kCableOutChannels,0.f);
+            if(c->busPorts.size()!=c->event.buses.size()) {
+                c->busPorts.clear();
+                for(const auto& link:c->event.buses){auto p=std::make_shared<cawbus::Port>();p->busName=link.bus;c->busPorts.push_back({link,p});}
+            }
+            {
+                std::fill(c->busIn.begin(),c->busIn.end(),0.f);
+                static thread_local std::vector<float> micBlock;
+                if(micBlock.size()<(size_t)64*PdBackend::kMicChannels)micBlock.resize((size_t)64*PdBackend::kMicChannels);
+                c->mic.read(micBlock.data(),64,PdBackend::kMicChannels);
+                for(int n=0;n<64;++n)for(int k=0;k<PdBackend::kMicChannels;++k)
+                    c->busIn[(size_t)n*PdBackend::kInputChannels+k]=micBlock[(size_t)n*PdBackend::kMicChannels+k];
+                for(auto& bp:c->busPorts) {
+                    if(bp.first.send)continue;
+                    cawbus::read(*bp.second,c->busLr.data(),64);
+                    const int l=PdBackend::kMicChannels+(bp.first.channel-1)*2;
+                    for(int n=0;n<64;++n){c->busIn[(size_t)n*PdBackend::kInputChannels+l]=c->busLr[(size_t)n*2];c->busIn[(size_t)n*PdBackend::kInputChannels+l+1]=c->busLr[(size_t)n*2+1];}
+                }
+            }
+            if(!c->pd->processTick(out,error,c->busIn.data(),c->cableOut.data())){
                 collectDiagnostics(*c);
                 error="PD clip "+std::to_string(c->event.clipId)+": "+error;
                 return false;
             }
             collectDiagnostics(*c);
+            for(auto& bp:c->busPorts) {   // [caws~ name] -> its cable
+                if(!bp.first.send)continue;
+                const int l=(bp.first.channel-1)*2;
+                for(int n=0;n<64;++n){c->busLr[(size_t)n*2]=c->cableOut[(size_t)n*PdBackend::kCableOutChannels+l];c->busLr[(size_t)n*2+1]=c->cableOut[(size_t)n*PdBackend::kCableOutChannels+l+1];}
+                cawbus::send(*bp.second,c->busLr.data(),64);
+            }
             c->pd->drainOutputs([&](const std::string& kind,const std::string& name,float value){
                 if(outputQueue)outputQueue->push(c->event.clipId,c->event.trackId,c->timelineFrame,kind,name,value);
             });
             if(outputQueue)outputQueue->addDropped(c->pd->takeDroppedOutputs());
             float clipPeak=0.f;
-            for(int ch=0;ch<std::min(2,c->channels);++ch)
+            for(int ch=0;ch<std::min(Meter::CH,c->channels);++ch)
                 for(int n=0;n<64;++n)clipPeak=std::max(clipPeak,std::fabs(out[n*c->channels+ch]));
             if(c->active) {
                 if(clipPeak>1e-5f)c->silentFrames=0;
@@ -108,8 +149,12 @@ public:
                         ": warning: no audio detected for 1.5 seconds while this patch is active. Check its output path (dac~) and gain; intentional silence is OK.");
                 }
             }
+            {   // the track fader x volume lane (after the silence check: a fader at 0 never warns "no audio")
+                const float g=trackGains().get(c->event.trackId);
+                if(g!=1.f)for(int n=0;n<64*c->channels;++n)out[n]*=g;
+            }
             if(c->meter) {
-                for(int ch=0;ch<std::min(2,c->channels);++ch) {
+                for(int ch=0;ch<std::min(Meter::CH,c->channels);++ch) {
                     float peak=0;
                     for(int n=0;n<64;++n)peak=std::max(peak,std::fabs(out[n*c->channels+ch]));
                     float old=c->meter->peak[ch].load(std::memory_order_relaxed);
@@ -144,10 +189,11 @@ public:
                 c.event=*e;
                 if(!patchNew||!c.pd)continue;
                 std::string why;
-                if(!c.pd->reloadPatch(e->patch,e->outputs,why)) {
+                if(!c.pd->reloadPatch(e->patch,e->outputs,why) || !c.pd->openBridge(pd_cables::prepare(e->patch,e->clipId,e->buses),why)) {
                     notes.push_back("PD clip "+std::to_string(c.event.clipId)+": warning: reload failed, the previous patch keeps playing: "+why);
                     continue;
                 }
+                c.busPorts.clear();   // the cable names may have changed with the patch
                 notes.push_back("PD patch reloaded: "+std::filesystem::u8path(e->patch).filename().u8string());
                 if(!c.active)continue;
                 start(c.event.clipId);
@@ -192,7 +238,7 @@ public:
 private:
     struct Command {std::int64_t frame=0,loopStart=0,loopEnd=0;bool playing=false,loop=false;};
 public:
-    struct TrackPeak {int trackId;std::array<float,2> value;};
+    struct TrackPeak {int trackId;std::array<float,Meter::CH> value;};
     PdDawEngine()=default;
     ~PdDawEngine(){stop();}
     PdDawEngine(const PdDawEngine&)=delete;
@@ -252,8 +298,11 @@ public:
         auto meters=std::atomic_load(&meters_);
         if(!meters)return result;
         result.reserve(meters->size());
-        for(const auto& m:*meters)
-            result.push_back({m->trackId,{m->peak[0].exchange(0.f),m->peak[1].exchange(0.f)}});
+        for(const auto& m:*meters) {
+            TrackPeak tp;tp.trackId=m->trackId;
+            for(int ch=0;ch<Meter::CH;++ch)tp.value[(size_t)ch]=m->peak[(size_t)ch].exchange(0.f);
+            result.push_back(tp);
+        }
         return result;
     }
 private:
@@ -264,10 +313,16 @@ private:
     }
     void run(std::string library,std::vector<pd_timeline::Event> plan,CawAudioSettings settings) noexcept {
         try {
+            // The virtual soundcard render width: the soundcard setup's width, widened to the
+            // widest [dac~ N] any planned patch writes. The device stream stays at the setup's
+            // width - the rendered channels fold into it at the push (k mod N), and the meters
+            // see every channel separately.
+            int renderCh=std::min(8,std::max(settings.channels,pdPlanMaxChannel(plan)));
+            if(renderCh<1)renderCh=1;
             std::string error;PdIsolatedLibraries copies;
             PdBackend emptyEngine;
             if(plan.empty()) {
-                if(!emptyEngine.openEngine(library,settings.sampleRate,settings.channels,error)){setStatus("PD: "+error);active_.store(false);return;}
+                if(!emptyEngine.openEngine(library,settings.sampleRate,renderCh,error)){setStatus("PD: "+error);active_.store(false);return;}
             } else if(!copies.create(library,plan.size(),error)){setStatus(error);active_.store(false);return;}
             Sink sink;
             auto controlQueue=std::make_shared<PdControlQueue>();sink.outputQueue=controlQueue.get();
@@ -280,7 +335,7 @@ private:
                 if(!frame(e.start,settings.sampleRate,start)||!frame(e.end,settings.sampleRate,end)||end<=start){
                     setStatus("PD clip "+std::to_string(e.clipId)+": invalid or sub-sample timing.");active_.store(false);return;
                 }
-                Clip c;c.event=e;c.channels=settings.channels;c.sampleRate=settings.sampleRate;
+                Clip c;c.event=e;c.channels=renderCh;c.sampleRate=settings.sampleRate;
                 if(e.trackId>0) {
                     for(const auto& meter:*meters)if(meter->trackId==e.trackId){c.meter=meter;break;}
                     if(!c.meter){c.meter=std::make_shared<Meter>(e.trackId);meters->push_back(c.meter);}
@@ -289,11 +344,16 @@ private:
                     setStatus("PD clip "+std::to_string(e.clipId)+": p-fields: "+error);active_.store(false);return;
                 }
                 c.pd=std::make_unique<PdBackend>();
-                if(!c.pd->open(copies.paths()[i],e.patch,settings.sampleRate,settings.channels,error)){
+                if(!c.pd->open(copies.paths()[i],e.patch,settings.sampleRate,renderCh,error)){
                     setStatus("PD clip "+std::to_string(e.clipId)+": "+error);active_.store(false);return;
                 }
                 if(!c.pd->bindOutputs(e.outputs,error)){
                     setStatus("PD clip "+std::to_string(e.clipId)+": outputs: "+error);active_.store(false);return;
+                }
+                {   // CAW cables: [cawr~ name] / [caws~ name] -> the bridge patch in the same instance
+                    std::string why;
+                    if(!c.pd->openBridge(pd_cables::prepare(e.patch,e.clipId,e.buses),why))
+                        setStatus("PD clip "+std::to_string(e.clipId)+": "+why);
                 }
                 sink.collectDiagnostics(c);
                 events.push_back({e.clipId,start,end,e.muted});
@@ -320,7 +380,7 @@ private:
                 }
             }
             pd_frame_scheduler::Scheduler scheduler;
-            if(!scheduler.prepare(events,settings.channels,error,std::move(controls))){setStatus(error);active_.store(false);return;}
+            if(!scheduler.prepare(events,renderCh,error,std::move(controls))){setStatus(error);active_.store(false);return;}
             auto capture = std::make_shared<MonitorCapture>(settings.sampleRate, settings.channels);
             CawAudioOutput output;settings.fullScale=1.f;
             output.setMonitorCapture(capture.get());
@@ -331,7 +391,8 @@ private:
             std::atomic_store(&controlQueue_,controlQueue);
             std::atomic_store(&capture_,capture);
             setStatus(plan.empty() ? "PD DSP ready." : "PD ready: all clips preloaded.");ready_.store(true);
-            std::vector<float> samples(static_cast<std::size_t>(64*settings.channels));
+            std::vector<float> samples(static_cast<std::size_t>(64*renderCh));
+            std::vector<float> pdStream;       // the folded push buffer: renderCh channels -> the soundcard's width
             std::uint64_t seen=0,seenPlan=0;Command command;
             auto publishRuntimeMessages=[&] {
                 auto messages=sink.takeRuntimeMessages();
@@ -412,11 +473,36 @@ private:
                                 clip.pd->numberLocal("cawr-"+entry.first,static_cast<float>(entry.second),why);
                     }
                 }
-                for(unsigned i=0;i<count*static_cast<unsigned>(settings.channels);++i)
+                for(unsigned i=0;i<count*static_cast<unsigned>(renderCh);++i)
                     samples[i]=std::max(-1.f,std::min(1.f,samples[i]));
-                if(!output.pushTagged(samples.data(),count,stop_,begin,&generation_,seen)){
-                    if(!stop_.load() && generation_.load()==seen){setStatus("PD audio output stopped.");break;}
-                    continue;
+                {   // The VST rack's PureData inputs (engine 1) hear the live mix through the shared
+                    // ring - the dedicated PD engine renders into its OWN device, which the rack
+                    // cannot read. The ring stores every rendered channel; the rack folds or takes
+                    // them 1:1 per its receive mode.
+                    pdlivering::ring.pushStride2(samples.data(),count,renderCh);
+                }
+                {
+                    // The virtual soundcard fold: the patch may render more channels than the
+                    // soundcard setup - channel k plays on stream channel k mod N.
+                    const unsigned streamCh=static_cast<unsigned>(std::max(1,settings.channels));
+                    if(renderCh==static_cast<int>(streamCh)) {
+                        if(!output.pushTagged(samples.data(),count,stop_,begin,&generation_,seen)){
+                            if(!stop_.load() && generation_.load()==seen){setStatus("PD audio output stopped.");break;}
+                            continue;
+                        }
+                    } else {
+                        if(pdStream.size()<(size_t)count*streamCh)pdStream.resize((size_t)count*streamCh,0.f);
+                        std::fill_n(pdStream.begin(),(size_t)count*streamCh,0.f);
+                        for(unsigned i=0;i<count;++i) {
+                            const float* in=samples.data()+(size_t)i*renderCh;
+                            float* dst=pdStream.data()+(size_t)i*streamCh;
+                            for(int c=0;c<renderCh;++c)dst[c%streamCh]+=in[c];
+                        }
+                        if(!output.pushTagged(pdStream.data(),count,stop_,begin,&generation_,seen)){
+                            if(!stop_.load() && generation_.load()==seen){setStatus("PD audio output stopped.");break;}
+                            continue;
+                        }
+                    }
                 }
                 const auto played=output.playedPosition();
                 if(played>=0)position_.store(played);

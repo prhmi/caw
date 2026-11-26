@@ -1,7 +1,75 @@
 #include "app_shared.h"
+#include "caw_audio_bus.h"
+#include <fstream>
+#include "caw_audio_in.h"
 
 // src/engine_dispatch.cpp (phase 2: extracted from app.cpp; the shared state is app_state.h, the
 //  internal declarations are app_internal.h - all included through app_shared.h.)
+
+// TRACK FREEZE (Cubase-style lock): the render pass state machine + the frozen-track playback.
+#include "track_freeze.h"
+#include "undo_files.h"
+#include "rack_offline.h"
+#include "pd_live_ring.h"
+#include "sc_nrt.h"
+
+// An OFFLINE render (freeze / export part) must start its plugin exactly where the live sound is.
+// The saved caches (parameter state + patch blob) can be stale: a patch edited inside the plugin
+// window that the state poll never re-captured, or a project-saved blob from an older session,
+// and the offline plugin then plays a DIFFERENT patch than the live instance (the live instance
+// is reused and carries every change since it was created). So the offline jobs read the LIVE
+// engine instance's CURRENT patch state and parameter values directly, with the render paused.
+static void captureLiveVstInstanceState(std::vector<VstJob>& jobs) {
+#ifdef CAW_VST3
+    for (VstJob& j : jobs) {
+        // Every chain stage refreshes its own state. Stage 0 = the track's plugin; stages 1..7
+        // live under the synthetic key id*8+stage in the editor slots and under the same key in
+        // the engine rack. The LIVE ENGINE instance wins when Run VST is on; otherwise the
+        // EDITOR instance (the plugin window's own instance - it always exists once the plugin
+        // is picked and holds exactly what the user sees / tweaked in the GUI). Without this
+        // fallback an export with the VST engine off fell back to the saved caches and could
+        // load a stale patch.
+        const int stageCount = 1 + (int)j.chain.size();
+        for (int st = 0; st < stageCount; ++st) {
+            std::shared_ptr<caw::IPlugin> plug;
+            bool viaEngine = false;
+            if (g_vstEngineOn) {
+                plug = st == 0 ? vstSolo().pluginOfTrack(j.id) : vstSolo().pluginOfTrackStage(j.id, st);
+                viaEngine = plug != nullptr;
+            }
+            if (!plug) {
+                const auto it = vstui::slots().find(st == 0 ? j.id : j.id * 8 + st);
+                if (it != vstui::slots().end()) plug = it->second.plugin;
+            }
+            if (!plug) continue;
+            auto read = [&] {
+                std::string blob = plug->getState();          // the instance's CURRENT patch state
+                if (!blob.empty()) {
+                    if (st == 0) j.stateBlob = blob;
+                    else j.chain[(size_t)st - 1].stateBlob = blob;
+                }
+                std::vector<double> vals;
+                const int n = plug->readParameterValues(vals);
+                const auto& ps = plug->params();
+                std::map<uint32_t, double>* stateMap = st == 0 ? &j.parameterState : &j.chain[(size_t)st - 1].parameterState;
+                if (n > 0 && (size_t)n == ps.size())
+                    for (const auto& p : ps)
+                        if (p.index >= 0 && (size_t)p.index < vals.size()) (*stateMap)[p.id] = vals[(size_t)p.index];
+            };
+            if (viaEngine) {   // off the render thread: pause it briefly, retry while it stays busy
+                bool ok = false;
+                for (int attempt = 0; attempt < 20 && !ok; ++attempt)
+                    ok = vstSolo().withRenderPaused(read);
+                if (!ok) read();   // the engine stays busy: the API mutex still serializes the call
+            } else {
+                read();
+            }
+        }
+    }
+#else
+    (void)jobs;
+#endif
+}
 
 bool scManualRunning(int clipId) {
     auto it = g_scManualRuns.find(clipId);
@@ -15,6 +83,37 @@ CawScRing* sampleRingOf(int trackId) {
     auto& r = g_sampleRings[trackId];
     if (!r) r = std::make_unique<CawScRing>();
     return r.get();
+}
+#include "app.h"
+CawScRing* scTrackRingOf(int slot) {
+    if (slot < 0 || slot >= ScEngine::maxTrackSlots) return nullptr;
+    std::lock_guard<std::mutex> lock(g_scTrackRingMutex);
+    auto& r = g_scTrackRings[slot];
+    if (!r) r = std::make_unique<CawScRing>();
+    return r.get();
+}
+#include "app.h"
+void updateScSlotSuppress() {   // which SuperCollider track slots an FX-only VSTe consumes: their raw mix no longer goes to the master
+    std::uint32_t mask = 0;
+    bool anySolo = false;
+    for (const Track& t : g_proj.tracks) if (t.solo && !t.muted) anySolo = true;
+    for (const Track& vt : g_proj.tracks) {
+        if (vt.kind != 4 || vt.vstPath.empty() || vt.vstOutMode != 0) continue;
+        if (anySolo && !vt.solo) continue;   // the VSTe muted by another track's solo: the solo rule already silences the consumed source, and a soloed source keeps its raw sound
+        for (const auto& in : vt.vstInputs) {
+            if (!in.on || in.mode == 2) continue;
+            for (size_t i = 0; i < g_proj.tracks.size(); ++i) {
+                const Track& o = g_proj.tracks[i];
+                if (o.kind != 5 || trackFrozen(o) || o.muted) continue;
+                const bool match = in.mode == 0 ? o.name == in.name
+                    : std::any_of(o.clips.begin(), o.clips.end(), [&](const Clip& c) { return c.name == in.name; });
+                if (!match) continue;
+                const int slot = scTrackSlot(o.id);
+                if (slot >= 0 && slot < ScEngine::kFirstBusSlot) mask |= (1u << slot);
+            }
+        }
+    }
+    g_scEngine.setSlotSuppress(mask);
 }
 #include "app.h"
 void clearSampleRings() {   // drops the stale ring audio (a late-starting consumer would stay behind forever)
@@ -156,7 +255,8 @@ std::set<int> collectVstActiveTracks(const Project& project);
 #include "app.h"
 CawAudioSettings pdAudioSettings() {
     CawAudioSettings audio;
-    audio.sampleRate = g_proj.cs.sr; audio.channels = 2;
+    audio.sampleRate = g_proj.cs.sr;
+    audio.channels = masterChannels(g_proj.cs);   // the project's output channels (out1..outN) - the device clamps to what it has
     audio.softwareBuffer = g_proj.cs.bufSW; audio.hardwareBuffer = g_proj.cs.bufHW;
     audio.queueFrames = std::max(512, g_proj.cs.bufSW * 2);
     int selected = g_proj.cs.outDev;
@@ -198,6 +298,11 @@ void handAudioCardToNextStream() {
 bool startScSoloOutput(std::string& error) {
     if (!g_scEngine.embedded() || scHasSharedAudioOwner()) return true;
     if (g_scSoloOutput) return true;
+    // One stream at a time: the sample engine's own stream must let go of the device first -
+    // its mix continues in the SC stream through the shared realtime hook. Two open streams
+    // would pump the shared hook twice per device period: everything plays at double speed
+    // with the two copies interleaving as noise.
+    if (g_sampleOutput) { g_sampleOutput->close(); g_sampleOutput.reset(); g_sampleCapture.reset(); logLine("[caw] Sample stream closed: the SuperCollider stream now carries the sample mix."); }
     // The VST engine's own stream (Run VST alone) must let go of the device first: its mix
     // continues in the SC stream through the shared realtime hook.
     if (g_vstSoloOutput) { g_vstSoloOutput->close(); g_vstSoloOutput.reset(); }
@@ -213,6 +318,8 @@ bool startScSoloOutput(std::string& error) {
     output->setExpectingAudio(false);
     g_scSoloCapture = std::move(capture);
     g_scSoloOutput = std::move(output);
+    if (g_scSoloOutput->actualRate() != settings.sampleRate)
+        logLine("[caw] WARNING: the output device runs at " + std::to_string(g_scSoloOutput->actualRate()) + " Hz but the project is " + std::to_string(settings.sampleRate) + " Hz - sounds play at the wrong speed/pitch. Set the project sample rate to the device rate in Settings > Audio.");
     return true;
 }
 #include "app.h"
@@ -232,11 +339,11 @@ std::filesystem::path pdConfigPath() {
 #include "app.h"
 std::string scBootstrap(int outputChannels, int serverPort) {
     const int physicalChannels = std::max(1, outputChannels);
-    const int serverOutputBuses = physicalChannels + 2 * ScEngine::maxTrackSlots;
+    const int serverOutputBuses = physicalChannels + ScEngine::slotStride * ScEngine::maxTrackSlots;
     std::ostringstream out;
     out << "(\n"
         << "o = ServerOptions.new; o.maxLogins = 32; o.numOutputBusChannels = " << serverOutputBuses
-        << "; o.numInputBusChannels = 0; o.numAudioBusChannels = " << std::max(1024, serverOutputBuses + 256) << ";\n"
+        << "; o.numInputBusChannels = " << ScEngine::kInputChannels << "; o.numAudioBusChannels = " << std::max(1024, serverOutputBuses + 256) << ";\n"
         << "~cawserveraddr = NetAddr(\"127.0.0.1\", " << serverPort << ");\n"
         // CAW owns the embedded server's life; sclang's own alive-check must not decide whether it "is running" (it flips
         // to false whenever the audio callback has not pumped the server for a moment, and then Function.play refuses
@@ -249,19 +356,21 @@ std::string scBootstrap(int outputChannels, int serverPort) {
         << "s.sendStatusMsg;\n"
         << "~cawgroups = IdentityDictionary.new; ~cawcancelled = IdentityDictionary.new; ~cawgeneration = 0;\n"
         << "~cawtrackbuses = IdentityDictionary.new;\n"
+        << "~cawnullbus = 255;   // the play wrapper's own Out: nothing meters or mixes this bus, so code with explicit Out.ar does not double\n"
         << "OSCdef(\\cawStart, { |msg|\n"
         << "    var id = msg[1].asInteger, path = msg[2].asString, trackSlot = msg[7].asInteger, clipId = msg[8].asInteger;\n"
         << "    var delay = msg[3].asFloat.max(0), duration = msg[4].asFloat.max(0.001);\n"
         << "    var p4 = msg[5].asFloat, p5 = msg[6].asFloat, outBus = 0, generation;\n"
         << "    generation = ~cawgeneration;\n"
-        << "    if ((trackSlot >= 0) and: { trackSlot < " << ScEngine::maxTrackSlots << " }) {\n"
-        << "        outBus = ~cawtrackbuses[trackSlot] ?? { var index = " << physicalChannels << " + (trackSlot * 2); ~cawtrackbuses[trackSlot] = index; index; };\n"
+        << "    if ((trackSlot >= 0) and: { trackSlot < " << ScEngine::kFirstBusSlot << " }) {\n"
+        << "        outBus = ~cawtrackbuses[trackSlot] ?? { var index = " << physicalChannels << " + (trackSlot * " << ScEngine::slotStride << "); ~cawtrackbuses[trackSlot] = index; index; };\n"
         << "    };\n"
         << "    ~cawcancelled[id] = false;\n"
         << "    SystemClock.sched(delay, {\n"
         << "        var group;\n"
         << "        if ((generation == ~cawgeneration) and: { ~cawcancelled[id] != true }) {\n"
         << "            group = Group.tail(s); ~cawgroups[id] = group; ~cawgroup = group; ~cawoutbus = outBus;\n"
+        << "            ~cawtrack = trackSlot;   // the lane namespace of THIS track: ~cawget reads t<slot>_<name>, so two tracks never share a lane\n"
         << "            ~cawp4 = p4; ~cawp5 = p5; ~cawnoteduration = duration;\n"
         << "            if (s.serverRunning.not) { ~cawforcerunning.value; \"CAW_SC_FORCED_RUNNING\".postln; };\n"
         << "            (\"CAW_SC_CLIP_BEGIN \" ++ id.asString ++ \" \" ++ clipId.asString).postln;\n"
@@ -279,10 +388,21 @@ std::string scBootstrap(int outputChannels, int serverPort) {
         << "OSCdef(\\cawStopAll, { |msg| ~cawgeneration = ~cawgeneration + 1; ~cawgroups.values.do { |group| group.free; }; ~cawgroups.clear; ~cawcancelled.clear; }, '/caw/stopAll');\n"
         << "OSCdef(\\cawResume, { |msg| s.sendStatusMsg; ~cawforcerunning.value; \"CAW_SC_READY\".postln; }, '/caw/resume');\n"
         << "~cawr = IdentityDictionary.new;   // CAW hub (caws/cawr): SC clips read ~cawr[\\name]\n"
+        // CAW AUDIO BUSES (caw_audio_bus.h): ~cawbsend.("name", sig) writes a stereo signal into the named
+        // bus (CAW moves it to Csound / PD / the other engines); ~cawbrecv.("name") reads one (2 channels).
+        // CAW maps every name the SC code uses to a reserved send slot / input pair (/caw/busmap).
+        << "~cawbussendbase = " << physicalChannels + ScEngine::kFirstBusSlot * ScEngine::slotStride << "; ~cawbusslotstride = " << ScEngine::slotStride << ";\n"
+        << "~cawbsendidx = IdentityDictionary.new; ~cawbrecvidx = IdentityDictionary.new;\n"
+        << "OSCdef(\\cawBusMap, { |msg| var name = msg[1].asSymbol, kind = msg[2].asInteger, index = msg[3].asInteger;\n"
+        << "    if (kind < 0) { ~cawbsendidx.clear; ~cawbrecvidx.clear; } { if (kind == 0) { ~cawbsendidx[name] = index } { ~cawbrecvidx[name] = index } };\n"
+        << "}, '/caw/busmap');\n"
+        << "~cawbsend = { |name, sig| var k = ~cawbsendidx[name.asSymbol]; if (k.isNil) { (\"CAW: no audio bus slot for \" ++ name).postln; 0 } { Out.ar(~cawbussendbase + (k * ~cawbusslotstride), if (sig.size == 0) { [sig, sig] } { sig }) } };\n"
+        << "~cawbrecv = { |name| var k = ~cawbrecvidx[name.asSymbol]; if (k.isNil) { (\"CAW: no audio bus input for \" ++ name).postln; Silent.ar(2) } { In.ar(NumOutputBuses.ir + " << ScEngine::kMicChannels << " + (k * 2), 2) } };\n"
         << "~cawbuses = IdentityDictionary.new;   // one control bus per automation channel, CAW keeps it current like the lane dots\n"
-        << "~cawbus = { |name| var key = name.asSymbol, bus = ~cawbuses[key]; if (bus.isNil) { bus = Bus.control(s, 1); bus.value = ~cawr[key] ? 0; ~cawbuses[key] = bus; }; bus; };   // cawbus: a live control bus for a lane, read it with In.kr(bus.index, 1)\n"
+        << "~cawkey = { |name| if (~cawtrack.isNil) { name.asSymbol } { (\"t\" ++ ~cawtrack.asString ++ \"_\" ++ name.asString).asSymbol } };   // the lane key: per-track (t<slot>_<name>) while a clip dispatch is in scope, bare name otherwise\n"
+        << "~cawbus = { |name| var key = ~cawkey.(name), bus = ~cawbuses[key]; if (bus.isNil) { bus = Bus.control(s, 1); bus.value = ~cawr[key] ? 0; ~cawbuses[key] = bus; }; bus; };   // cawbus: a live control bus for a lane, read it with In.kr(bus.index, 1)\n"
         << "OSCdef(\\cawHub, { |msg| var key = msg[1].asSymbol, value = msg[2], bus = ~cawbuses[key]; ~cawr[key] = value; if (bus.notNil) { bus.value = value; }; }, '/caw/hub');\n"
-        << "~cawget = { |name| if (UGen.buildSynthDef.notNil) { In.kr(~cawbus.(name).index, 1) } { ~cawr[name.asSymbol] ? 0 } };   // cawget: inside a synth it is a live k-rate control signal on the lane bus (like Csound cawget); outside it reads the lane value once\n"
+        << "~cawget = { |name| if (UGen.buildSynthDef.notNil) { In.kr(~cawbus.(name).index, 1) } { ~cawr[~cawkey.(name)] ? 0 } };   // cawget: inside a synth it is a live k-rate control signal on the lane bus (like Csound cawget); outside it reads the lane value once\n"
         << "OSCdef(\\cawQuit, { |msg|\n"
         << "    ~cawgeneration = ~cawgeneration + 1; ~cawgroups.values.do { |group| group.free; }; ~cawgroups.clear; ~cawcancelled.clear;\n"
         << "    ~cawtrackbuses.clear;\n"
@@ -414,10 +534,18 @@ bool sendScClip(const Clip& clip, double delay, double duration, double p4, doub
     // only by Run): code the user is typing right now must not reach a (re)launch on its own.
     std::string routedCode = codeOverride.empty() ? clip.code : codeOverride;
     static const std::regex playTarget(R"re(\.play\s*\(\s*target\s*:\s*~caw[Gg]roup)re");
-    static const std::regex directOut(R"re(\bOut\.ar\(\s*0\s*,)re");
+    static const std::regex numericOut(R"re(\bOut\.ar\(\s*(\d+)\s*,)re");
+    static const std::regex hasOut(R"re(\bOut\.ar\s*\(|~cawbsend\s*\.)re");   // ~cawbsend writes its own Out.ar (an audio bus send counts as an explicit out)
+    // Out.ar(N, ...) addresses the TRACK's channel N (0-based): the virtual soundcard. Route every
+    // numeric out to the track slot's bus (bus + N), whatever N is - Out.ar(3) is the 4th channel.
+    routedCode = std::regex_replace(routedCode, numericOut, "Out.ar(~cawoutbus + $1,");
+    // The Function-play wrapper ALSO writes the function's return value (Out.ar returns its input).
+    // Code with its own Out.ar must not double: the wrapper goes to the null bus (never metered or
+    // mixed), the code's own outs decide the channels. Without an Out.ar the wrapper is the out.
+    const bool explicitOut = std::regex_search(routedCode, hasOut);
     routedCode = std::regex_replace(routedCode, playTarget,
-                                    ".play(outbus: ~cawoutbus, target: ~cawgroup");
-    routedCode = std::regex_replace(routedCode, directOut, "Out.ar(~cawoutbus,");
+                                    explicitOut ? ".play(outbus: ~cawnullbus, target: ~cawgroup"
+                                                : ".play(outbus: ~cawoutbus, target: ~cawgroup");
     std::error_code ec;
     const auto path = workDir() / ("caw_sc_clip_" + std::to_string(clip.id) + ".scd");
     const auto cached = g_scClipFileCache.find(clip.id);
@@ -531,7 +659,7 @@ void scTimelineWindows(double from) {
     std::set<int> seen;
     for (const Track& t : g_proj.tracks) {
         if (t.kind != 5) continue;
-        const bool audible = !t.muted && !(anySolo && !t.solo);
+        const bool audible = !t.muted && !(anySolo && !t.solo) && !trackFrozen(t);   // frozen: the WAV plays, the live engine skips
         for (const Clip& c : t.clips) {
             seen.insert(c.id);
             const bool clipAudible = audible && !c.muted;
@@ -688,6 +816,7 @@ void pollScEngine(float /*dt*/) {
             if (!g_scReady) {
                 g_scReady = true;
                 logLine("[caw] sclang connected to CAW's embedded SuperCollider server. Audio shares the CAW output stream.");
+                seedScLaneDefaults();   // ~cawget hears every lane's default before the first Play
                 if (g_scPendingClipId > 0) {
                     const int pending = g_scPendingClipId;
                     g_scPendingClipId = 0;
@@ -726,7 +855,94 @@ void pollScEngine(float /*dt*/) {
     }
 }
 #include "app.h"
+// CAW AUDIO BUSES: map the bus names the SuperCollider code uses onto the reserved send slots /
+// receive pairs, keep the per-track automatic bus names current ("sc_<track>", "smp_<track>").
+// Cheap when nothing changed (a signature compare); re-sent whenever SuperCollider (re)starts.
+void updateCawBusRouting() {
+    {   // the soundcard input as the cable "mic" (inputs 1-2), so any engine can receive the microphone
+        // by name. A small UI-thread pump: it moves what was captured since the last frame.
+        static cawin::Reader reader; static cawbus::Port port; static std::vector<float> blk;
+        if (cawin::isOpen()) {
+            port.rename("mic");
+            const std::uint64_t h = cawin::state().head.load(std::memory_order_acquire);
+            if (!reader.started) { reader.pos = h; reader.started = true; }
+            size_t n = (size_t)std::min<std::uint64_t>(h > reader.pos ? h - reader.pos : 0, cawin::kCap / 2);
+            while (n > 0) {
+                const size_t chunk = std::min<size_t>(n, 1024);
+                if (blk.size() < chunk * 2) blk.resize(chunk * 2);
+                reader.read(blk.data(), chunk, 2, 0);
+                cawbus::send(port, blk.data(), chunk);
+                n -= chunk;
+            }
+        }
+    }
+    {   // automatic per-track buses
+        std::map<int, std::string> smp, sc;
+        for (const Track& t : g_proj.tracks) {
+            if (t.kind == 7) smp[t.id] = "smp_" + cawbus::safeName(t.name);
+            if (t.kind == 5) { const int slot = scTrackSlot(t.id); if (slot >= 0) sc[slot] = "sc_" + cawbus::safeName(t.name); }
+        }
+        { std::lock_guard<std::mutex> l(cawbus::sampleTrackNames().m); if (cawbus::sampleTrackNames().byKey != smp) cawbus::sampleTrackNames().byKey = smp; }
+        { std::lock_guard<std::mutex> l(cawbus::scSlotNames().m); if (cawbus::scSlotNames().byKey != sc) cawbus::scSlotNames().byKey = sc; }
+    }
+    static const std::regex sendRe(R"re(~cawbsend\s*\.\s*\(\s*"([A-Za-z0-9_-]+)")re");
+    static const std::regex recvRe(R"re(~cawbrecv\s*\.\s*\(\s*"([A-Za-z0-9_-]+)")re");
+    std::vector<std::string> sends, recvs;
+    for (const Track& t : g_proj.tracks) if (t.kind == 5) for (const Clip& c : t.clips) {
+        for (std::sregex_iterator it(c.code.begin(), c.code.end(), sendRe), end; it != end; ++it)
+            if (std::find(sends.begin(), sends.end(), (*it)[1].str()) == sends.end()) sends.push_back((*it)[1].str());
+        for (std::sregex_iterator it(c.code.begin(), c.code.end(), recvRe), end; it != end; ++it)
+            if (std::find(recvs.begin(), recvs.end(), (*it)[1].str()) == recvs.end()) recvs.push_back((*it)[1].str());
+    }
+    std::array<std::string, ScEngine::kBusSlots> sa{};
+    std::array<std::string, ScEngine::kRecvPairs> ra{};
+    for (size_t k = 0; k < sends.size() && k < sa.size(); ++k) sa[k] = sends[k];
+    for (size_t k = 0; k < recvs.size() && k < ra.size(); ++k) ra[k] = recvs[k];
+    static std::string lastSig; static bool lastUp = false; static bool warned = false;
+    std::string sig;
+    for (const auto& n : sa) sig += n + "|";
+    sig += "#";
+    for (const auto& n : ra) sig += n + "|";
+    const bool up = g_scReady && g_scEngine.running();
+    if (sig == lastSig && up == lastUp) return;
+    lastSig = sig; lastUp = up;
+    g_scEngine.setBusRouting(sa, ra);
+    if (!up) return;
+    g_scEngine.sendBusMap(std::string(), -1, 0);
+    for (int k = 0; k < (int)sa.size(); ++k) if (!sa[(size_t)k].empty()) g_scEngine.sendBusMap(sa[(size_t)k], 0, k);
+    for (int k = 0; k < (int)ra.size(); ++k) if (!ra[(size_t)k].empty()) g_scEngine.sendBusMap(ra[(size_t)k], 1, k);
+    if (!warned && (sends.size() > sa.size() || recvs.size() > ra.size())) {
+        warned = true;
+        logLine("[caw] SuperCollider audio buses: at most " + std::to_string(sa.size()) + " sends and " + std::to_string(ra.size()) + " receives - the extra names stay silent.");
+    }
+}
+#include "app.h"
+// THE SOUNDCARD INPUT: opened once (the project's input device, nchnls_i or 2 channels) whenever an
+// engine runs and the project asks for input (an input device is chosen, or any clip uses inch /
+// ins / adc~ / SoundIn / the "mic" cable). Also streams inputs 1-2 into the CAW cable "mic".
+void ensureCawAudioInput() {
+    bool wanted = g_proj.cs.inDev >= 0 || g_proj.cs.nchnlsIn > 0;
+    if (!wanted)
+        for (const Track& t : g_proj.tracks) for (const Clip& c : t.clips) {
+            const std::string& k = c.code;
+            if (k.find("inch") != std::string::npos || k.find(" ins") != std::string::npos || k.find("SoundIn") != std::string::npos ||
+                k.find("\"mic\"") != std::string::npos || k.find("cawr~ mic") != std::string::npos) { wanted = true; break; }
+            if (t.kind == 6 && k.size() > 3 && k.substr(k.size() - 3) == ".pd") {
+                std::ifstream in(std::filesystem::u8path(k.find(':') == std::string::npos && !g_projectPath.empty()
+                    ? (std::filesystem::u8path(g_projectPath).parent_path() / std::filesystem::u8path(k)).u8string() : k), std::ios::binary);
+                std::string txt((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                if (txt.find("adc~") != std::string::npos) { wanted = true; break; }
+            }
+        }
+    if (!wanted || cawin::isOpen()) return;
+    std::string err;
+    const int ch = g_proj.cs.nchnlsIn > 0 ? g_proj.cs.nchnlsIn : 2;
+    if (!cawin::open(g_proj.cs.inDev, g_proj.cs.sr, ch, err)) { logLine("[caw] Audio input: " + err); return; }
+    logLine("[caw] Audio input open: \"" + cawin::state().device + "\", " + std::to_string(cawin::channels()) + " ch - adc~ / inch / SoundIn, and the cable \"mic\".");
+}
+#include "app.h"
 void pollCawHub() {
+    updateCawBusRouting();
     static std::uint64_t seen = 0;
     std::map<std::string,double> values;
     if (!g_cawHub.take(seen, values)) return;
@@ -735,14 +951,44 @@ void pollCawHub() {
         g_scEngine.sendHub(entry.first, static_cast<float>(entry.second));
 }
 #include "app.h"
+// Seed every SuperCollider automation lane's DEFAULT value into the language right after the
+// engine boots (user report: ~cawget read 0 for a lane without dots until Play started). After
+// this, ~cawget returns the lane's default even while the transport is stopped.
+void seedScLaneDefaults() {
+    for (const Track& t : g_proj.tracks) {
+        if (t.kind != 5) continue;
+        const int slot = scTrackSlot(t.id);
+        if (slot < 0) continue;
+        for (const auto& lane : t.automation) {
+            const std::string& chn = lane.first;
+            if (!autoLaneActive(t, chn)) continue;
+            double lo = 0.0, hi = 1.0, initial = 0.5;
+            const auto range = t.automationRanges.find(chn);
+            if (range != t.automationRanges.end()) {
+                lo = range->second.min;
+                hi = range->second.max > lo ? range->second.max : lo + 1.0;
+                initial = range->second.value;
+            }
+            const float value = static_cast<float>(autoValueAt(lane.second, g_play, initial));
+            const std::string hubName = "t" + std::to_string(slot) + "_" + chn;
+            g_scLaneSent[hubName] = value;
+            g_scEngine.sendHub(hubName, value);
+        }
+    }
+}
+#include "app.h"
 void pollScAutomation() {
     if (!g_scReady || !g_scEngine.running() || !g_timelineRun) return;
     for (const Track& t : g_proj.tracks) {
         if (t.kind != 5) continue;
+        if (trackFrozen(t)) continue;   // frozen: the automation values are baked into the WAV, nothing streams
         for (const auto& lane : t.automation) {
             const std::string& chn = lane.first;
             const std::vector<AutoPoint>& points = lane.second;
-            if (points.empty() || !autoLaneActive(t, chn)) continue;
+            // A lane WITHOUT dots streams its DEFAULT value (user report: ~cawget used to read 0
+            // until dots existed): autoValueAt returns the fallback for an empty lane, so the clip
+            // hears the lane's default from the very first block.
+            if (!autoLaneActive(t, chn)) continue;
             double lo = 0.0, hi = 1.0, initial = 0.5;
             const auto range = t.automationRanges.find(chn);
             if (range != t.automationRanges.end()) {
@@ -751,14 +997,35 @@ void pollScAutomation() {
                 initial = range->second.value;
             }
             const float value = static_cast<float>(autoValueAt(points, g_play, initial));
-            const bool first = g_scLaneSent.find(chn) == g_scLaneSent.end();
-            float& seen = g_scLaneSent[chn];
+            // Per-track namespace: the language reads a lane as t<slot>_<name> inside a clip's
+            // synths (~cawtrack is set by the /caw/start dispatch), so two tracks that both have
+            // an "input1" lane stream separately instead of sharing one bus.
+            const int slot = scTrackSlot(t.id);
+            const std::string hubName = "t" + std::to_string(slot) + "_" + chn;
+            const bool first = g_scLaneSent.find(hubName) == g_scLaneSent.end();
+            float& seen = g_scLaneSent[hubName];
             if (seen == value) continue;
             seen = value;
-            if (first) logLine("[caw] SC automation: lane \"" + chn + "\" streams into the language (~cawget is live)");
-            g_scEngine.sendHub(chn, value);
+            if (first) logLine("[caw] SC automation: track \"" + t.name + "\" lane \"" + chn + "\" streams into the language (t" + std::to_string(slot) + "_" + chn + ", ~cawget is live)");
+            g_scEngine.sendHub(hubName, value);
         }
     }
+}
+#include "app.h"
+// Every audio bus a Csound clip names: cawbsend "x" / cawbrecv "x" (and the project-wide code). The
+// Csound engine resolves cawbo_<x>_L/R (send) and cawbi_<x>_L/R (receive) channels for exactly these.
+void collectCawBusNames(std::vector<std::string>& sends, std::vector<std::string>& recvs) {
+    static const std::regex sendRe(R"re(\bcawbsend[ \t]+"([A-Za-z0-9_-]+)")re");
+    static const std::regex recvRe(R"re(\bcawbrecv[ \t]+"([A-Za-z0-9_-]+)")re");
+    std::set<std::string> s, r;
+    auto scan = [&](const std::string& code) {
+        for (std::sregex_iterator it(code.begin(), code.end(), sendRe), end; it != end; ++it) s.insert((*it)[1].str());
+        for (std::sregex_iterator it(code.begin(), code.end(), recvRe), end; it != end; ++it) r.insert((*it)[1].str());
+    };
+    for (const Track& t : g_proj.tracks) if (t.kind == 0) for (const Clip& c : t.clips) scan(c.code);
+    scan(g_proj.orchestraCode); scan(g_proj.udoCode);
+    for (const std::string& src : g_proj.instrPool) scan(src);
+    sends.assign(s.begin(), s.end()); recvs.assign(r.begin(), r.end());
 }
 #include "app.h"
 std::vector<std::string> collectCawHubNames() {
@@ -868,6 +1135,86 @@ void drainPlayOutput() {
     pollMonitor();
 }
 #include "app.h"
+// How many meters an SC track shows: the widest channel count its clips write (user request:
+// the meter follows the code). Detected from the code text: Out.ar(bus, [a, b, c]) = 3,
+// the multichannel expansion '! 4' = 4, a bare mono Out.ar = 1; default 2 (stereo).
+int scTrackMeterChannels(const Track& t) {
+    int channels = 0;
+    for (const Clip& c : t.clips) {
+        int ch = 1;
+        // Out.ar(<anything>, <second arg>) up to the closing paren of the call
+        size_t at = c.code.find("Out.ar");
+        while (at != std::string::npos) {
+            const size_t open = c.code.find('(', at);
+            if (open != std::string::npos) {
+                int depth = 0; size_t i = open;
+                for (; i < c.code.size(); ++i) {
+                    if (c.code[i] == '(') ++depth;
+                    else if (c.code[i] == ')') { --depth; if (depth == 0) break; }
+                }
+                if (i < c.code.size()) {
+                    // the top-level comma inside the call splits bus from channels
+                    int topCommas = 0; size_t commaAt = std::string::npos; int d2 = 0;
+                    for (size_t k = open + 1; k < i; ++k) {
+                        const char q = c.code[k];
+                        if (q == '[' || q == '(') ++d2;
+                        else if (q == ']' || q == ')') --d2;
+                        else if (q == ',' && d2 == 0) { ++topCommas; if (commaAt == std::string::npos) commaAt = k; }
+                    }
+                    // Out.ar(N, ...) with a plain number: the code writes channel N (0-based) -
+                    // Out.ar(3, x) is the 4th output, so the meter count is N + 1
+                    if (commaAt != std::string::npos) {
+                        const std::string first = c.code.substr(open + 1, commaAt - open - 1);
+                        const size_t f0 = first.find_first_not_of(" \t");
+                        const size_t f1 = first.find_last_not_of(" \t");
+                        if (f0 != std::string::npos && f1 != std::string::npos) {
+                            const std::string num = first.substr(f0, f1 - f0 + 1);
+                            if (!num.empty() && std::all_of(num.begin(), num.end(), [](char q) { return q >= '0' && q <= '9'; }))
+                                ch = std::max(ch, std::atoi(num.c_str()) + 1);
+                        }
+                    }
+                    if (topCommas >= 1) {
+                        const std::string arg = c.code.substr(commaAt + 1, i - commaAt - 1);
+                        // [a, b, c] -> 3 ; anything '! N' -> N ; a bare expression -> 1
+                        const size_t br0 = arg.find('[');
+                        if (br0 != std::string::npos) {
+                            const size_t br1 = arg.rfind(']');
+                            if (br1 != std::string::npos && br1 > br0) {
+                                const std::string list = arg.substr(br0 + 1, br1 - br0 - 1);
+                                ch = 1; int d3 = 0;
+                                for (char q : list) {
+                                    if (q == '[' || q == '(') ++d3;
+                                    else if (q == ']' || q == ')') --d3;
+                                    else if (q == ',' && d3 == 0) ++ch;
+                                }
+                            }
+                        } else {
+                            const size_t bang = arg.find('!');
+                            if (bang != std::string::npos) {
+                                size_t d4 = bang + 1;
+                                while (d4 < arg.size() && (arg[d4] == ' ' || arg[d4] == '	')) ++d4;
+                                ch = std::max(1, std::atoi(arg.c_str() + d4));
+                            }
+                        }
+                    }
+                }
+            }
+            at = c.code.find("Out.ar", at + 6);
+        }
+        // the '.play' expansion form: { ... } ! 4 }.play (user example) - and any plain '! N'
+        // multichannel expansion when the code has no Out.ar call at all
+        if (ch <= 1) {
+            static const std::regex playBangRe(R"re(!\s*(\d+)\s*\}\s*\)\s*\.\s*play)re");
+            static const std::regex anyBangRe(R"re(!\s*(\d+))re");
+            std::smatch m;
+            if (std::regex_search(c.code, m, playBangRe)) ch = std::max(1, std::atoi(m[1].str().c_str()));
+            else if (std::regex_search(c.code, m, anyBangRe)) ch = std::max(1, std::atoi(m[1].str().c_str()));
+        }
+        channels = std::max(channels, std::min(ScEngine::slotStride, ch));
+    }
+    return channels > 0 ? channels : 2;
+}
+#include "app.h"
 void updateMeters(float dt) {
     for (auto& entry : g_scMeterDb)
         for (float& db : entry.second) db = std::max(-100.f, db - 36.f * dt);
@@ -878,7 +1225,7 @@ void updateMeters(float dt) {
             const int slot = scTrackSlot(track.id);
             if (slot < 0) continue;
             auto& meter = g_scMeterDb[track.id];
-            for (int channel = 0; channel < 2; ++channel) {
+            for (int channel = 0; channel < ScEngine::slotStride; ++channel) {
                 const float peak = g_scEngine.takeTrackPeak(slot, channel);
                 const float db = 20.f * std::log10(std::max(peak, 1e-5f));
                 meter[static_cast<size_t>(channel)] = std::max(meter[static_cast<size_t>(channel)], db);
@@ -888,11 +1235,13 @@ void updateMeters(float dt) {
     if (g_sampleEngineOn) {
         const auto peaks = cawaudio::engine().takeTrackPeaks();   // trackId -> output channel peaks (max since the last frame)
         for (const Track& track : g_proj.tracks) {
-            if (track.kind != 7 || trackHiddenByFolder(track)) continue;
+            if ((track.kind != 7 && !trackFrozen(track)) || trackHiddenByFolder(track)) continue;
             // how many meters this track shows: the widest output use of its clips (the saved routing
             // and the code's out1..out8 custom routing both count)
             int channels = 0;
-            for (const Clip& c : track.clips) {
+            if (trackFrozen(track)) {
+                channels = 2;   // the frozen WAV plays as one stereo clip (the meter rides its voice)
+            } else for (const Clip& c : track.clips) {
                 if (c.audioFile.empty()) continue;
                 std::string err;
                 const auto data = audioClipData(c, err);
@@ -931,7 +1280,7 @@ void updateMeters(float dt) {
         if (g_scSoloCapture->take(snapshot, g_scSoloSnapshotSeq)) {
             g_scSoloSnapshotSeq = snapshot.sequence;
             g_rawFullScale = 1.f;
-            g_rawSampleRate = std::max(1, g_proj.cs.sr);
+            g_rawSampleRate = g_scSoloOutput->actualRate() > 0 ? g_scSoloOutput->actualRate() : std::max(1, g_proj.cs.sr);   // the analyzer maps frequencies at the feed's real rate
             applyRawSamples(snapshot.left.data(), snapshot.right.data());
             if (g_peakIn.size() < snapshot.meters.size()) g_peakIn.resize(snapshot.meters.size(), 0.f);
             if (g_meterClipHold.size() < g_peakIn.size()) g_meterClipHold.resize(g_peakIn.size(), 0.f);
@@ -947,7 +1296,7 @@ void updateMeters(float dt) {
         if (g_vstSoloCapture->take(snapshot, g_vstSoloSnapshotSeq)) {
             g_vstSoloSnapshotSeq = snapshot.sequence;
             g_rawFullScale = 1.f;
-            g_rawSampleRate = std::max(1, g_proj.cs.sr);
+            g_rawSampleRate = g_vstSoloOutput->actualRate() > 0 ? g_vstSoloOutput->actualRate() : std::max(1, g_proj.cs.sr);   // the analyzer maps frequencies at the feed's real rate
             applyRawSamples(snapshot.left.data(), snapshot.right.data());
             if (g_peakIn.size() < snapshot.meters.size()) g_peakIn.resize(snapshot.meters.size(), 0.f);
             if (g_meterClipHold.size() < g_peakIn.size()) g_meterClipHold.resize(g_peakIn.size(), 0.f);
@@ -966,13 +1315,18 @@ void updateMeters(float dt) {
         for (const Track& t : g_proj.tracks) if (t.solo && !t.muted) anySoloT = true;
         // An effect belongs to its source's signal path (see collectVstActiveTracks): it replaces the
         // sample while THAT source is audible - soloing the source keeps its insert working.
-        const auto srcAudible = [&](const Track& o) { return !o.muted && (!anySoloT || o.solo); };
+        const auto srcAudible = [&](const Track& o) { return !o.muted && (!anySoloT || o.solo); };   // a locked source's raw mix is its WAV voice: it is suppressed like a live one
         for (const Track& vt : g_proj.tracks) {
-            if (vt.kind != 4 || vt.vstOutMode != 0 || vt.muted) continue;
+            if (vt.kind != 4 || vt.vstOutMode != 0) continue;
+            // FX only keeps consuming its sources also while the VSTe is explicitly muted: muting the
+            // VSTe silences the whole chain (the raw source must not leak back to the master).
+            // The VSTe muted by another track's solo is skipped: the solo rule already silences the
+            // consumed source, and a soloed SOURCE must keep its raw sound.
+            if (anySoloT && !vt.solo) continue;
             for (const auto& in : vt.vstInputs) {
                 if (!in.on || in.mode == 2) continue;
                 for (const Track& o : g_proj.tracks) {
-                    if (o.kind != 7) continue;
+                    if (o.kind != 7 && !trackFrozen(o)) continue;
                     const bool match = in.mode == 0 ? o.name == in.name
                         : std::any_of(o.clips.begin(), o.clips.end(), [&](const Clip& c) { return c.name == in.name; });
                     if (match && srcAudible(o)) smpReplaced = true;
@@ -991,7 +1345,7 @@ void updateMeters(float dt) {
                 for (const auto& in : vt.vstInputs) {
                     if (!in.on || in.mode == 2) continue;
                     for (const Track& o : g_proj.tracks) {
-                        if (o.kind != 7) continue;
+                        if (o.kind != 7 && !trackFrozen(o)) continue;
                         const bool match = in.mode == 0 ? o.name == in.name
                             : std::any_of(o.clips.begin(), o.clips.end(), [&](const Clip& c) { return c.name == in.name; });
                         if (match && srcAudible(o)) consumesSample = true;
@@ -1007,7 +1361,7 @@ void updateMeters(float dt) {
         if (g_sampleCapture->take(snapshot, g_sampleSnapshotSeq)) {
             g_sampleSnapshotSeq = snapshot.sequence;
             g_rawFullScale = 1.f;
-            g_rawSampleRate = std::max(1, g_proj.cs.sr);
+            g_rawSampleRate = g_sampleOutput->actualRate() > 0 ? g_sampleOutput->actualRate() : std::max(1, g_proj.cs.sr);   // the analyzer maps frequencies at the feed's real rate
             applyRawSamples(snapshot.left.data(), snapshot.right.data());
             if (g_peakIn.size() < snapshot.meters.size()) g_peakIn.resize(snapshot.meters.size(), 0.f);
             if (g_meterClipHold.size() < g_peakIn.size()) g_meterClipHold.resize(g_peakIn.size(), 0.f);
@@ -1039,34 +1393,37 @@ void updateMeters(float dt) {
         for(float& db:entry.second)db=std::max(-100.f,db-36.f*dt);
     for(auto& entry:g_vstMeterDb)
         for(float& db:entry.second)db=std::max(-100.f,db-36.f*dt);
-    if (g_vstEngineOn) {   // the 4th engine's rack - it always hosts the VST graph (SEPARATED ENGINES)
+    if (g_vstEngineOn || g_liveCsound) {   // VST track peaks by TRACK ID, from the VST engine and from the Csound-hosted rack
         std::vector<VstRack::SoloPeak> peaks;
-        vstSolo().takePeaks(peaks);
-        for (const auto& p : g_apiProc.takeVstPeaks()) peaks.push_back({p.trackId, p.l, p.r});
+        if (g_vstEngineOn) vstSolo().takePeaks(peaks);
+        for (const auto& p : g_apiProc.takeVstPeaks()) {
+            VstRack::SoloPeak sp; sp.trackId = p.trackId;
+            for (int c = 0; c < 8; ++c) sp.value[(size_t)c] = p.value[(size_t)c];
+            peaks.push_back(sp);
+        }
         for(const auto& track:peaks) {
             auto it=g_vstMeterDb.find(track.trackId);
-            if(it==g_vstMeterDb.end())it=g_vstMeterDb.emplace(track.trackId,std::array<float,2>{-100.f,-100.f}).first;
-            const float channels[2] = {track.l, track.r};
-            for(int ch=0;ch<2;++ch) {
-                const float db=20.f*std::log10(std::max(channels[ch],1e-5f));
-                it->second[ch]=std::max(it->second[ch],db);
+            if(it==g_vstMeterDb.end())it=g_vstMeterDb.emplace(track.trackId,PdMeterArr{}).first;
+            for(int ch=0;ch<(int)track.value.size();++ch) {
+                const float db=20.f*std::log10(std::max(track.value[(size_t)ch],1e-5f));
+                it->second[(size_t)ch]=std::max(it->second[(size_t)ch],db);
             }
         }
     }
     if(g_pdEngineOn)for(const auto& track:g_pdTimelineEngine.takePeaks()) {
         auto it=g_pdMeterDb.find(track.trackId);
-        if(it==g_pdMeterDb.end())it=g_pdMeterDb.emplace(track.trackId,std::array<float,2>{-100.f,-100.f}).first;
-        for(int ch=0;ch<2;++ch) {
-            const float db=20.f*std::log10(std::max(track.value[ch],1e-5f));
-            it->second[ch]=std::max(it->second[ch],db);
+        if(it==g_pdMeterDb.end())it=g_pdMeterDb.emplace(track.trackId,PdMeterArr{}).first;
+        for(int ch=0;ch<(int)track.value.size();++ch) {
+            const float db=20.f*std::log10(std::max(track.value[(size_t)ch],1e-5f));
+            it->second[(size_t)ch]=std::max(it->second[(size_t)ch],db);
         }
     }
     if(g_mixedPd)for(const auto& track:g_apiProc.takePdPeaks()) {
         auto it=g_pdMeterDb.find(track.trackId);
-        if(it==g_pdMeterDb.end())it=g_pdMeterDb.emplace(track.trackId,std::array<float,2>{-100.f,-100.f}).first;
-        for(int ch=0;ch<2;++ch) {
-            const float db=20.f*std::log10(std::max(track.value[ch],1e-5f));
-            it->second[ch]=std::max(it->second[ch],db);
+        if(it==g_pdMeterDb.end())it=g_pdMeterDb.emplace(track.trackId,PdMeterArr{}).first;
+        for(int ch=0;ch<(int)track.value.size();++ch) {
+            const float db=20.f*std::log10(std::max(track.value[(size_t)ch],1e-5f));
+            it->second[(size_t)ch]=std::max(it->second[(size_t)ch],db);
         }
     }
     g_monAge += dt;
@@ -1093,15 +1450,38 @@ std::vector<VstJob> collectVstJobs(const Project& project, const std::vector<Lan
     for (const Track& t : project.tracks) {
         if ((t.kind != 3 && t.kind != 4) || t.vstPath.empty()) continue;
         if (!ignoreMuteSolo && (t.muted || (anySolo && !t.solo))) continue;
+        if (trackFrozen(t)) continue;   // frozen: no plugin instance runs for this track (the frozen WAV plays instead)
         VstJob j; j.id = t.id; j.name = vstBusName(t); j.path = t.vstPath; j.classId = t.vstClassId;
         j.parameterState = t.vstParameterState;
         j.stateBlob = vstui::editorStateBlob(t.id);   // SEPARATED ENGINES: the editor instance's loaded patch (Kontakt .nki) - empty until captured
         if (j.stateBlob.empty()) j.stateBlob = t.vstPatchState;   // a project-saved patch state (v58) starts the fresh instance with the same library
         j.instrument = t.kind == 3; j.pick = t.vstPick; j.init = t.vstInit;
+        j.trackVolume = std::max(0.f, std::min(kMaxVolumeGain, t.volume));   // the fader rides the output at the master join
         j.outMode = t.vstOutMode == 1 ? 1 : 0;
+        j.channels = std::max(1, std::min(8, t.vstTrackChannels()));   // the track's channel format (set by the user)
+        j.outWide = j.channels > 2 ? 1 : 0;   // legacy field: wider than stereo = channels 1:1
+        for (int k = 0; k < 8; ++k) j.slotStage[(size_t)k] = t.kind == 4 ? std::min(7, std::max(0, t.vstSlotStage[k])) : 0;
+        j.outMap = Track::routeOutMap(t.vstRouteCode, j.outMapOn);   // the routing text (out<n> = in<m>), like a sample clip
+        j.outMap = Track::routeOutMap(t.vstRouteCode, j.outMapOn);   // the routing text (out<n> = in<m>), like a sample clip
+        j.outMap = Track::routeOutMap(t.vstRouteCode, j.outMapOn);   // the routing text (out<n> = in<m>), like a sample clip
+        j.outMap = Track::routeOutMap(t.vstRouteCode, j.outMapOn);   // the routing text (out<n> = in<m>), like a sample clip
+        j.outMap = Track::routeOutMap(t.vstRouteCode, j.outMapOn);   // the routing text (out<n> = in<m>), like a sample clip
+        j.chain.clear();
+        for (int st = 1; st < 8 && t.kind == 4; ++st) {   // the effect chain: stages 2..8, contiguous (VSTe only)
+            const Track::VstStage& sg = t.vstChain[st - 1];
+            if (sg.path.empty()) break;
+            VstJob::ChainStage cs;
+            cs.path = sg.path; cs.classId = sg.classId; cs.parameterState = sg.parameterState;
+            cs.stateBlob = vstui::editorStateBlob(t.id, st);   // the editor instance's loaded patch, per stage
+            if (cs.stateBlob.empty()) cs.stateBlob = sg.patchState;   // a project-saved patch state starts the fresh instance with the same library
+            j.chain.push_back(std::move(cs));
+        }
+        j.bypass = (t.kind == 4 && t.vstBypass0) ? 1u : 0u;   // effect on/off: bit k = effect k+1 bypassed
+        for (int st = 1; st < 8 && t.kind == 4; ++st) if (!t.vstChain[st - 1].path.empty() && t.vstChain[st - 1].bypass) j.bypass |= 1u << st;
         bool anyIn = false;
         for (int s = 0; s < 8; ++s) {
-            j.inputs[s].on = t.vstInputs[s].on; j.inputs[s].mode = t.vstInputs[s].mode; j.inputs[s].name = t.vstInputs[s].name;
+            j.inputs[s].on = t.vstInputs[s].on; j.inputs[s].mode = t.vstInputs[s].mode; j.inputs[s].name = t.vstInputs[s].name; j.inputs[s].sidechain = t.vstInputs[s].sidechain;
+            j.inputs[s].receive = t.vstInputs[s].receive;
             const bool configured = t.vstInputs[s].mode == 2 || ((t.vstInputs[s].mode == 0 || t.vstInputs[s].mode == 1) && !t.vstInputs[s].name.empty());
             if (configured) anyIn = true;
         }
@@ -1112,6 +1492,13 @@ std::vector<VstJob> collectVstJobs(const Project& project, const std::vector<Lan
         // the slot instead (stereo - the same channels the source sends to the master). Same
         // lookup order as resolveVstInputRoutes: PD / SC first, then VST, then Csound lines.
         const auto engineOf = [&project](const std::string& trackName, const std::string& clipName, int mode, int& srcId) {
+            for (const Track& o : project.tracks) {
+                if (!trackFrozen(o)) continue;
+                const bool match = mode == 0 ? o.name == trackName
+                    : std::any_of(o.clips.begin(), o.clips.end(),
+                        [&clipName](const Clip& c) { return c.name == clipName; });
+                if (match) { srcId = o.id; return 4; }
+            }
             const auto owner = [&](int kindA, int kindB) -> const Track* {
                 for (const Track& o : project.tracks) {
                     if (o.kind != kindA && o.kind != kindB) continue;
@@ -1122,8 +1509,16 @@ std::vector<VstJob> collectVstJobs(const Project& project, const std::vector<Lan
                 }
                 return nullptr;
             };
-            if (const Track* o = owner(5, 6)) { srcId = o->id; return o->kind == 6 ? 1 : 2; }   // Pure Data / SuperCollider mix
-            if (const Track* o = owner(3, 4)) { srcId = o->id; return 3; }                      // VSTi / VSTe output, wired by the rack
+            // A FROZEN source track plays its rendered WAV through the sample engine (one WAV voice
+            // per track): its sound reaches the rack through the same per-track sample ring the
+            // sample tracks use (engine 4) - its own engine no longer runs, so its old route (PD / SC
+            // mix, VST output or Csound taps) is silent.
+            if (const Track* o = owner(5, 6)) {
+                if (trackFrozen(*o)) { srcId = o->id; return 4; }                    // frozen: the WAV voice rides the sample-engine ring
+                srcId = o->kind == 6 ? o->id : scTrackSlot(o->id);                   // SC: srcId = the track slot (the per-track SC ring's key)
+                return o->kind == 6 ? 1 : 2;
+            }
+            if (const Track* o = owner(3, 4)) { srcId = o->id; return trackFrozen(*o) ? 4 : 3; }                       // VSTi / VSTe output, wired by the rack
             if (const Track* o = owner(7, 7)) { srcId = o->id; return 4; }                      // sample track: its stereo mix via the sample-engine ring
             return 0;                                                                           // a Csound track: the CSD routing writes the lines
         };
@@ -1139,7 +1534,7 @@ std::vector<VstJob> collectVstJobs(const Project& project, const std::vector<Lan
                 if (j.inputs[r.slot].engine == 0) j.inputs[r.slot].csChans = r.chans;   // the per-clip tap channels the CSD publishes
             }
         }
-        for (const LaneMeterInfo& lm : meters) if (lm.trackId == t.id) { j.meterFirst = lm.first; break; }
+        for (const LaneMeterInfo& lm : meters) if (lm.trackId == t.id) { j.meterFirst = lm.first; j.meterCount = lm.channels; break; }
         jobs.push_back(j);
     }
     return jobs;
@@ -1171,6 +1566,7 @@ std::vector<VstSoloNote> buildVstSoloNotes() {
     for (const Track& t : g_proj.tracks) if (t.solo && !t.muted) anySolo = true;
     for (const Track& t : g_proj.tracks) {
         if (t.muted || (anySolo && !t.solo) || t.midiClips.empty()) continue;
+        if (trackFrozen(t)) continue;   // frozen: the live engines skip the track (its notes are baked into the WAV)
         for (const MidiClip& mc : t.midiClips) {
             if (mc.muted) continue;
             int targetTrackId = -1;
@@ -1181,7 +1577,7 @@ std::vector<VstSoloNote> buildVstSoloNotes() {
                 const Clip* target = findClip(mc.clipId, &laneIdx);
                 if (!target || target->muted || laneIdx < 0) continue;
                 const Track& vt = g_proj.tracks[(size_t)laneIdx];
-                if ((vt.kind != 3 && vt.kind != 4) || vt.muted || (anySolo && !vt.solo)) continue;   // not a VST track: the Csound path plays it
+                if ((vt.kind != 3 && vt.kind != 4) || vt.muted || (anySolo && !vt.solo) || trackFrozen(vt)) continue;   // not a VST track: the Csound path plays it
                 targetTrackId = vt.id;
             }
             for (const MidiNote& n : mc.notes) {
@@ -1199,12 +1595,16 @@ std::vector<VstSoloNote> buildVstSoloNotes() {
     return out;
 }
 #include "app.h"
-std::vector<VstScript> buildVstScripts() {
+std::vector<VstScript> buildVstScripts() { return buildVstScripts(g_proj); }
+// The render-copy overload: an offline render (freeze / export part) passes its stripped copy, so
+// only the track being rendered contributes scripts and its solo/audible state counts.
+std::vector<VstScript> buildVstScripts(const Project& proj) {
     std::vector<VstScript> out;
     bool anySolo = false;
-    for (const Track& t : g_proj.tracks) if (t.solo && !t.muted) anySolo = true;
-    for (const Track& t : g_proj.tracks) {
+    for (const Track& t : proj.tracks) if (t.solo && !t.muted) anySolo = true;
+    for (const Track& t : proj.tracks) {
         if ((t.kind != 3 && t.kind != 4) || t.muted || (anySolo && !t.solo)) continue;   // VSTi (3) AND VSTe (4): the clip code runs in C++ here
+        if (&proj == &g_proj && trackFrozen(t)) continue;   // frozen: the clip code does not run (the WAV carries the sound)
         for (const Clip& c : t.clips) {
             if (c.muted || c.code.empty()) continue;
             VstScript s;
@@ -1241,6 +1641,11 @@ void ensureVstSoloOutput() {
     // mixes this engine via renderMix), PD and SC block a dedicated stream here; the command-line
     // Csound opens ITS OWN device, so the VST engine still needs one in that mode.
     if (scHasSharedAudioOwner() || g_scSoloOutput || g_sampleOutput || g_testSound.running() || g_renderActive) return;
+    // The dedicated Pure Data engine's stream is the carrier: the rack is mixed into it through
+    // the shared realtime hook (scRealtimeSource). Opening a second stream here rendered the
+    // rack a SECOND time per callback period and double-drained the PD mix ring - the rack
+    // starved and a PureData input went silent while PD ran.
+    if (g_pdEngineOn && g_pdTimelineEngine.active()) return;
     if (g_useCsoundApi && g_apiProc.active()) return;   // the Csound API engine's stream is the carrier: the rack is mixed into it
     if (!g_audioDevicesReady) refreshAudioDevices(false);
     if (g_proj.cs.outDev == -2) return;   // no output chosen: Settings already asks for one
@@ -1279,8 +1684,8 @@ std::set<int> collectVstActiveTracks(const Project& project) {
     for (const Track& t : project.tracks) if (t.solo && !t.muted) anySolo = true;
     // The normal rule: an unmuted track sounds on its own (or when any solo lets it).
     for (const Track& t : project.tracks)
-        if ((t.kind == 3 || t.kind == 4) && !t.vstPath.empty() && !t.muted && (!anySolo || t.solo))
-            ids.insert(t.id);
+        if ((t.kind == 3 || t.kind == 4) && !t.vstPath.empty() && !t.muted && !trackFrozen(t) && (!anySolo || t.solo))
+            ids.insert(t.id);   // frozen: no plugin instance for this track (the frozen WAV plays instead)
     // An EFFECT wired to an audible source keeps processing it even while ANOTHER track is soloed:
     // it is that source's insert, so it belongs to the source's signal path - exactly like the
     // master FX chain, which the track M / S never touches. Without this, soloing the source track
@@ -1289,7 +1694,7 @@ std::set<int> collectVstActiveTracks(const Project& project) {
     const auto srcAudible = [&](const Track& o) {
         if (o.muted) return false;
         if (o.kind == 3 || o.kind == 4) return ids.count(o.id) != 0;   // a VST source follows its own chain
-        return !anySolo || o.solo;
+        return !anySolo || o.solo;   // a frozen source is audible through its sample-engine WAV voice
     };
     bool grew = true;
     while (grew) {
@@ -1314,9 +1719,54 @@ std::set<int> collectVstActiveTracks(const Project& project) {
     return ids;
 }
 #include "app.h"
+// Sample clips and every locked source reach a VSTe through the sample engine's per-track rings.
+static bool vstInputsNeedSampleEngine() {
+    for (const Track& vt : g_proj.tracks) {
+        if (vt.kind != 4) continue;
+        for (const auto& in : vt.vstInputs) {
+            if (!in.on || in.mode == 2 || in.name.empty()) continue;
+            for (const Track& o : g_proj.tracks) {
+                if (o.kind != 7 && !trackFrozen(o)) continue;
+                if (trackFrozen(o) && o.freezePath.empty()) continue;
+                const bool match = in.mode == 0 ? o.name == in.name
+                    : std::any_of(o.clips.begin(), o.clips.end(), [&](const Clip& c) { return c.name == in.name; });
+                if (match) return true;
+            }
+        }
+    }
+    return false;
+}
+
+void ensureSampleEngineForVstInputs() {
+    static bool warnedAudioOff = false;
+    if (!vstInputsNeedSampleEngine()) { warnedAudioOff = false; return; }
+    if (!g_langAudio) {
+        if (!warnedAudioOff)
+            logLine("[caw] VSTe input problem: a sample or locked source feeds an effect, but Audio is disabled in Settings > Engines.");
+        warnedAudioOff = true;
+        return;
+    }
+    warnedAudioOff = false;
+    if (!g_sampleEngineOn) {
+        g_sampleEngineOn = true;
+        ensureSampleOutput();
+        logLine("[caw] Sample engine started automatically: a sample or locked source feeds a VSTe input.");
+    }
+}
+
 void pushVstActiveLive() {
-    if (g_liveCsound && g_useCsoundApi) g_apiProc.setVstActiveTracks(collectVstActiveTracks(g_proj));
-    if (g_vstEngineOn) vstSolo().setActive(vstSoloActiveIds());
+    ensureSampleEngineForVstInputs();
+    if (g_liveCsound && g_useCsoundApi) {
+        g_apiProc.setVstActiveTracks(collectVstActiveTracks(g_proj));
+        g_apiProc.setControlChannels(vstGateValues());   // M / S move which effect replaces its sources (FX only keeps consuming while its rack is muted)
+        pushVstTapsToCsound();   // freeze / unfreeze can change a source from the sample ring to a Csound tap
+        // Live plugins belong only to the VST engine; the runner's rack is offline-only.
+    }
+    if (g_vstEngineOn) {
+        vstSolo().setActive(vstSoloActiveIds());
+        vstSolo().setWiring(collectVstEngineJobs());   // same re-route for the 4th engine's rack
+    }
+    updateScSlotSuppress();   // M / S move which SC track slots an FX-only VSTe consumes (their raw mix stops reaching the master)
 }
 #include "app.h"
 void vstEngineJoinTransport() {   // notes + loop + position, from the current playhead
@@ -1336,11 +1786,13 @@ bool applyVstInstrumentJobs(const std::vector<VstJob>& jobs) {   // (re)load the
     static bool com = false; if (!com) { OleInitialize(nullptr); com = true; }   // plugins expect COM on the thread that loads them
 #endif
     const CawAudioSettings audio = pdAudioSettings();
-    static VstEngineAudio soloAudio;   // the SuperCollider mix is captured by CAW's callback (g_scRing)
+    static VstEngineAudio soloAudio;   // the SuperCollider per-track rings are captured by CAW's callback (scTrackRingOf)
     soloAudio.scRing = &g_scRing;
-    soloAudio.pdMix = nullptr;         // the Pure Data mix has no app-side ring: a PD input needs Csound
+    soloAudio.scTrackRing = [](int slot) -> CawScRing* { return scTrackRingOf(slot); };
+    soloAudio.pdMix = nullptr;         // the mixed-mode PD mix lives inside the Csound runner (this engine runs while Csound is off)
+    soloAudio.pdRing = &pdlivering::ring;   // the dedicated PD engine's live mix: a PureData input works WITHOUT Csound
     soloAudio.sampleRing = [](int trackId) -> CawScRing* { return sampleRingOf(trackId); };   // a sample track's stereo mix (engine 4)
-    if (!vstSolo().start(jobs, audio.sampleRate, 2, 512, &soloAudio)) return false;
+    if (!vstSolo().start(jobs, audio.sampleRate, std::max(1, std::min(8, audio.channels)), 512, &soloAudio)) return false;   // the audio setting's width
     clearSampleRings();   // a (re)loaded graph starts from "now": stale ring audio would put the effect seconds behind
     vstSolo().setActive(vstSoloActiveIds());
     vstSolo().setInputMasks(collectVstInputMasks(g_proj));
@@ -1355,17 +1807,17 @@ bool applyVstInstrumentJobs(const std::vector<VstJob>& jobs) {   // (re)load the
                 if (!sum.empty()) sum += ", ";
                 sum += "in" + std::to_string(s + 1) + ": ";
                 if (src.mode == 2) sum += "master";
-                else if (src.engine == 1) { sum += "\"" + src.name + "\" (PureData - needs Csound)"; csInput = true; }
+                else if (src.engine == 1) { sum += "\"" + src.name + "\" (PureData mix)"; }
                 else if (src.engine == 2) sum += "\"" + src.name + "\" (SuperCollider mix)";
                 else if (src.engine == 3) sum += "\"" + src.name + "\" (VST output)";
-                else if (src.engine == 4) sum += "\"" + src.name + "\" (sample track mix)";
+                else if (src.engine == 4) sum += "\"" + src.name + "\" (sample engine: sample track or rendered WAV)";
                 else { sum += "\"" + src.name + "\" (Csound track - needs Csound)"; csInput = true; }
             }
             logLine("[caw] VSTe \"" + j.name + "\" runs in the VST engine; inputs: " +
                     (sum.empty() ? std::string("(none enabled - nothing to process)") : sum) + ".");
             if (csInput)
-                logLine("[caw] VSTe \"" + j.name + "\": a Csound / PD track only sounds while Csound runs. "
-                        "With the VST engine alone, wire the effect to a VSTi track, the master, or the SuperCollider mix.");
+                logLine("[caw] VSTe \"" + j.name + "\": a Csound track only sounds while Csound runs. "
+                        "With the VST engine alone, wire the effect to a VSTi track, the master, a PureData track, or the SuperCollider mix.");
         }
     }
     return true;
@@ -1411,6 +1863,7 @@ void startVstEngine() {
     // automatically (notifyPluginLoaded + vstEngineCheckJobs) without a Stop / Run VST cycle -
     // and the P1..P8 mapping is carried over to the new plugin.
     g_vstEngineOn = true;
+    ensureSampleEngineForVstInputs();
     g_vstIdleNoPlugin = jobs.empty();   // nothing picked yet: the pill must not wait for a load that is not running
     // Editor-side VST3 instances may have been opened before Run VST. Once the engine format is
     // known, negotiate it with those instances too (without starting a second audio processor).
@@ -1480,9 +1933,26 @@ void vstEngineCheckJobs(float dt) {
     const std::vector<VstJob> jobs = collectVstEngineJobs();
     vstSolo().setWiring(jobs);   // effect inputs / output modes as configured now (no plugin reload)
     vstSolo().refreshLatencies();   // the rack loads async: keep the reported latencies current (dry/wet alignment)
+    static bool retainedForLock = false;
+    if (!jobs.empty()) retainedForLock = false;
     if (vstSolo().sameJobs(jobs)) { g_vstFailedSig.clear(); return; }
     if (jobs.empty()) {
         g_vstFailedSig.clear();
+        const bool lockedVstRemains = std::any_of(g_proj.tracks.begin(), g_proj.tracks.end(), [](const Track& t) {
+            return (t.kind == 3 || t.kind == 4) && !t.vstPath.empty() && trackFrozen(t);
+        });
+        if (lockedVstRemains) {
+            // Keep the native instance alive: some VST3 factories fault when a just-bounced effect is destroyed.
+            if (!retainedForLock) {
+                vstSolo().setActive({});
+                vstSolo().setWiring({});
+                g_vstMeterDb.clear();
+                logLine("[caw] VST engine: the remaining VST tracks are locked - keeping their plugin instances until unlock or project close.");
+                retainedForLock = true;
+            }
+            return;
+        }
+        retainedForLock = false;
         if (vstSolo().ready()) {   // the last VST track / plugin went away: unload, keep the button on and wait
             vstSolo().unload();
             vstSolo().setEngineOn(true);   // Run VST stays on: a plugin loaded later starts playing by itself
@@ -1491,6 +1961,7 @@ void vstEngineCheckJobs(float dt) {
         }
         return;
     }
+    retainedForLock = false;
     const std::string sig = VstSoloEngine::signature(jobs);
     if (sig == g_vstFailedSig && g_vstFailedRetryT > 0.0) return;   // this set already failed: retried when the timer runs out
     logLine("[caw] VST engine: the plugins changed - reloading.");
@@ -1692,7 +2163,7 @@ void startEngine() {
     const std::string cmd = "\"" + exe + "\" \"" + csdPath + "\"";
     if (!g_useCsoundApi) logLine("[caw] Run (Csound runs until Stop; Play sends the clips at their start times): " + cmd);
     resetCommands();   // the command files exist before Csound reads them
-    g_engineMeters = meterLayout(g_proj);
+    g_engineMeters = meterLayout(g_proj, g_projectPath);
     g_recNames = cawWriteTargets(g_proj);
     int top = masterChannels(g_proj.cs);
     for (const LaneMeterInfo& lm : g_engineMeters) top = std::max(top, lm.first + lm.channels);
@@ -1712,7 +2183,10 @@ void startEngine() {
     g_fftDb.clear();
     g_spectrumBands.clear();
     g_columnBands.clear();
+    g_columnHold.clear();
+    g_columnDisp.clear();
     g_tonePeaks.clear();
+    monitor_peaks::resetTracking();
     g_fftHistory.clear();
     g_rawSampleRate = std::max(1, g_proj.cs.sr);
     g_rawFullScale = (float)std::max(0.0001, g_proj.cs.zdbfs);
@@ -1725,11 +2199,8 @@ void startEngine() {
     if (g_useCsoundApi) {
         // First host-output version is output-only. Never silently drop a
         // configured recording input; the legacy OSC engine supports it.
-        if (g_proj.cs.inDev >= 0 || g_proj.cs.options.find("-iadc") != std::string::npos) {
-            logLine("[caw] CAW-owned audio input is not available yet. Use run_osc_monitor.bat for audio input.");
-            g_cawMonitorApi = false; g_useCsoundApi = false;
-            return;
-        }
+        // The soundcard input is CAW-owned now (caw_audio_in.h): one capture stream for every engine.
+        ensureCawAudioInput();
         if (g_proj.cs.outDev == -2) {
             logLine("[caw] No output selected. Choose a soundcard in Settings or use the OSC launcher for silent output.");
             g_cawMonitorApi = false; g_useCsoundApi = false;
@@ -1771,6 +2242,7 @@ void startEngine() {
             // CAW hub (caws/cawr): the shared bus + the hub channel names found in the clip code.
             g_apiProc.setHub(&g_cawHub);
             g_apiProc.setHubNames(collectCawHubNames());
+            { std::vector<std::string> bs, br; collectCawBusNames(bs, br); g_apiProc.setBusNames(bs, br); }   // audio buses (cawbsend / cawbrecv)
         }
         closeScSoloOutput();
         if (!g_apiProc.start(csdPath, g_rawSampleRate, top,
@@ -1815,6 +2287,11 @@ bool replaceOutputFile(const std::string& temporary, const std::string& final, s
 #endif
 }
 #include "app.h"
+// The offline render carries the FROZEN tracks' sound through their rendered WAVs (the offline
+// host decodes them and feeds them as engine-4 sample-ring inputs - see setOfflineSampleStreams).
+// The live sample engine does not run offline, so these streams ARE the locked sources' voices.
+std::map<int, CsoundApiRunner::OfflineSampleStream> collectOfflineSampleStreams(const Project& p);
+
 void cleanupRenderTemps() {
     std::error_code ec;
     if (!g_renderTemp.empty()) std::filesystem::remove(g_renderTemp, ec);
@@ -1822,14 +2299,180 @@ void cleanupRenderTemps() {
     g_renderTemp.clear(); g_renderEncodedTemp.clear();
 }
 #include "app.h"
+// ---- whole-project OFFLINE export (Render mode = offline): every engine renders through its own
+// offline pipeline (the same per-track passes the freeze uses), one part per track, and the parts
+// mix down into the single export file afterwards. A frozen track joins as its rendered WAV.
+struct ExportOffline {
+    bool active = false;                 // a queue is running (g_renderActive stays true for Cancel)
+    std::vector<int> pending;            // track indexes still to render
+    struct Part { std::string path; double t0; float gain = 1.f; };   // the WAV starts at timeline t0; gain = the track fader (parts render at unity, the mix applies it like the live mix does)
+    std::vector<Part> parts;
+    std::string finalPath, tempWav, encTmp;
+    int format = 0, wavFormat = 0;
+    int rate = 48000;
+    double t0 = 0.0;                     // the export range start (the panel's Start)
+    double t1 = 0.0;                     // the export range end (the panel's End, or the project end + tail)
+    int partSeq = 0;                     // part file numbering
+    std::chrono::steady_clock::time_point startedAt;
+    bool asReal = false;                 // as real routing: the parts carry the whole virtual bus (settings N)
+    int partCh = 2;                      // the channel width the parts were rendered at
+    bool splitExport = false;            // each final channel exports as its own mono file
+};
+static ExportOffline g_exportOff;
+static bool g_exportBeginPending = false;    // freezeTrackBegin is starting ON BEHALF of the export queue
+static void exportNextTrack();   // defined below (drives the offline per-engine export queue)
+
+// ---- real-time whole-project export (Settings > Audio: Render mode = Real-time capture)
+// The transport plays once from the project start while the audio callback copies the FINAL
+// master mix (every engine live, master FX included) into the export WAV. Works for every track
+// kind - no offline pipeline needed - and uses the project's export format / bit depth / rate.
+struct ExportRt {
+    int phase = 0;                    // 0 idle, 1 capturing (transport rolling), 2 draining/writing, 3 encode handoff done
+    double t0 = 0.0, t1 = 0.0;        // timeline extent being captured (t1 includes the tail)
+    std::string tmpPath;
+    int rate = 48000;
+    int ch = 2;                       // the WAV's channels: the project's output channels (clamped 1..8)
+    int wavFormat = 2;                // the WAV's sample format (float32 for the FLAC/MP3 handoff)
+    double savedPlayhead = 0.0;
+    bool savedLoopEnabled = false;
+    double savedLoopStart = 0.0, savedLoopEnd = 0.0;
+    FreezeCaptureSink sink;
+    CawWavWriter wav;
+    std::thread writer;
+    std::atomic<bool> stopWriter{false};
+    std::atomic<int> writeFailed{0};
+    std::chrono::steady_clock::time_point startedAt;
+    std::chrono::steady_clock::time_point captureStartedAt = std::chrono::steady_clock::now();   // reset on every playhead move (the stall watchdog)
+    double lastPlay = 0.0;                                    // the last playhead seen (stall detection)
+    std::string error;
+    // Reset for a new pass (atomics cannot be assigned: every field is reset here; the caller
+    // must have joined any previous writer thread and released the sink before).
+    void resetForNewPass() {
+        phase = 0;
+        t0 = t1 = 0.0;
+        tmpPath.clear();
+        rate = 48000;
+        savedPlayhead = 0.0;
+        savedLoopEnabled = false;
+        savedLoopStart = savedLoopEnd = 0.0;
+        sink.quiesce();
+        sink.reset();
+        stopWriter.store(false, std::memory_order_release);
+        writeFailed.store(0, std::memory_order_release);
+        wavFormat = 2;
+        error.clear();
+    }
+};
+static ExportRt g_exportRt;
+int activeStreamRate(int fallback);   // defined next to scheduleAudioTimeline
+
+static void exportRtCancel() {
+    if (g_exportRt.phase == 0) return;
+    g_exportRt.sink.quiesce();
+    g_exportSink.store(nullptr, std::memory_order_release);
+    g_exportRt.stopWriter.store(true, std::memory_order_release);
+    if (g_exportRt.writer.joinable()) g_exportRt.writer.join();
+    if (timelinePlaying()) toggleTimelinePlay();
+    g_play = g_exportRt.savedPlayhead;
+    g_proj.loopEnabled = g_exportRt.savedLoopEnabled;
+    g_proj.loopStart = g_exportRt.savedLoopStart;
+    g_proj.loopEnd = g_exportRt.savedLoopEnd;
+    g_exportRt.wav.close();
+    std::error_code ec;
+    if (!g_exportRt.tmpPath.empty()) std::filesystem::remove(std::filesystem::u8path(g_exportRt.tmpPath), ec);
+    g_exportRt.phase = 0;
+}
+
+void startRenderRealtime(const std::string& renderPath, int format, int wavFormat) {
+    double hi = 0.0;
+    for (const Track& t : g_proj.tracks) {
+        if (t.kind == 1) continue;
+        for (const Clip& c : t.clips) hi = std::max(hi, c.start + c.dur);
+        for (const MidiClip& mc : t.midiClips) hi = std::max(hi, mc.start + mc.dur);
+        for (const auto& lane : t.automation)
+            for (const AutoPoint& ap : lane.second) hi = std::max(hi, ap.t);
+        // A locked track's sound runs to the END OF ITS RENDERED WAV (its clips no longer bound it):
+        // the offline export must end where the real-time capture (and your ears) end.
+        if (trackFrozen(t)) hi = std::max(hi, t.freezeEnd);
+    }
+    if (hi <= 0.0) { g_exportError = "The project has nothing to render (no clips)."; logLine("[caw] " + g_exportError); return; }
+    const double extent = hi + std::max(0.0, g_proj.cs.tail) + 1.0;
+    const double rangeStart = std::max(0.0, g_proj.cs.exportStart);
+    const double rangeEnd = g_proj.cs.exportEnd > rangeStart ? std::min(g_proj.cs.exportEnd, extent) : extent;
+    if (rangeEnd <= rangeStart) { g_exportError = "The export range is empty (End must be greater than Start)."; logLine("[caw] " + g_exportError); return; }
+    const int projCh = std::max(1, std::min(8, masterChannels(g_proj.cs)));
+    // The real-time export renders the LIVE mix: start every checked engine first (the DSP press
+    // does the same), so the export works with the DSP off. The transport waits for them (arming).
+    if (g_langCsound && !engineIsUp()) { logLine("[caw] Real-time export: starting Csound..."); startEngine(); }
+    if (g_langSc && !g_scEngineOn) { logLine("[caw] Real-time export: starting SuperCollider..."); startScEngine(); }
+    if (g_langVst && !g_vstEngineOn) { logLine("[caw] Real-time export: starting the VST engine..."); startVstEngine(); }
+    if (g_langAudio && !g_sampleEngineOn) { g_sampleEngineOn = true; ensureSampleOutput(); logLine("[caw] Real-time export: the sample engine is on."); }
+    const int fileCh = std::max(1, std::min(8, g_proj.cs.exportChannels));
+    logLine("[caw] Real-time export: the file carries " + std::to_string(fileCh) + " channel(s) (the export panel's Channels setting; the project mix is " + std::to_string(projCh) + ").");
+    g_exportRt.resetForNewPass();
+    g_exportRt.t0 = rangeStart;
+    g_exportRt.t1 = rangeEnd;
+    g_exportRt.rate = activeStreamRate(std::max(8000, g_proj.cs.sr));   // provisional; re-read at arming, once the device rate is known
+    g_exportRt.ch = std::max(1, std::min(8, g_proj.cs.exportChannels));   // the export panel's Channels setting
+    g_exportRt.wavFormat = wavFormat;
+    g_exportRt.tmpPath = renderPath;
+    g_exportRt.savedPlayhead = g_play;
+    g_exportRt.savedLoopEnabled = g_proj.loopEnabled;
+    g_exportRt.savedLoopStart = g_proj.loopStart;
+    g_exportRt.savedLoopEnd = g_proj.loopEnd;
+    g_exportRt.stopWriter.store(false, std::memory_order_release);
+    g_exportRt.writeFailed.store(0, std::memory_order_release);
+    g_exportRt.sink.quiesce();
+    g_exportRt.sink.reset();
+    g_exportRt.sink.quiesce();
+    g_exportRt.sink.reset();
+    g_exportRt.startedAt = std::chrono::steady_clock::now();
+    g_exportRt.phase = 4;   // arming: the transport waits until the started engines and the soundcard are up
+    g_renderActive = true;
+    logLine("[caw] Real-time export: waiting for the engines, then the transport plays " +
+            std::to_string((int)(rangeEnd - rangeStart + 0.5)) + " s once and the final master mix is captured to " + renderPath +
+            " (the WAV opens once the device rate is known).");
+}
+
+static void exportNextTrack();   // defined below (drives the offline per-engine export queue)
+
 void startRenderNow() {
-    if (!g_langCsound) { logLine("[caw] PD audio export is not available yet. Enable Csound to export Csound projects."); return; }
-    if (g_pdEngineOn || g_pdPreview.active()) { logLine("[caw] Stop Pure Data playback before exporting."); return; }
     if (g_renderActive) return;
+    // The DSP switch decides the pipeline (user request): offline rendering must not run while the
+    // DSP (any engine) is on, and real-time capture needs the engines of the checked languages up.
+    // Both ask in a popup - never crash, never silently fail. The popup button performs the same
+    // full start/stop as the DSP button, so the button state follows.
+    if (g_proj.cs.renderMode == 0 &&
+        (g_liveCsound || g_pdEngineOn || g_scEngineOn || g_vstEngineOn || g_sampleEngineOn)) { g_askDspOffExport = true; return; }
+    if (g_proj.cs.renderMode == 1) {
+        const bool dspUp = (!g_langCsound || g_liveCsound) && (!g_langPd || g_pdEngineOn || g_mixedPd) &&
+                           (!g_langSc || g_scEngineOn) && (!g_langVst || g_vstEngineOn) && (!g_langAudio || g_sampleEngineOn);
+        if (!dspUp) { g_askDspOnExport = true; return; }
+    }
+    if (freezeActive()) {   // a freeze render owns the offline host: starting an export would stop it mid-render
+        g_exportError = "A track freeze is running. Wait for it to finish (or cancel it) before exporting.";
+        logLine("[caw] " + g_exportError);
+        return;
+    }
     vstui::captureParameters(g_proj);
     g_exportError.clear();
     const int format = std::min(4, std::max(0, g_proj.cs.renderFormat));
-    const int channels = g_proj.cs.exportChannels;
+    const int convertTarget = (g_proj.cs.exportConvertOn && g_proj.cs.exportConvert >= 1) ? g_proj.cs.exportConvert : 0;
+    const int virtualBus = masterChannels(g_proj.cs);
+    // The exported width: Convert wins (the fold happens at the writer); otherwise as real
+    // routing exports the whole virtual bus (settings N) and as virtual follows the Channels combo.
+    const int channels = convertTarget >= 1 ? convertTarget
+        : (g_proj.cs.exportSource == 1 ? virtualBus : g_proj.cs.exportChannels);
+    if (g_proj.cs.exportSplit && format >= 3) {
+        g_exportError = "Channel-separated export writes WAV formats - pick WAV (PCM), or turn splitting off.";
+        logLine("[caw] " + g_exportError);
+        return;
+    }
+    if (g_proj.cs.renderMode == 1 && (g_proj.cs.exportSource == 1 || convertTarget >= 1)) {
+        g_exportError = "The real-time capture always records the stereo master mix. For as real routing / Convert / separated channels use Render mode = Offline.";
+        logLine("[caw] " + g_exportError);
+        return;
+    }
     if ((format == 4 && channels > 2) || (format == 3 && channels > 8)) {
         g_exportError = format == 4 ? "MP3 supports mono or stereo only." : "FLAC supports up to 8 channels.";
         logLine("[caw] " + g_exportError);
@@ -1840,19 +2483,137 @@ void startRenderNow() {
         logLine("[caw] " + g_exportError);
         return;
     }
-    for (const Track& track : g_proj.tracks)
-        if (!track.muted && (track.kind == 5 || track.kind == 6) &&
-            std::any_of(track.clips.begin(), track.clips.end(), [](const Clip& c) { return !c.muted; })) {
-            g_exportError = "Audio export cannot include PD or SuperCollider clips yet.";
-            logLine("[caw] " + g_exportError);
-            return;
-        }
+    if (g_proj.cs.renderMode == 1) {
+        // REAL-TIME EXPORT: every engine plays live and the final master mix is captured - all
+        // track kinds (SC / PD / frozen / VST / sample), no Csound host, no offline pipelines.
+        std::error_code ec;
+        g_renderWillOverwrite = std::filesystem::exists(renderFilePath(), ec);
+        if (ec) { g_exportError = "Could not check output: " + ec.message(); logLine("[caw] " + g_exportError); return; }
+        for (const Track& track : g_proj.tracks)
+            if (!track.muted && (track.kind == 3 || track.kind == 4) && !track.clips.empty() && track.vstPath.empty()) {
+                g_exportError = "VST track " + track.name + " has clips but no plugin selected.";
+                logLine("[caw] " + g_exportError);
+                return;
+            }
+        if (g_playing) stopPlayback();
+        const std::string renderPath = renderFilePath().string();
+        g_renderPath = renderPath;
+        g_activeRenderFormat = format;
+        g_activeFlacBits = g_proj.cs.exportFlacBits;
+        g_activeMp3Kbps = g_proj.cs.exportMp3Kbps;
+        const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        const std::filesystem::path dir = std::filesystem::path(renderPath).parent_path();
+        const std::string stem = ".caw_render_" + std::to_string(stamp);
+        g_renderTemp = (dir / (stem + ".wav")).string();
+        g_renderEncodedTemp = format >= 3 ? (dir / (stem + renderExtension(format))).string() : std::string();
+        g_renderConverting = false;
+        diagClearAll();
+        startRenderRealtime(g_renderTemp, format, format >= 3 ? 2 : format);
+        return;
+    }
+    // OFFLINE EXPORT, PER-ENGINE (no Csound requirement: each engine renders its own way - a
+    // Csound/VSTi track renders through the offline Csound host, PD in CAW's C++ PD host,
+    // SuperCollider through the NRT renderer, sample tracks in the C++ sample engine).
+    if (g_pdEngineOn || g_pdPreview.active()) { logLine("[caw] Stop Pure Data playback before exporting."); return; }
     for (const Track& track : g_proj.tracks)
         if (!track.muted && (track.kind == 3 || track.kind == 4) && !track.clips.empty() && track.vstPath.empty()) {
             g_exportError = "VST track " + track.name + " has clips but no plugin selected.";
             logLine("[caw] " + g_exportError);
             return;
         }
+    // OFFLINE EXPORT, PER-ENGINE: every audible track renders through its OWN offline pipeline
+    // (the freeze passes: Csound host for Csound/VSTi, CAW's C++ PD host, the SC NRT renderer,
+    // the C++ sample engine), one part per track - no Csound in the PD/SC/sample render paths -
+    // and the parts mix down into one file. Frozen tracks join as their rendered WAV.
+    {
+        g_exportOff = ExportOffline{};
+        g_exportOff.active = true;
+        g_exportOff.format = format;
+        g_exportOff.wavFormat = format >= 3 ? 2 : format;
+        g_exportOff.rate = std::max(8000, g_proj.cs.sr);
+        double hi = 0.0;
+        for (const Track& t : g_proj.tracks) {
+            if (t.kind == 1) continue;
+            for (const Clip& c : t.clips) hi = std::max(hi, c.start + c.dur);
+            for (const MidiClip& mc : t.midiClips) hi = std::max(hi, mc.start + mc.dur);
+            for (const auto& lane : t.automation)
+                for (const AutoPoint& ap : lane.second) hi = std::max(hi, ap.t);
+            // A locked track's sound runs to the end of its rendered WAV: the mix must not stop
+            // before the tail does (the offline file used to cut off mid-decay, shorter than the
+            // real-time capture of the same project).
+            if (trackFrozen(t)) hi = std::max(hi, t.freezeEnd);
+        }
+        g_exportOff.t0 = std::max(0.0, g_proj.cs.exportStart);
+        const double autoEnd = hi + std::max(0.0, g_proj.cs.tail) + 1.0;
+        g_exportOff.t1 = g_proj.cs.exportEnd > g_exportOff.t0 ? std::min(g_proj.cs.exportEnd, autoEnd) : autoEnd;
+        if (g_exportOff.t1 <= g_exportOff.t0) {
+            g_exportError = "The export range is empty (End must be greater than Start).";
+            logLine("[caw] " + g_exportError);
+            g_exportOff.active = false;
+            return;
+        }
+        logLine("[caw] Offline export range: " + std::to_string(g_exportOff.t0) + " s to " + std::to_string(g_exportOff.t1) + " s.");
+        g_exportOff.finalPath = renderFilePath().string();
+        g_exportOff.asReal = g_proj.cs.exportSource == 1;
+        g_exportOff.splitExport = g_proj.cs.exportSplit;
+        g_exportOff.partCh = g_exportOff.asReal ? masterChannels(g_proj.cs) : 2;   // as real routing renders the parts at the whole virtual bus width
+        g_renderPath = g_exportOff.finalPath;
+        std::error_code ec2;
+        g_renderWillOverwrite = std::filesystem::exists(g_exportOff.finalPath, ec2);
+        const auto stamp2 = std::chrono::steady_clock::now().time_since_epoch().count();
+        const std::filesystem::path dir2 = std::filesystem::path(g_exportOff.finalPath).parent_path();
+        const std::string stem2 = ".caw_export_" + std::to_string(stamp2);
+        g_exportOff.tempWav = (dir2 / (stem2 + ".wav")).string();
+        g_renderTemp = g_exportOff.tempWav;
+        g_renderEncodedTemp = format >= 3 ? (dir2 / (stem2 + renderExtension(format))).string() : std::string();
+        g_activeRenderFormat = format;
+        g_activeFlacBits = g_proj.cs.exportFlacBits;
+        g_activeMp3Kbps = g_proj.cs.exportMp3Kbps;
+        g_renderConverting = false;
+        for (size_t i = 0; i < g_proj.tracks.size(); ++i) {
+            const Track& t = g_proj.tracks[i];
+            // Solo/mute are part of the mix the user hears, so the export applies the same rule:
+            // a muted track never exports, and while any track is soloed only soloed ones do.
+            if (t.muted || t.kind == 1 || t.kind == 2) continue;
+            bool anySolo = false;
+            for (const Track& o : g_proj.tracks) if (o.solo && !o.muted) anySolo = true;
+            if (anySolo && !t.solo) continue;
+            const bool hasContent = trackFrozen(t) || !t.clips.empty() || !t.midiClips.empty();
+            if (!hasContent) continue;
+            double tlo = 1e300, thi = 0.0;   // outside the export range: skip the pass entirely
+            if (trackFrozen(t)) { tlo = t.freezeStart; thi = t.freezeEnd; }
+            else {
+                for (const Clip& c : t.clips) { tlo = std::min(tlo, c.start); thi = std::max(thi, c.start + c.dur); }
+                for (const MidiClip& mc : t.midiClips) { tlo = std::min(tlo, mc.start); thi = std::max(thi, mc.start + mc.dur); }
+            }
+            if (thi <= g_exportOff.t0 || tlo >= g_exportOff.t1) continue;
+            g_exportOff.pending.push_back((int)i);
+        }
+        {   // A rack in FX-only mode SILENCES its sources' own sound in the live mix: only the processed
+            // signal is heard. The export must do the same - a source (locked or not) that also joined
+            // the mix as its own part would sound dry on top of the effect, a sound the live mix never has.
+            std::vector<int> drop;
+            for (int ri : g_exportOff.pending) {
+                const Track& rk = g_proj.tracks[(size_t)ri];
+                if (rk.kind != 4 || rk.vstOutMode != 0 || rk.vstPath.empty()) continue;
+                for (int si : freezeVsteSources(ri)) drop.push_back(si);
+            }
+            for (int si : drop) {
+                auto it = std::find(g_exportOff.pending.begin(), g_exportOff.pending.end(), si);
+                if (it != g_exportOff.pending.end()) {
+                    logLine("[caw] Export: \"" + g_proj.tracks[(size_t)si].name + "\" only sounds through its FX-only rack, so it does not export on its own.");
+                    g_exportOff.pending.erase(it);
+                }
+            }
+        }
+        g_exportOff.startedAt = std::chrono::steady_clock::now();
+        g_renderActive = true;
+        diagClearAll();
+        logLine("[caw] Offline export: " + std::to_string(g_exportOff.pending.size()) +
+                " track(s) render one by one through their own engines, then the parts mix into " + g_exportOff.finalPath);
+        exportNextTrack();
+        return;
+    }
     diagClearAll();
     if (g_playing) stopPlayback();
     const std::string csdPath = (workDir() / "caw_render.csd").string();
@@ -1890,10 +2651,11 @@ void startRenderNow() {
     vstui::captureAllParameters(g_proj);   // the export renders exactly what the plugin GUIs show
     g_offlineProc.setVstJobs(g_langVst ? collectVstJobs(g_proj, {}) : std::vector<VstJob>{});   // VST unchecked: not loaded in the render either
     g_offlineProc.setControlChannels(vstGateValues());   // the source gates for the render too
+    g_offlineProc.setOfflineSampleStreams(collectOfflineSampleStreams(g_proj));   // the locked sources' WAV voices feed the render's VSTe inputs
     const int wavFormat = format >= 3 ? 2 : format;
     if (!g_offlineProc.startOffline(csdPath, g_proj.cs.sr, masterChannels(g_proj.cs),
                                     (float)g_proj.cs.zdbfs, g_proj.cs.masterGain,
-                                    wavFormat, g_renderTemp, error, channels)) {
+                                    wavFormat, g_renderTemp, error, channels)) {   // channels = the exported width: as virtual = the Channels combo, as real routing = the virtual bus, Convert folds to mono/stereo/quadro
         g_exportError = "Audio export failed: " + error;
         logLine("[caw] " + g_exportError);
         cleanupRenderTemps();
@@ -1908,11 +2670,8 @@ void startRender() {
     std::error_code ec;
     g_renderWillOverwrite = std::filesystem::exists(renderFilePath(), ec);
     if (ec) { g_exportError = "Could not check output: " + ec.message(); logLine("[caw] " + g_exportError); return; }
-    g_renderWarnVst = false;
-    for (const Track& track : g_proj.tracks)
-        if ((track.kind == 3 || track.kind == 4) && !track.muted && !track.vstPath.empty())
-            g_renderWarnVst = true;
-    if (g_renderWillOverwrite || g_renderWarnVst) g_confirmRenderOverwrite = true;
+    g_renderWarnVst = false;   // the VST parameter-warning popup is gone (user request): exporting starts directly
+    if (g_renderWillOverwrite) g_confirmRenderOverwrite = true;
     else startRenderNow();
 }
 #include "app.h"
@@ -1920,6 +2679,13 @@ void cancelRender() {
     g_offlineProc.stop();
     g_codecProc.stop();
     g_renderProc.stop();
+    exportRtCancel();
+    if (g_exportOff.active) {
+        g_exportOff.pending.clear();
+        g_exportOff.active = false;
+        logLine("[caw] Offline export cancelled.");
+    }
+    if (freezeActive()) freezeCancel();   // a per-track part pass may be mid-flight
     for (const std::string& l : g_offlineProc.takeOutput()) logLine(l);
     for (const std::string& l : g_renderProc.takeOutput()) logLine(l);
     g_renderActive = false;
@@ -1950,6 +2716,7 @@ bool startFallbackEncoder() {
 }
 #include "app.h"
 void tickAutosave(float dt) {
+    if (freezeActive()) { g_autoSaveElapsed = 0.f; return; }   // a freeze render mutates mute / solo temporarily: autosave skips it
     if (!g_proj.cs.autosaveEnabled) { g_autoSaveElapsed = 0.f; return; }
     g_autoSaveElapsed += std::max(0.f, dt);
     const int minutes = std::min(120, std::max(1, g_proj.cs.autosaveMinutes));
@@ -2049,7 +2816,7 @@ cawaudio::VoiceSpec audioClipVoiceSpec(const Clip& c, int trackId, double from, 
         cawaudio::sampleCodeVisuals(c.code, rC, gC, revC, normC);
         spec.normalize = normC;   // the code's normalize = 1: the engine scales the file to full level
     }
-    spec.gain0 = c.audioGain * (double)std::max(0.f, std::min(2.f, trackVolume));   // the track volume slider
+    spec.gain0 = c.audioGain * (double)std::max(0.f, std::min(kMaxVolumeGain, trackVolume));   // the track volume slider
     for (const AutoPoint& p : c.audioGainPts) spec.gainPts.push_back({p.t, (float)p.v});
     spec.t0 = std::max(from, c.start) + engineOutputLatency();   // the sound meets the playhead (skip the latency into the clip)
     spec.skip = std::max(0.0, std::max(from, c.start) - c.start) * spec.rate;   // source seconds the playhead is already into the clip
@@ -2097,6 +2864,8 @@ void ensureSampleOutput() {
         output->setExpectingAudio(false);
         g_sampleCapture = std::move(capture);
         g_sampleOutput = std::move(output);
+        if (g_sampleOutput->actualRate() != settings.sampleRate)
+            logLine("[caw] WARNING: the output device runs at " + std::to_string(g_sampleOutput->actualRate()) + " Hz but the project is " + std::to_string(settings.sampleRate) + " Hz - sounds play at the wrong speed/pitch. Set the project sample rate to the device rate in Settings > Audio.");
         logLine("[caw] Sample engine: playing through " + g_sampleOutput->description());
     } else {
         logLine("[caw] Sample output: " + error + " - the samples stay silent until an output opens.");
@@ -2131,8 +2900,13 @@ void applySampleClip(Clip& c, int trackId) {
     if (inWindow) {
         cawaudio::engine().setClipVoice(audioClipVoiceSpec(c, trackId, g_play, trackVolumeOf(trackId)));
         g_audioVoiceSig[c.id] = audioClipSignature(c, trackVolumeOf(trackId));
-    } else if (!g_timelineRun) {
-        if (!g_sampleEngineOn) { playNotice("Press DSP first, then Run clip to audition.", "Sample engine is off"); return; }
+    } else if (!g_sampleEngineOn) {
+        // DSP OFF: Run plays the clip once for its duration - the sample engine is started here
+        // (the same way the freeze dialog turns it on). DSP ON: Run is an APPLY button only - no
+        // audition with the transport stopped; the playing window above restarts with the new code.
+        g_sampleEngineOn = true;
+        ensureSampleOutput();
+        logLine("[caw] The sample engine was off - it is running now; the clip is auditioned once.");
         cawaudio::VoiceSpec spec;
         spec.kind = 2;   // manual audition: not managed by the timeline windows
         spec.trackId = trackId;
@@ -2160,19 +2934,36 @@ void applySampleClip(Clip& c, int trackId) {
     logLine("[caw] Sample clip applied: " + c.name);
 }
 #include "app.h"
+// The rate the soundcard REALLY runs at (a device may ignore the requested project rate): the
+// sample engine's voices must advance at the device's pace no matter which CAW stream carries
+// them - the SuperCollider engine's pump and the sample render live in the same callback.
+int activeStreamRate(int fallback) {
+    if (g_scSoloOutput && g_scSoloOutput->actualRate() > 0) return g_scSoloOutput->actualRate();
+    if (g_sampleOutput && g_sampleOutput->actualRate() > 0) return g_sampleOutput->actualRate();
+    if (g_vstSoloOutput && g_vstSoloOutput->actualRate() > 0) return g_vstSoloOutput->actualRate();
+    return fallback;
+}
 void scheduleAudioTimeline(double from, bool restart) {
     cawaudio::Engine& eng = cawaudio::engine();
-    eng.setSr(g_proj.cs.sr);
-    if (!g_timelineRun || !g_sampleEngineOn) { eng.clearAll(); g_audioVoiceSig.clear(); g_audioLastFrom = from; return; }
+    eng.setSr(activeStreamRate(g_proj.cs.sr));
+    if (!g_timelineRun) { eng.clearAll(); g_audioVoiceSig.clear(); g_audioLastFrom = from; return; }
+    // Frozen (LKD) tracks play their rendered WAV through the sample engine EVEN when the sample
+    // DSP is off: the WAV is just a stream, not a sample clip - a project without any sample track
+    // never turns the sample engine on, and the frozen WAV still has to play.
+    bool anyFrozen = false;
+    for (const Track& t : g_proj.tracks)
+        if (trackFrozen(t) && !trackHiddenByFolder(t)) { anyFrozen = true; break; }
+    if (!g_sampleEngineOn && !anyFrozen) { eng.clearAll(); g_audioVoiceSig.clear(); g_audioLastFrom = from; return; }
     if (restart) { eng.clearAll(); g_audioVoiceSig.clear(); g_audioLastFrom = from; }
     bool anySolo = false;
     for (const Track& t : g_proj.tracks) if (t.solo && !t.muted) anySolo = true;
     std::set<int> want;
-    for (size_t ti = 0; ti < g_proj.tracks.size(); ++ti) {
+    const bool sampleDsp = g_sampleEngineOn;
+    for (size_t ti = 0; ti < g_proj.tracks.size() && sampleDsp; ++ti) {
         const Track& t = g_proj.tracks[ti];
         if (t.kind != 7 || trackHiddenByFolder(t)) continue;
-        const bool audible = !t.muted && !(anySolo && !t.solo);
-        eng.setTrackGain(t.id, trackVolumeAutomation(t, from));   // the volume lane is live (0 = silent)
+        const bool audible = !t.muted && !(anySolo && !t.solo) && !trackFrozen(t);   // frozen kind 7: the frozen WAV plays instead (loop below)
+        if (!trackFrozen(t)) eng.setTrackGain(t.id, trackVolumeAutomation(t, from));   // the volume lane is live (0 = silent); frozen: it is baked into the WAV
         for (const Clip& c : t.clips) {
             if (c.muted || c.audioFile.empty() || c.audioSegs.empty()) continue;
             const bool inWindow = c.start <= from + 1e-9 && from < c.start + c.dur;
@@ -2186,15 +2977,49 @@ void scheduleAudioTimeline(double from, bool restart) {
             }
         }
     }
+    // frozen tracks: ONE virtual clip per frozen track plays its rendered WAV (the live engines
+    // skip the track everywhere else). The track volume slider is carried live (the signature
+    // includes it, a fader move rebuilds the voice); the "volume" automation lane is already
+    // baked into the WAV, so setTrackGain is deliberately NOT called here.
+    for (const Track& t : g_proj.tracks) {
+        if (!trackFrozen(t) || trackHiddenByFolder(t)) continue;
+        const bool audible = !t.muted && !(anySolo && !t.solo);
+        const int vid = freezeClipId(t.id);
+        const bool inWindow = t.freezeStart <= from + 1e-9 && from < t.freezeEnd;
+        if (!audible || !inWindow) continue;
+        want.insert(vid);
+        Clip fc;                                      // a throwaway clip shape: only the audio fields matter
+        fc.id = vid;
+        fc.start = t.freezeStart;
+        fc.dur = std::max(0.01, t.freezeEnd - t.freezeStart);
+        fc.audioFile = t.freezePath;
+        fc.audioSegs = {{0.0, fc.dur}};
+        fc.audioRate = 1.f;
+        fc.audioGain = 1.f;
+        const unsigned long long sig = audioClipSignature(fc, t.volume);
+        if (g_audioVoiceSig.count(vid) == 0 || g_audioVoiceSig[vid] != sig) {
+            const cawaudio::VoiceSpec fs = audioClipVoiceSpec(fc, t.id, from, t.volume);
+            eng.setClipVoice(fs);
+            g_audioVoiceSig[vid] = sig;
+            const cawaudio::AudioHandle fd = fs.data;
+            char b[3][32];
+            std::snprintf(b[0], sizeof b[0], "%.3f", fs.t0);
+            std::snprintf(b[1], sizeof b[1], "%.3f", fs.skip);
+            std::snprintf(b[2], sizeof b[2], "%.3f", (double)g_proj.cs.sr);
+            logLine("[caw] Freeze play '" + t.name + "': voice built t0=" + b[0] + " skip=" + b[1] +
+                    " dur=" + std::to_string(fc.dur) + " fileCh=" + std::to_string(fd ? fd->channels : -1) +
+                    " fileSr=" + (fd ? std::to_string(fd->sr) : "?") + " engSr=" + b[2]);
+        }
+    }
     for (auto it = g_audioVoiceSig.begin(); it != g_audioVoiceSig.end();)
         if (want.count(it->first)) ++it; else { eng.killManaged(it->first); it = g_audioVoiceSig.erase(it); }
 
     // sampler notes: the notes of the MIDI lane trigger the clip like a sample
     const double lookahead = engineOutputLatency() + 0.06;
-    for (size_t ti = 0; ti < g_proj.tracks.size(); ++ti) {
+    for (size_t ti = 0; ti < g_proj.tracks.size() && sampleDsp; ++ti) {
         const Track& t = g_proj.tracks[ti];
         if (t.kind != 7 || trackHiddenByFolder(t) || t.midiClips.empty()) continue;
-        const bool audible = !t.muted && !(anySolo && !t.solo);
+        const bool audible = !t.muted && !(anySolo && !t.solo) && !trackFrozen(t);
         if (!audible) continue;
         for (const MidiClip& mc : t.midiClips) {
             if (mc.muted) continue;
@@ -2310,6 +3135,24 @@ void mixedPdTransport(bool playing) {
         g_apiProc.pdTransport(playing,g_play,g_proj.loopStart,g_proj.loopEnd,timeline_loop::valid(g_proj),g_proj.cs.sr,g_cmdSerial);
 }
 #include "app.h"
+#include "track_gain.h"
+// The track fader x volume lane (the same rule as the sample engine) pushed to the engines whose audio CAW
+// does not mix as samples: live Csound (cawvol_<trackId> channels), PD (Sink::tick) and SuperCollider (per
+// slot). Frozen tracks play their WAV through the sample engine, so they are left at unity here.
+void pushEngineTrackGains(double time, bool force) {
+    std::vector<std::pair<std::string, double>> csVol;
+    for (const Track& t : g_proj.tracks) {
+        if (t.kind != 0 && t.kind != 5 && t.kind != 6) continue;
+        const float g = trackFrozen(t) ? 1.f : std::max(0.f, std::min(kMaxVolumeGain, t.volume)) * trackVolumeAutomation(t, time);
+        if (t.kind == 0) csVol.push_back({"cawvol_" + std::to_string(t.id), (double)g});
+        else if (t.kind == 6) trackGains().set(t.id, g);
+        else { const int slot = scTrackSlot(t.id); if (slot >= 0) g_scEngine.setSlotGain(slot, g); }
+    }
+    static std::vector<std::pair<std::string, double>> lastCs;
+    if (force) lastCs.clear();   // a (re)start: the engine may be a new Csound instance
+    if (g_liveCsound && g_useCsoundApi && csVol != lastCs) { g_apiProc.setControlChannels(csVol); lastCs = csVol; }
+    if (!g_liveCsound) lastCs.clear();
+}
 void tickTimeline(float dt) {
     if (g_drag == Drag::Playhead) { g_resync = 1; return; }  // wait until the playhead is released
     if (timeline_loop::valid(g_proj) && (g_play < g_proj.loopStart || g_play >= g_proj.loopEnd)) {
@@ -2342,6 +3185,7 @@ void tickTimeline(float dt) {
         scheduleAudioTimeline(g_play, true);
         if (audioOnly) audioClockSync(g_play);
         mixedPdTransport(true);
+        pushEngineTrackGains(g_play, true);
         g_sig = timelineSignature(g_proj);
         g_scTimelineSig = scTimelineSignature(g_proj);
         g_sigT = 0.0; g_scPlanT = 0.0;
@@ -2366,8 +3210,30 @@ void tickTimeline(float dt) {
         if (g_vstEngineOn) vstSolo().followClock(g_play);   // stay in time with the Csound / SC transport
     }
     scheduleAudioTimeline(g_play, false);   // sample voices follow the windows (and trigger sampler notes)
+    pushEngineTrackGains(g_play);   // the fader x volume lane of live Csound / PD / SuperCollider tracks
     ensureSampleOutput();   // the sample engine keeps an output stream open whenever nothing else owns the card
     pollScAutomation();   // SuperCollider lanes follow the playhead (~cawget in the language)
+    {   // play diagnostics (once a second while playing): engine states + who is actually loud
+        static double s_diagT = 0.0;
+        s_diagT += dt;
+        if (g_timelineRun && s_diagT >= 1.0) {
+            s_diagT = 0.0;
+            int devRate = 0;
+            if (g_scSoloOutput) devRate = g_scSoloOutput->actualRate();
+            else if (g_sampleOutput) devRate = g_sampleOutput->actualRate();
+            else if (g_vstSoloOutput) devRate = g_vstSoloOutput->actualRate();
+            char b[2][32];
+            std::snprintf(b[0], sizeof b[0], "%.4f", g_diagScRms.load(std::memory_order_relaxed));
+            std::snprintf(b[1], sizeof b[1], "%.4f", g_diagCawRms.load(std::memory_order_relaxed));
+            int frozenVoices = 0;
+            for (const auto& kv : g_audioVoiceSig) if (kv.first <= -1000000) ++frozenVoices;
+            logLine("[caw] Play diag: sc=" + std::to_string(g_scEngineOn) + "/" + std::to_string(g_scReady) +
+                    " sample=" + std::to_string(g_sampleEngineOn) + " vst=" + std::to_string(g_vstEngineOn) +
+                    " csound=" + std::to_string(engineIsUp() ? 1 : 0) + " frozenVoices=" + std::to_string(frozenVoices) +
+                    " devRate=" + std::to_string(devRate) + " projSr=" + std::to_string(g_proj.cs.sr) +
+                    " scMixRms=" + b[0] + " cawMixRms=" + b[1]);
+        }
+    }
     if (timeline_loop::valid(g_proj) && g_play >= g_proj.loopEnd) {
         g_play = timeline_loop::wrap(g_proj, g_play);
         // This host reissues transport commands at the boundary. It is not a
@@ -2377,6 +3243,7 @@ void tickTimeline(float dt) {
         scheduleAudioTimeline(g_play, true);
         if (audioOnly) audioClockSync(g_play);
         mixedPdTransport(true);
+        pushEngineTrackGains(g_play, true);
         g_sig = timelineSignature(g_proj);
         g_scTimelineSig = scTimelineSignature(g_proj);
         g_sigT = 0.0; g_scPlanT = 0.0;
@@ -2570,21 +3437,19 @@ void runClipNow(const Clip& clip) {
         else logLine("[caw] Could not send the clip to Csound.");
         return;
     }
-    diagClearClip(clip.name);
+    // DSP OFF: Run plays the clip. Start the DSP engine; pollProcesses fires the pending clip
+    // (whole duration, audible) as soon as the engine is up. Compile errors still appear in the
+    // console - the engine compiles the CSD on its way up.
     g_testProc.stop();
     g_test = TestRun();
-    g_test.name = clip.name;
-    const std::string csdPath = (workDir() / "caw_test.csd").string();
-    OrcSpan span;
-    const std::string csd = buildClipTestCsd(g_proj, clip, span);
-    g_orcSpans.assign(1, span);
-    if (!writeTextFile(csdPath, csd)) {
-        logLine("[caw] ERROR: could not write " + csdPath);
-        return;
+    g_csoundPendingClipId = clip.id;
+    g_csoundPendingAt = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (g_liveCsound) {
+        playNotice("The DSP is starting. The clip plays when the engine is ready.", "DSP is starting");
+    } else {
+        logLine("[caw] Run clip " + clip.name + ": the DSP is off - starting it; the clip plays when the engine is up.");
+        startEngine();
     }
-    logLine("[caw] Run clip " + clip.name + " (this clip alone, no audio)...");
-    if (!g_testProc.start("\"" + csoundExePath() + "\" \"" + csdPath + "\"", false))
-        logLine("[caw] ERROR: " + g_testProc.lastError());
 }
 #include "app.h"
 void stopClipRun(const Clip& clip) {
@@ -2645,15 +3510,20 @@ void applyScClip(const Clip& clip) {
     // Apply = the code becomes what the timeline (and any relaunch) uses from now on.
     g_scTimelineCode[clip.id] = clip.code;
     const bool inWindow = g_timelineRun && clip.start <= g_play + 1e-9 && g_play < clip.start + clip.dur;
-    const bool running = scClipRunning(clip.id);
-    if (inWindow) {
-        if (running) stopScClip(clip.id);
-        launchScClip(clip, clip.start + clip.dur - g_play);   // re-evaluate for the remaining window
-    } else if (!g_timelineRun) {
-        if (running) stopScClip(clip.id);   // a fresh audition with the new code
-        launchScClip(clip);
-        g_scManualRuns[clip.id] = std::chrono::steady_clock::now() +
-            std::chrono::milliseconds((long long)(clip.dur * 1000.0 + 500.0));   // the button shows it (manual audition)
+    // DSP OFF: Run plays the clip (it boots the SuperCollider engine and waits for it - launchScClip
+    // handles the pending start). DSP ON: Run is an APPLY button only - the timeline re-evaluates a
+    // playing window from the new code snapshot; nothing is auditioned, with the transport running
+    // or stopped.
+    if (!g_scReady && !g_scEngineOn) {
+        if (!(g_timelineRun && inWindow)) {   // the timeline is already sounding this window: applying is enough
+            if (scClipRunning(clip.id)) stopScClip(clip.id);   // a fresh audition with the new code
+            launchScClip(clip);
+            g_scManualRuns[clip.id] = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds((long long)(clip.dur * 1000.0 + 500.0));   // the button shows it (manual audition)
+        }
+    } else if (g_timelineRun && inWindow && scClipRunning(clip.id)) {
+        stopScClip(clip.id);
+        launchScClip(clip, clip.start + clip.dur - g_play);   // apply live: re-evaluate for the remaining window
     }
     g_clipCodeDirty.erase(clip.id);
 }
@@ -2666,8 +3536,12 @@ bool applyClipCodeNow(const Clip& clip, const Track& lane) {
     }
     if (lane.kind == 3 || lane.kind == 4) {   // SEPARATED: the VST engine interprets the edited clip code in C++
         if (g_vstEngineOn) { vstSolo().setScripts(buildVstScripts()); logLine("[caw] live code: the VST engine is using the edited clip code."); g_clipCodeDirty.erase(clip.id); return true; }
-        logLine("[caw] Enable the VST engine to apply this clip's code.");
-        return false;
+        // DSP OFF: Run starts the VST engine - it loads with the edited code (the jobs read the
+        // current clip text at start), so the clip sounds through Play / its MIDI notes.
+        logLine("[caw] The VST engine was off - it is starting with the edited clip code.");
+        g_clipCodeDirty.erase(clip.id);
+        startVstEngine();
+        return true;
     }
     // Csound: push the new instrument into the running engine (and restart the clip at the playhead).
     if (engineIsUp()) { applyLiveClipCode(clip, lane); g_clipCodeDirty.erase(clip.id); return true; }
@@ -2731,6 +3605,17 @@ void pollProcesses(float dt) {
     // the same session - Csound's plugins then got libpd's copies, or found no dependencies at all.
     static bool sharedOnce = false;
     if (!sharedOnce) { sharedOnce = true; shareEngineDlls(); }
+    if (g_csoundPendingClipId > 0) {   // a Run pressed while the DSP was off: play the clip once the engine is up
+        if (engineIsUp()) {
+            const int pending = g_csoundPendingClipId;
+            g_csoundPendingClipId = 0;
+            if (Clip* clip = findClip(pending)) runClipNow(*clip);
+            else logLine("[caw] The pending Run clip no longer exists.");
+        } else if (std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - g_csoundPendingAt > 20.0) {
+            g_csoundPendingClipId = 0;
+            logLine("[caw] The DSP did not come up - the pending Run clip was cancelled (see the engine log above).");
+        }
+    }
     pollScEngine(dt);
     drainPdControlOutputs();
     pollCawHub();   // deliver caws/cawr hub changes to the SuperCollider language
@@ -2888,7 +3773,151 @@ void pollProcesses(float dt) {
         g_renderActive = false;
         cleanupRenderTemps();
     };
-    if (g_offlineProc.active()) {
+    // ---- real-time whole-project export (Render mode = real-time): the transport rolls, the
+    // callback copies the final master mix; when the playhead passes the end the capture drains,
+    // the WAV closes and the encode/finish machinery below takes over.
+    if (g_renderActive && g_exportRt.phase == 4) {   // arming: wait for the started engines + the soundcard
+        const bool csoundUp = !g_langCsound || engineIsUp();
+        const bool scUp = !g_langSc || g_scReady;
+        const bool vstUp = !g_langVst || g_vstEngineOn;
+        const bool streamUp = g_sampleOutput || g_scSoloOutput || g_vstSoloOutput || g_apiProc.active() || g_pdEngineOn;
+        const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_exportRt.startedAt).count();
+        if (waited > 25.0) {
+            g_exportError = "The real-time export could not start its engines in time - start them with DSP and try again.";
+            logLine("[caw] " + g_exportError);
+            exportRtCancel();
+            g_renderActive = false;
+            cleanupRenderTemps();
+        } else if (csoundUp && scUp && vstUp && streamUp) {
+            // The WAV opens NOW: the capture rate must be the device's ACTUAL rate (the sample
+            // engine follows it, round 159) - opening earlier could mismatch and pitch the file.
+            g_exportRt.rate = activeStreamRate(std::max(8000, g_proj.cs.sr));
+            std::string werr;
+            if (!g_exportRt.wav.open(g_exportRt.tmpPath, g_exportRt.rate, g_exportRt.ch, g_exportRt.wavFormat, werr)) {
+                g_exportError = "The real-time export could not create its WAV: " + werr;
+                logLine("[caw] " + g_exportError);
+                exportRtCancel();
+                g_renderActive = false;
+                cleanupRenderTemps();
+                return;
+            }
+            FreezeCaptureSink* sink = &g_exportRt.sink;
+            const int ch = g_exportRt.ch;
+            g_exportRt.writer = std::thread([sink, ch]() {
+                std::vector<float> block((size_t)2048 * (size_t)ch);
+                std::string werr;
+                for (;;) {
+                    if (sink->pop(block.data(), 2048, ch)) {
+                        if (sink == &g_exportRt.sink && !g_exportRt.wav.write(block.data(), 2048, 1.0, 1.f, werr))
+                            g_exportRt.writeFailed.store(1, std::memory_order_release);
+                        continue;
+                    }
+                    if (g_exportRt.stopWriter.load(std::memory_order_acquire)) {
+                        while (sink->pop(block.data(), 256, ch))
+                            if (sink == &g_exportRt.sink && !g_exportRt.wav.write(block.data(), 256, 1.0, 1.f, werr))
+                                g_exportRt.writeFailed.store(1, std::memory_order_release);
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            });
+            g_exportSink.store(sink, std::memory_order_release);
+            sink->active.store(true, std::memory_order_release);
+            g_exportRt.phase = 1;
+            g_exportRt.captureStartedAt = std::chrono::steady_clock::now();
+            g_exportRt.lastPlay = g_play;
+            g_proj.loopEnabled = false;
+            seekTimeline(g_exportRt.t0);
+            toggleTimelinePlay();
+            logLine("[caw] Real-time export: the engines are up - the transport rolls at " + std::to_string(g_exportRt.rate) + " Hz.");
+        }
+    }
+    if (g_renderActive && g_exportRt.phase == 1) {
+        const double sinceStart = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_exportRt.captureStartedAt).count();
+        if (g_exportRt.writeFailed.load(std::memory_order_acquire)) {
+            g_exportError = "The real-time export could not write its WAV (disk problem).";
+            logLine("[caw] " + g_exportError);
+            exportRtCancel();
+            g_renderActive = false;
+            cleanupRenderTemps();
+        } else if (!timelinePlaying() && g_play < g_exportRt.t0 + 0.5) {
+            // The transport refused to start (toggleTimelinePlay can answer with a notice instead
+            // of playing, e.g. shared engines still preparing). Wait briefly, then fail CLEARLY -
+            // silently finishing here produced empty exports.
+            if (sinceStart > 3.0) {
+                g_exportError = "The real-time export could not start the transport (see the notice in the log). Stop other playback and try again.";
+                logLine("[caw] " + g_exportError);
+                exportRtCancel();
+                g_renderActive = false;
+                cleanupRenderTemps();
+            }
+        } else if (!timelinePlaying() || g_play >= g_exportRt.t1 ||
+                   sinceStart > (g_exportRt.t1 - g_exportRt.t0) + 6.0) {
+            // Hard deadline: the capture can never take longer than its own span plus margin.
+            // A playhead that parks at the end (or any transport oddity) used to keep the export
+            // running forever - "the first try is stuck at the end". With the deadline it always
+            // finishes and keeps whatever was captured.
+            if (timelinePlaying()) toggleTimelinePlay();
+            g_exportRt.sink.quiesce();                       // the callback stops copying first
+            g_exportSink.store(nullptr, std::memory_order_release);
+            g_exportRt.phase = 2;
+            logLine("[caw] Real-time export: capture done at " + std::to_string(g_play) + " s, writing the file...");
+        } else {
+            // The transport rolls but the playhead must move: a stalled clock would otherwise
+            // keep the export running forever (the "pause forever" report).
+            if (std::fabs(g_play - g_exportRt.lastPlay) > 1e-9) {
+                g_exportRt.lastPlay = g_play;
+                g_exportRt.captureStartedAt = std::chrono::steady_clock::now();
+            } else if (sinceStart > 10.0) {
+                g_exportError = "The real-time export stopped: the playhead stopped advancing. Check the engines (DSP) and try again.";
+                logLine("[caw] " + g_exportError);
+                exportRtCancel();
+                g_renderActive = false;
+                cleanupRenderTemps();
+            }
+        }
+    }
+    if (g_renderActive && g_exportRt.phase == 2) {
+        if (g_exportRt.sink.queued() == 0) {
+            g_exportRt.stopWriter.store(true, std::memory_order_release);
+            if (g_exportRt.writer.joinable()) g_exportRt.writer.join();
+            std::string werr;
+            const bool ok = g_exportRt.wav.finish(werr);
+            g_play = g_exportRt.savedPlayhead;
+            g_proj.loopEnabled = g_exportRt.savedLoopEnabled;
+            g_proj.loopStart = g_exportRt.savedLoopStart;
+            g_proj.loopEnd = g_exportRt.savedLoopEnd;
+            g_exportRt.phase = 0;
+            if (g_exportRt.wav.dataBytes() == 0) {   // an empty capture must never "finish" as a silent file
+                g_exportError = "The real-time export captured nothing - the engines were up but no audio reached the capture. Check DSP / the engines and try again.";
+                logLine("[caw] " + g_exportError);
+                g_renderActive = false;
+                cleanupRenderTemps();
+            } else if (!ok || g_exportRt.writeFailed.load(std::memory_order_acquire)) {
+                g_exportError = "The real-time export WAV could not be written" + std::string(werr.empty() ? "." : ": " + werr);
+                logLine("[caw] " + g_exportError);
+                g_renderActive = false;
+                cleanupRenderTemps();
+            } else {
+                logLine("[caw] Real-time export finished in " + std::to_string((int)(std::chrono::duration<double>(std::chrono::steady_clock::now() - g_exportRt.startedAt).count() + 0.5)) + " s.");
+                if (g_activeRenderFormat >= 3) {
+                    g_renderConverting = true;
+                    logLine(g_activeRenderFormat == 3 ? "[caw] Encoding FLAC..." : "[caw] Encoding MP3...");
+                    // The bundled ffmpeg first (it is always there); the native Csound encoder only if it is missing.
+                    if (!startFallbackEncoder() &&
+                        !g_codecProc.start(g_renderTemp, g_renderEncodedTemp, csoundExePath(),
+                                           g_activeRenderFormat, g_activeFlacBits, g_activeMp3Kbps)) {
+                        g_exportError = "Audio encoder could not start.";
+                        logLine("[caw] " + g_exportError);
+                        g_renderActive = false; cleanupRenderTemps();
+                    }
+                } else finishExport(g_renderTemp);
+            }
+        }
+    }
+    // The generic export polling must stay out of the way while a freeze pass runs: the per-engine
+    // offline export drives its parts THROUGH the freeze machinery, which uses this same host.
+    if (g_renderActive && g_freeze.phase == 0 && g_exportRt.phase == 0 && g_offlineProc.active()) {
         for (const std::string& l : g_offlineProc.takeOutput()) logCsoundLine(l);
         if (g_offlineProc.finished()) {
             const int code = g_offlineProc.exitCode();
@@ -2901,9 +3930,10 @@ void pollProcesses(float dt) {
             } else if (g_activeRenderFormat >= 3) {
                 g_renderConverting = true;
                 logLine(g_activeRenderFormat == 3 ? "[caw] Encoding FLAC..." : "[caw] Encoding MP3...");
-                if (!g_codecProc.start(g_renderTemp, g_renderEncodedTemp, csoundExePath(),
-                                       g_activeRenderFormat, g_activeFlacBits, g_activeMp3Kbps) &&
-                    !startFallbackEncoder()) {
+                // The bundled ffmpeg first (it is always there); the native Csound encoder only if it is missing.
+                if (!startFallbackEncoder() &&
+                    !g_codecProc.start(g_renderTemp, g_renderEncodedTemp, csoundExePath(),
+                                       g_activeRenderFormat, g_activeFlacBits, g_activeMp3Kbps)) {
                     g_exportError = "Audio encoder could not start.";
                     logLine("[caw] " + g_exportError);
                     g_renderActive = false; cleanupRenderTemps();
@@ -3034,3 +4064,1553 @@ std::string audioVariableName(const Clip& clip, const AudioAsset& asset) {
     return name;
 }
 #include "app.h"
+
+// ---------------------------------------------------------------- TRACK FREEZE (Cubase-style lock)
+// State lives in track_freeze.h; the definitions live here as plain functions (declared in
+// app_internal.h, called from app.cpp / ui_timeline.cpp / tickAutosave). They must NOT be inline
+// in the header: MSVC discards an inline definition that its only including TU never calls.
+
+bool freezeActive() { return g_freeze.phase != 0; }
+
+bool freezeOffline() { return g_freeze.phase == 3; }
+
+float freezeProgress() {
+    if (g_freeze.phase == 2) return 1.f;
+    if (g_freeze.phase == 3) {   // the offline host gives no fraction: show an indeterminate sweep
+        const double t = std::fmod(ImGui::GetTime() * 0.55, 1.0);
+        return (float)(t < 0.5 ? t * 2.0 : (1.0 - t) * 2.0);
+    }
+    if (g_freeze.phase != 1 || g_freeze.t1 <= g_freeze.t0) return 0.f;
+    const double p = (g_play - g_freeze.t0) / (g_freeze.t1 - g_freeze.t0);
+    return (float)std::max(0.0, std::min(1.0, p));
+}
+
+const std::string& freezeTrackName() { return g_freeze.trackName; }
+
+const std::string& freezeError() { return g_freeze.error; }
+
+// Restores every mixer state the capture pass touched (mute / solo, loop, master FX, VSTe inputs,
+// the target track's volume slider). Called on every exit path - success, cancel and error.
+void freezeRestoreStates() {
+    if (g_freeze.trackIdx < 0 || g_freeze.trackIdx >= (int)g_proj.tracks.size()) return;
+    const size_t n = std::min(g_proj.tracks.size(), g_freeze.savedMuteSolo.size());
+    for (size_t i = 0; i < n; ++i) {
+        g_proj.tracks[i].muted = g_freeze.savedMuteSolo[i][0];
+        g_proj.tracks[i].solo = g_freeze.savedMuteSolo[i][1];
+    }
+    size_t v = 0;
+    for (Track& t : g_proj.tracks) {
+        if (t.kind != 4) continue;
+        if (v < g_freeze.savedVstInputs.size())
+            for (int s = 0; s < 8; ++s) t.vstInputs[s].on = g_freeze.savedVstInputs[v][s];
+        ++v;
+    }
+    g_proj.loopEnabled = g_freeze.savedLoopEnabled;
+    g_proj.loopStart = g_freeze.savedLoopStart;
+    g_proj.loopEnd = g_freeze.savedLoopEnd;
+    g_proj.tracks[(size_t)g_freeze.trackIdx].volume = g_freeze.savedVolume;
+    g_freezeSilent.store(false, std::memory_order_release);       // the render is over: the speakers come back
+    g_masterChainEnabled.store(g_freeze.savedMasterChain, std::memory_order_relaxed);
+    g_scRawSuppress.store(false, std::memory_order_release);      // the VSTe routing is back: the raw mix flows again
+    g_sampleRawSuppress.store(false, std::memory_order_release);
+    pushVstActiveLive();                                          // the same live refresh a mute / solo click does
+}
+
+// Stops the writer thread (it drains the ring first), closes the WAV and joins.
+// The OFFLINE pass has no writer thread and no sink: the main thread wrote the WAV directly -
+// the WAV must still be closed here (an open std::ofstream would make the rename into place fail
+// with a sharing violation, and the next pass's open() would hit an already-open stream).
+void freezeStopWriter(bool finishWav) {
+    g_freezeSink.store(nullptr, std::memory_order_release);       // the callback stops copying first
+    g_freeze.sink.quiesce();                                      // wait for any callback that already entered copy()
+    g_freeze.stopWriter.store(true, std::memory_order_release);
+    if (g_freeze.writer.joinable()) g_freeze.writer.join();       // the realtime capture: drain the ring, join the writer
+    std::string err;
+    if (finishWav) {
+        if (!g_freeze.wav.finish(err)) g_freeze.error = err;      // patches the header and closes the file
+    } else {
+        g_freeze.wav.close();                                     // the pass is discarded: just close the file
+    }
+}
+
+// The folder CAW saves its generated files in, one folder per kind ("lkd" = lock renders; every
+// kind gets its own folder inside exports/). Two storage choices (Settings > Files > File storage):
+//   "CAW folder (user directory)"  -> C:\Users\<name>\caw\exports\<kind> on Windows,
+//                                     ~/caw/exports/<kind> on macOS and Linux
+//   "Inside the project folder"    -> <project>/exports/<kind>  (moves with the project)
+// An unsaved project has no folder yet: it falls back to the CAW user folder.
+std::string cawExportDir(const char* kind) {
+    std::error_code ec;
+    std::filesystem::path base;
+    if (g_renderInProjectFolder && !g_projectPath.empty()) {
+        base = std::filesystem::u8path(g_projectPath).parent_path();
+    } else {
+        const char* homeEnv =
+#if defined(_WIN32)
+            std::getenv("USERPROFILE");
+#else
+            std::getenv("HOME");
+#endif
+        base = (homeEnv && *homeEnv) ? std::filesystem::u8path(homeEnv) : std::filesystem::temp_directory_path(ec);
+        base /= "caw";
+    }
+    const std::filesystem::path dir = base / "exports" / kind;
+    std::filesystem::create_directories(dir, ec);
+    return dir.u8string();
+}
+
+// The offline render carries the FROZEN tracks' sound through their rendered WAVs (the offline
+// host decodes them and feeds them as engine-4 sample-ring inputs - see setOfflineSampleStreams).
+// The live sample engine does not run offline, so these streams ARE the locked sources' voices.
+static std::map<int, CsoundApiRunner::OfflineSampleStream> collectOfflineSampleStreams(const Project& p) {
+    std::map<int, CsoundApiRunner::OfflineSampleStream> out;
+    for (const Track& tr : p.tracks)
+        if (trackFrozen(tr) && !tr.freezePath.empty())
+            out[tr.id] = { tr.freezePath, tr.freezeStart, std::max(0.f, std::min(kMaxVolumeGain, tr.volume)) };   // the fader rides on top; the volume lane is baked into the WAV
+    return out;
+}
+
+// The render-and-lock sequence: queue every UNFROZEN source that must be pre-rendered (Csound /
+// sample through their offline passes, SuperCollider real-time), then the rack bounce runs when
+// they are done (PD and VSTi sources render natively in the bounce - no freeze needed).
+static std::vector<int> g_freezeQueue;      // the source freezes still to run (track indexes)
+static int g_freezeVsteBounce = -1;         // the rack to bounce after the queue drains (-1 = none)
+
+
+// Mixes the finished parts into the export file and hands FLAC/MP3 to the encoders.
+static void exportOffMixdown() {
+    std::string err;
+    const long long total = (long long)std::llround((g_exportOff.t1 - g_exportOff.t0) * (double)g_exportOff.rate);
+    std::vector<float> mix((size_t)std::max(1LL, total) * 2, 0.f);
+    bool failed = false;
+    logLine("[caw] Export: mixing " + std::to_string(g_exportOff.parts.size()) + " part(s) into " + g_exportOff.finalPath + "...");
+    for (const ExportOffline::Part& p : g_exportOff.parts) {
+        const cawaudio::AudioHandle a = cawaudio::getAudio(p.path, g_exportOff.rate, g_proj.cs.ffmpegExe, err);
+        if (!a || a->samples.empty()) { logLine("[caw] Export: a rendered part could not be read (" + p.path + ")" + (err.empty() ? "." : ": " + err)); failed = true; continue; }
+        const int ch = std::max(1, a->channels);
+        const long long frames = (long long)(a->samples.size() / (size_t)ch);
+        long long off = (long long)std::llround((p.t0 - g_exportOff.t0) * (double)g_exportOff.rate);
+        long long srcSkip = 0;
+        if (off < 0) { srcSkip = -off; off = 0; }   // the part starts before the export range: skip its head
+        off = std::max(0LL, std::min(total, off));
+        for (long long f = 0; f + srcSkip < frames && off + f < total; ++f)
+            for (int c = 0; c < 2; ++c)
+                mix[(size_t)((off + f) * 2 + (size_t)c)] += a->samples[(size_t)((f + srcSkip) * (size_t)ch + (size_t)std::min(c, ch - 1))] * p.gain;
+    }
+    for (const ExportOffline::Part& p : g_exportOff.parts) { std::error_code ec; std::filesystem::remove(std::filesystem::u8path(p.path), ec); }
+    g_exportOff.parts.clear();
+    if (failed) { g_exportError = "The offline export failed: a part could not be read."; logLine("[caw] " + g_exportError); g_exportOff.active = false; g_renderActive = false; cleanupRenderTemps(); return; }
+    CawWavWriter wav;
+    if (!wav.open(g_exportOff.tempWav, g_exportOff.rate, 2, g_exportOff.wavFormat, err)) {
+        g_exportError = "The export WAV could not be created: " + err;
+        logLine("[caw] " + g_exportError);
+        g_exportOff.active = false; g_renderActive = false; cleanupRenderTemps();
+        return;
+    }
+    if (g_vstEngineOn) {   // the master FX chain (the FX button): the live mix runs through it before the master gain
+        masterfx::Rack& mrack = masterfx::rack();
+        bool anyOn = false;
+        for (const auto& sv : mrack.view()) if (sv.on && sv.loaded) anyOn = true;
+        if (anyOn) {
+            int stuck = 0;
+            for (long long f = 0; f < total && stuck < 3; f += 512) {
+                const int n = (int)std::min<long long>(512, total - f);
+                bool done = false;
+                for (int attempt = 0; attempt < 100 && !done; ++attempt) {   // render() skips a block when the UI holds the rack: retry
+                    done = mrack.render(mix.data() + (size_t)(f * 2), n, 2);
+                    if (!done) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                if (!done) ++stuck;
+            }
+            logLine(stuck < 3 ? "[caw] Export: the master FX chain was applied to the mix."
+                              : "[caw] Export: the master FX chain could not process the mix (it stayed busy) - exported without it.");
+        }
+    }
+    const long long chunk = 4800;
+    for (long long f = 0; f < total; f += chunk) {
+        const long long n = std::min(chunk, total - f);
+        if (!wav.write(mix.data() + (size_t)(f * 2), (size_t)n, 1.0, g_proj.cs.masterGain, err)) {
+            g_exportError = "The export WAV could not be written (disk problem).";
+            logLine("[caw] " + g_exportError);
+            g_exportOff.active = false; g_renderActive = false; cleanupRenderTemps();
+            return;
+        }
+    }
+    std::string werr;
+    if (!wav.finish(werr)) { g_exportError = "The export WAV could not be finished: " + werr; logLine("[caw] " + g_exportError); g_exportOff.active = false; g_renderActive = false; cleanupRenderTemps(); return; }
+    logLine("[caw] Offline export mixed " + std::to_string(g_exportOff.partSeq) + " engine part(s) in " +
+            std::to_string((int)(std::chrono::duration<double>(std::chrono::steady_clock::now() - g_exportOff.startedAt).count() + 0.5)) + " s.");
+    g_exportOff.active = false;
+    if (g_exportOff.format >= 3) {
+        g_renderConverting = true;
+        logLine(g_exportOff.format == 3 ? "[caw] Encoding FLAC..." : "[caw] Encoding MP3...");
+        // The bundled ffmpeg first (it is always there); the native Csound encoder only if it is missing.
+        if (!startFallbackEncoder() &&
+            !g_codecProc.start(g_renderTemp, g_renderEncodedTemp, csoundExePath(), g_exportOff.format, g_activeFlacBits, g_activeMp3Kbps)) {
+            g_exportError = "Audio encoder could not start.";
+            logLine("[caw] " + g_exportError);
+            g_renderActive = false; cleanupRenderTemps();
+        }
+    } else {
+        std::string error;
+        std::error_code ec;
+        const bool appeared = !g_renderWillOverwrite && std::filesystem::exists(g_renderPath, ec);
+        if (ec) { g_exportError = "Could not check the destination: " + ec.message(); logLine("[caw] Audio export failed: " + g_exportError); }
+        else if (appeared) { g_exportError = "The destination appeared during rendering; it was not replaced."; logLine("[caw] Audio export failed: " + g_exportError); }
+        else if (replaceOutputFile(g_renderTemp, g_renderPath, error)) logLine("[caw] Audio export finished: " + g_renderPath);
+        else if (!error.empty()) { g_exportError = error; logLine("[caw] Audio export failed: " + error); }
+        g_renderActive = false;
+        cleanupRenderTemps();
+    }
+}
+
+// Starts the next pending track's part (or the mixdown when the queue is empty).
+static void exportNextTrack() {
+    while (!g_exportOff.pending.empty()) {
+        const int idx = g_exportOff.pending.front();
+        g_exportOff.pending.erase(g_exportOff.pending.begin());
+        if (idx < 0 || idx >= (int)g_proj.tracks.size()) continue;
+        const Track& t = g_proj.tracks[(size_t)idx];
+        if (t.kind == 1 || t.kind == 2) continue;                          // marker / graph: no sound of their own
+        {   // Solo/mute are part of the mix (applied when the queue was built, and again here so a
+            // change during the export is respected at the pass level too).
+            bool anySolo = false;
+            for (const Track& o : g_proj.tracks) if (o.solo && !o.muted) anySolo = true;
+            if (t.muted || (anySolo && !t.solo)) continue;
+        }
+        if (trackFrozen(t)) {                                              // the frozen WAV IS the track's render
+            g_exportOff.parts.push_back({t.freezePath, t.freezeStart, std::max(0.f, std::min(kMaxVolumeGain, t.volume))});
+            logLine("[caw] Export: \"" + t.name + "\" joins as its frozen WAV.");
+            continue;
+        }
+        if (t.kind == 4) {                                                 // the VSTe rack: its sources' sound, processed
+            if (t.vstPath.empty()) { logLine("[caw] Export: the VSTe rack \"" + t.name + "\" has no plugin selected - skipped."); continue; }
+            if (t.vstOutMode != 0) { logLine("[caw] Export: the rack \"" + t.name + "\" is in FX+Source mode (the sources also sound on their own) - the offline export would bake them together. Switch it to FX only, or use the real-time mode."); continue; }
+            bool pdLib = !g_pdLibraryPath.empty();
+            if (!pdLib) g_pdLibraryPath = plat::bundledLibpd();
+            pdLib = !g_pdLibraryPath.empty();
+            const std::vector<int> sources = freezeVsteSources(idx);
+            if (sources.empty()) { logLine("[caw] Export: the rack \"" + t.name + "\" has no renderable sources - skipped."); continue; }
+            bool ok = true;
+            std::vector<int> purge;                                        // the sources' sound lives INSIDE the bounce
+            for (int si : sources) {
+                const Track& st = g_proj.tracks[(size_t)si];
+                if (trackFrozen(st)) {
+                    if (!g_langAudio) { ok = false; logLine("[caw] Export: the rack \"" + t.name + "\" needs Audio enabled (a rendered source feeds it). Skipped."); break; }
+                    continue;
+                }
+                if (st.kind == 3 && !st.vstPath.empty()) { purge.push_back(si); continue; }   // the bounce renders VSTi natively
+                if (st.kind == 6 && pdLib) { purge.push_back(si); continue; }                 // the bounce renders PD natively
+                ok = false;
+                logLine("[caw] Export: the rack \"" + t.name + "\" has a source (\"" + st.name + "\") the offline bounce cannot feed - freeze that source first (LKD) or use the real-time mode. The rack is skipped.");
+                break;
+            }
+            if (!ok) continue;
+            for (int si : purge)
+                for (size_t k = 0; k < g_exportOff.pending.size(); ++k)
+                    if (g_exportOff.pending[(size_t)k] == si) { g_exportOff.pending.erase(g_exportOff.pending.begin() + (long)k); break; }
+            g_exportBeginPending = true;
+            const bool bounced = freezeVsteBegin(idx);
+            g_exportBeginPending = false;
+            if (bounced) return;                                           // the bounce runs; the queue continues in phase 2
+            logLine("[caw] Export: the rack \"" + t.name + "\" could not render - skipped (see the message above).");
+            continue;
+        }
+        if (t.kind == 3 && t.vstPath.empty()) {
+            logLine("[caw] Export: the VSTi track \"" + t.name + "\" has no plugin selected - skipped.");
+            continue;
+        }
+        g_exportBeginPending = true;
+        const bool ok = freezeTrackBegin(idx);
+        g_exportBeginPending = false;
+        if (ok) return;                                                    // the pass runs; freezeTick continues the queue
+        logLine("[caw] Export: \"" + t.name + "\" could not render offline - skipped (see the freeze message above).");
+    }
+    if (g_exportOff.parts.empty()) {
+        g_exportError = "The offline export found no renderable tracks.";
+        logLine("[caw] " + g_exportError);
+        g_exportOff.active = false;
+        g_renderActive = false;
+        cleanupRenderTemps();
+        return;
+    }
+    exportOffMixdown();
+}
+
+// The pure C++ offline renders (rack_offline.h): the rack and PD clips render in CAW's own C++
+// hosts - no Csound in those render paths. Polled by freezeTick phase 3, stopped by freezeCancel.
+static cawcpp::RackCppRender g_cppRender;
+
+// The pure C++ offline SAMPLE freeze: the sample engine renders the track's clips (their granular
+// clip code included) and the MIDI lane's sampler notes, offline - faster than real time, no
+// Csound in the render path. While it runs the live streams' render is gated off (setOffline):
+// one clock drives the voices. The track's volume automation is sampled into a per-block gain
+// curve on the UI thread (the worker never touches the project); the fader stays live afterwards.
+static struct SampleCppRender {
+    std::atomic<bool> done{false}, stop{false};
+    std::atomic<int> code{-1};
+    std::mutex logMutex;
+    std::vector<std::string> log;
+    std::string error;
+    std::vector<cawaudio::VoiceSpec> clipVoices;                    // spawned up front (delay = time until the clip starts)
+    std::vector<std::pair<double, cawaudio::VoiceSpec>> noteVoices; // spawned on the render clock at their onset
+    int trackId = -1, rate = 48000;
+    std::string wavPath;
+    double seconds = 0.0;
+    std::vector<float> gainCurve;   // the track's volume automation, one value per render block
+
+    void say(const std::string& s) { std::lock_guard<std::mutex> l(logMutex); if (log.size() < 256) log.push_back(s); }
+    std::vector<std::string> takeLog() { std::lock_guard<std::mutex> l(logMutex); std::vector<std::string> out; log.swap(out); return out; }
+    void setError(const std::string& e) { std::lock_guard<std::mutex> l(logMutex); error = e; }
+    std::string takeError() { std::lock_guard<std::mutex> l(logMutex); std::string e; error.swap(e); return e; }
+    void finish(int c) { code.store(c, std::memory_order_release); done.store(true, std::memory_order_release); }
+
+    void start(std::vector<cawaudio::VoiceSpec> clips,
+               std::vector<std::pair<double, cawaudio::VoiceSpec>> notes,
+               int trackId_, int rate_, std::string path, double secs, std::vector<float> gains) {
+        clipVoices = std::move(clips);
+        noteVoices = std::move(notes);
+        std::sort(noteVoices.begin(), noteVoices.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        trackId = trackId_; rate = rate_ < 8000 ? 48000 : rate_; wavPath = std::move(path); seconds = secs; gainCurve = std::move(gains);
+        done.store(false, std::memory_order_release); stop.store(false, std::memory_order_release); code.store(-1, std::memory_order_release);
+        std::thread([this] { run(); }).detach();   // freezeTick polls done/code; freezeCancel sets stop
+    }
+
+    void run() {
+        auto& eng = cawaudio::engine();
+        eng.setSr(rate);
+        eng.setOffline(true);   // the live streams stop rendering the sample engine: one clock, no double drive
+        eng.clearAll();         // no stale voices from the last play
+        auto giveBack = [&]() { eng.setOffline(false); eng.clearAll(); };   // the live voices respawn on the next play
+        CawWavWriter wav;
+        std::string werr;
+        if (!wav.open(wavPath, rate, 2, 2, werr)) { setError(werr); say("[caw] Offline render: " + werr); giveBack(); finish(-1); return; }
+        for (const auto& v : clipVoices) eng.startVoice(v);
+        size_t noteIdx = 0;
+        const int block = 512;
+        const double blockDt = (double)block / (double)rate;
+        std::vector<float> buf((size_t)block * 2, 0.f);
+        unsigned long long frames = 0;
+        const unsigned long long cap = seconds > 0.0 ? (unsigned long long)(seconds * (double)rate) : 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            if (cap && frames >= cap) break;
+            const double tNow = (double)frames / (double)rate;
+            if (trackId >= 0) {
+                const size_t bi = (size_t)(frames / (unsigned long long)block);
+                if (bi < gainCurve.size()) eng.setTrackGain(trackId, gainCurve[bi]);   // the volume lane, live per block
+            }
+            while (noteIdx < noteVoices.size() && noteVoices[noteIdx].first < tNow + blockDt) {
+                cawaudio::VoiceSpec s = noteVoices[noteIdx].second;
+                s.t0 = noteVoices[noteIdx].first;   // the render clock IS the project clock: no output latency offline
+                s.delay = (long long)std::llround(std::max(0.0, noteVoices[noteIdx].first - tNow) * (double)rate);
+                eng.startVoice(s);
+                ++noteIdx;
+            }
+            std::fill(buf.begin(), buf.end(), 0.f);
+            eng.render(buf.data(), block, 2, true);   // force: the offline gate is for the live streams
+            if (!wav.write(buf.data(), (size_t)block, 1.0, 1.f, werr)) {
+                setError(werr); say("[caw] Offline render: " + werr); giveBack(); finish(-1); return;
+            }
+            frames += (unsigned long long)block;
+        }
+        giveBack();
+        if (stop.load(std::memory_order_relaxed)) {
+            wav.close();   // a discarded pass: the sizes stay unwritten
+            say("[caw] Offline render: cancelled at " + std::to_string((double)frames / (double)rate) + " s.");
+            finish(-1);
+            return;
+        }
+        std::string ferr;
+        if (!wav.finish(ferr)) { setError("the render WAV could not be finished: " + ferr); say("[caw] Offline render: " + ferr); finish(-1); return; }
+        say("[caw] Offline render: finished normally, " + std::to_string((double)frames / (double)rate) + " s rendered.");
+        finish(0);
+    }
+} g_smpRender;
+
+// The offline SuperCollider freeze: sclang captures every clip's OSC messages in virtual time
+// (the embedded CAWNrt class library), then scsynth -N renders the score faster than real time.
+// No Csound and no live SC engine in the render path. Polled by freezeTick phase 3 (scOffline).
+static scnrt::ScNrtRender g_scRender;
+
+// The SC NRT tools: sclang is required; scsynth.exe must sit next to it (the runtime ships it).
+// Non-static: the LKD button pre-gate asks the same question before freezeTrackBegin runs.
+bool scNrtAvailable() {
+    const std::string sclang = scLangExePath();
+    if (sclang.empty()) {
+        logLine("[caw] Freeze: no sclang.exe found - the offline SuperCollider render is unavailable.");
+        return false;
+    }
+    std::error_code ec;
+    const auto scsynth = std::filesystem::u8path(sclang).parent_path() / (plat::isWindows ? "scsynth.exe" : "scsynth");
+    if (!std::filesystem::is_regular_file(scsynth, ec) || ec) {
+        logLine("[caw] Freeze: no scsynth.exe next to \"" + sclang + "\" - the offline SuperCollider render is unavailable.");
+        return false;
+    }
+    return true;
+}
+
+void freezeWavPaths(const Track& t) {
+    const std::filesystem::path dir = cawExportDir("lkd");
+    if (g_renderInProjectFolder && g_projectPath.empty())
+        logLine("[caw] The project is not saved yet - the render goes to CAW's user folder (save the project to keep renders in project/exports/lkd).");
+    std::string safe;
+    for (char ch : t.name) {
+        const char c = (char)std::tolower((unsigned char)ch);
+        safe += ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') ? c : '_';
+    }
+    if (safe.empty()) safe = "track";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    g_freeze.finalPath = (dir / (safe + "_" + std::to_string(t.id) + ".wav")).u8string();
+    g_freeze.tmpPath = (dir / (safe + "_" + std::to_string(t.id) + "_rendering.wav")).u8string();
+}
+
+// The writer thread: pops the capture ring on its own (the audio callback never writes to disk).
+static void freezeStartWriter() {
+    g_freeze.sink.reset();
+    g_freeze.stopWriter.store(false, std::memory_order_release);
+    FreezeCaptureSink* sink = &g_freeze.sink;
+    g_freeze.writer = std::thread([sink]() {
+        std::vector<float> block(2048 * 2);
+        std::string werr;
+        for (;;) {   // the freeze WAV stays stereo: the sink's first two channels
+            if (sink->pop(block.data(), 2048, 2)) {
+                if (sink == &g_freeze.sink && !g_freeze.wav.write(block.data(), 2048, 1.0, 1.f, werr))
+                    g_freeze.writeFailed.store(1, std::memory_order_release);
+                continue;
+            }
+            if (g_freeze.stopWriter.load(std::memory_order_acquire)) {
+                while (sink->pop(block.data(), 256, 2))
+                    if (sink == &g_freeze.sink && !g_freeze.wav.write(block.data(), 256, 1.0, 1.f, werr))
+                        g_freeze.writeFailed.store(1, std::memory_order_release);
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    });
+    g_freezeSink.store(sink, std::memory_order_release);
+    sink->active.store(true, std::memory_order_release);
+}
+
+// Starts the freeze render of a track (the lock button). Returns false with a message when the
+// track cannot freeze right now (wrong kind, no clips, engines not running, a freeze already runs).
+bool freezeTrackBegin(int trackIdx) {
+    if (g_freeze.phase != 0) { logLine("[caw] A freeze is already running."); return false; }
+    if (trackIdx < 0 || trackIdx >= (int)g_proj.tracks.size()) return false;
+    Track& t = g_proj.tracks[(size_t)trackIdx];
+    if (!trackCanFreeze(t)) { logLine("[caw] This track kind cannot be frozen (marker, graph and VSTe tracks carry no instrument sound of their own)."); return false; }
+    if (trackFrozen(t)) { logLine("[caw] The track is already frozen."); return false; }
+    if (g_renderActive && !g_exportBeginPending) { logLine("[caw] Wait for the export to finish before freezing a track."); return false; }
+    double lo = 1e300, hi = 0.0;
+    for (const Clip& c : t.clips) { lo = std::min(lo, c.start); hi = std::max(hi, c.start + c.dur); }
+    for (const MidiClip& mc : t.midiClips) { lo = std::min(lo, mc.start); hi = std::max(hi, mc.start + mc.dur); }
+    if (hi <= lo) { logLine("[caw] The track has nothing to render (no clips)."); return false; }
+
+    // The engines must be up only for the REAL-TIME capture kinds (SC): the offline pass renders
+    // through its own silent Csound host at full CPU speed - no live engine needed. Sample / VST /
+    // PD tracks render offline even with those engines unchecked (the csound DLLs are only the
+    // host clock there; PD renders in CAW's C++ PD host mixer); a Csound track itself needs its
+    // language enabled, and if the csound DLLs are missing the prepare step falls back to the
+    // real-time capture below.
+    const bool pdLibAvailable = [&] { if (!g_pdLibraryPath.empty()) return true; g_pdLibraryPath = plat::bundledLibpd(); return !g_pdLibraryPath.empty(); }();
+    // Render mode (Settings > Audio): real-time capture skips the offline pipelines entirely -
+    // the transport plays once and the callback captures the track's raw mix, for every kind.
+    const bool wantOffline = g_proj.cs.renderMode != 1;
+    bool offlineCapable = false;
+    // g_renderActive normally blocks a freeze (an export owns the offline host) - but an export
+    // pass ITSELF (g_exportBeginPending) is the legitimate owner of the offline pipelines.
+    const bool renderFree = !g_renderActive || g_exportBeginPending;
+    if (wantOffline && renderFree) {
+        if (t.kind == 3 || t.kind == 7) offlineCapable = true;
+        else if (t.kind == 0) offlineCapable = g_langCsound;
+        else if (t.kind == 5) offlineCapable = scNrtAvailable();
+        else if (t.kind == 6) offlineCapable = pdLibAvailable;
+    }
+    bool engineMissing = false;
+    const char* what = "";
+    if (offlineCapable && t.kind == 3 && t.vstPath.empty()) { logLine("[caw] Freeze: the VSTi track has no plugin selected."); return false; }
+    if (!offlineCapable) {   // kind 5 falls back to real time only when the NRT tools are missing; then its SC engine must run
+        if (t.kind == 0 && !engineIsUp()) { engineMissing = true; what = "Run Csound (DSP)"; }
+        if (t.kind == 0 && engineIsUp() && !g_useCsoundApi) {   // the process-based csound fallback renders outside CAW: nothing to capture
+            logLine("[caw] Freeze needs CAW's Csound API engine (the external csound process mode cannot be frozen).");
+            return false;
+        }
+        if (t.kind == 3 && !g_vstEngineOn) { engineMissing = true; what = "Run VST"; }
+        if (t.kind == 5 && !g_scReady) { engineMissing = true; what = "Run SuperCollider"; }
+        if (t.kind == 6 && !g_pdEngineOn && !g_mixedPd) { engineMissing = true; what = "Run Pure Data (DSP)"; }
+        if (t.kind == 7 && !g_sampleEngineOn) { engineMissing = true; what = "Run Sample"; }
+        if (engineMissing) { logLine(std::string("[caw] Freeze needs its engine: press ") + what + " first, then freeze the track."); return false; }
+    }
+
+    g_freeze.resetForNewPass();
+    g_freeze.exportPass = g_exportBeginPending;   // an export-queue part: no lock at the end
+    g_freeze.phase = 1;
+    g_freeze.trackIdx = trackIdx;
+    g_freeze.trackId = t.id;
+    g_freeze.trackName = t.name;
+    g_freeze.t0 = std::max(0.0, lo);
+    g_freeze.t1 = hi + 2.0;                                       // tail: releases and reverb tails ring out
+    if (!g_freeze.exportPass) {
+        // An LKD replaces the live track: its release tail must survive, like the export's parts do
+        // (the fixed 2 s used to cut long plugin decays - the locked track sounded truncated while
+        // the export of the same track rang out).
+        g_freeze.t1 = hi + std::max(2.0, g_proj.cs.tail + 2.0);
+    }
+    if (g_freeze.exportPass) {   // the export range (Start/End) bounds this part exactly like the mix
+        g_freeze.t0 = std::max(g_freeze.t0, g_exportOff.t0);
+        // The part rings to the END OF THE MIX: a plugin's release tail keeps sounding while the
+        // transport rolls (the real-time capture hears it), so the offline part must render past
+        // its own last clip. The mixdown cuts anything past the export end.
+        g_freeze.t1 = std::max(g_freeze.t1, g_exportOff.t1 + 2.0);
+        if (g_freeze.t1 <= g_freeze.t0) {
+            logLine("[caw] Export: \"" + t.name + "\" lies outside the export range - skipped.");
+            return false;
+        }
+    }
+    g_freeze.rate = std::max(8000, g_proj.cs.sr);                 // the device always runs at the project rate
+
+    freezeWavPaths(t);
+    std::string err;
+    if (!g_freeze.wav.open(g_freeze.tmpPath, g_freeze.rate, 2, 2, err)) {   // float32 stereo
+        g_freeze.error = err;
+        g_freeze.phase = 0;
+        logLine("[caw] Freeze failed: " + err);
+        return false;
+    }
+
+    // Save every mixer state the pass touches, then set the pass up: only this track is audible,
+    // no loop wrap, no master FX, no VSTe routing, the volume slider at unity (it stays live).
+    for (const Track& tr : g_proj.tracks) g_freeze.savedMuteSolo.push_back({tr.muted, tr.solo});
+    for (const Track& tr : g_proj.tracks) if (tr.kind == 4) {
+        std::array<bool, 8> on{};
+        for (int s = 0; s < 8; ++s) on[(size_t)s] = tr.vstInputs[s].on;
+        g_freeze.savedVstInputs.push_back(on);
+    }
+    g_freeze.savedLoopEnabled = g_proj.loopEnabled;
+    g_freeze.savedLoopStart = g_proj.loopStart;
+    g_freeze.savedLoopEnd = g_proj.loopEnd;
+    g_freeze.savedMasterChain = g_masterChainEnabled.load(std::memory_order_relaxed);
+    g_freeze.savedVolume = t.volume;
+
+    if (timelinePlaying()) toggleTimelinePlay();                  // realtime pass: always plays from t0; offline pass: stay silent
+    for (Track& tr : g_proj.tracks) { tr.muted = true; tr.solo = false; }
+    t.muted = false;
+    t.solo = true;
+    t.volume = 1.f;
+    for (Track& tr : g_proj.tracks) if (tr.kind == 4) for (int s = 0; s < 8; ++s) tr.vstInputs[s].on = false;
+    g_proj.loopEnabled = false;
+    g_masterChainEnabled.store(false, std::memory_order_relaxed);
+    g_scRawSuppress.store(false, std::memory_order_release);
+    g_sampleRawSuppress.store(false, std::memory_order_release);
+    pushVstActiveLive();
+
+    if (offlineCapable) {
+        // OFFLINE PASS: build the render CSD from the current mixer state (only this track audible),
+        // render it through the offline Csound host (silent, full CPU speed) and slice the track's
+        // range into the freeze WAV afterwards. PD clips render in CAW's C++ PD host mixer inside
+        // the same host (frame-scheduled). Falls back to the real-time capture if the offline host
+        // is unavailable.
+        std::string error;
+        std::vector<pd_timeline::Event> pdPlan;
+        // Render ONLY the track that freezes: buildCsd derives the render length from every
+        // timeline event of the project, so one stray automation point far right stretches the
+        // offline WAV into silent hours until it hits the 4 GiB RIFF limit. A stripped copy keeps
+        // the target with its id (the CSD length follows the target's extent instead).
+        Project renderProj = g_proj;
+        {
+            std::vector<Track> keep;
+            for (const Track& tr : renderProj.tracks)
+                if (tr.id == t.id) keep.push_back(tr);
+            renderProj.tracks = std::move(keep);
+        }
+        // An export pass: mute/solo are already applied (the queue only holds audible tracks), so
+        // the render copy must carry them: solo on, mute off - otherwise a copy whose original is
+        // unsoloed under an active solo would silently drop its own clip code / lanes.
+        if (g_exportBeginPending && !renderProj.tracks.empty())
+            renderProj.tracks.front().solo = true, renderProj.tracks.front().muted = false;
+        {   // even the target track can carry a stray event far right: clamp the render length to
+            // the frozen range (+ tail) so the score stays near the freeze extent
+            double endT = 0.0;
+            for (const TimelineEvent& ev : timelineEvents(renderProj, 0.0)) endT = std::max(endT, ev.start + ev.dur);
+            const double cap = g_freeze.t1 + std::max(0.0, g_proj.cs.tail) + 0.5;
+            if (endT > cap) {
+                for (Track& tr : renderProj.tracks)
+                    for (auto& lane : tr.automation)
+                        for (AutoPoint& ap : lane.second)
+                            if (ap.t > cap) ap.t = cap;
+                logLine("[caw] Freeze: the project timeline stretches to " + std::to_string((int)endT) +
+                        " s (a stray event far right) - the offline render is capped at " +
+                        std::to_string((int)cap) + " s.");
+            }
+        }
+        g_freeze.csdPath = (workDir() / "caw_freeze.csd").string();
+        g_freeze.offlineWavPath = g_freeze.tmpPath + ".full.wav";
+        if (t.kind == 7) {
+            // PURE C++ SAMPLE FREEZE: the sample engine renders the track's clips (their granular
+            // clip code included) and the MIDI lane's sampler notes, offline - no Csound anywhere.
+            // The voices carry their project-clock t0 / delay, so one continuous render places
+            // every sound exactly where the timeline has it.
+            std::vector<cawaudio::VoiceSpec> clipVoices;
+            std::vector<std::pair<double, cawaudio::VoiceSpec>> noteVoices;
+            // The render runs from PROJECT TIME 0 (the finisher slices [t0, t1] out of the file,
+            // assuming it starts at zero - like the Csound / PD offline renders). The voices'
+            // delays place every sound at its absolute timeline position.
+            const double renderT0 = 0.0;
+            for (const Clip& c : t.clips) {
+                if (c.muted || c.audioFile.empty() || c.audioSegs.empty() || c.midiEnabled) continue;
+                cawaudio::VoiceSpec spec = audioClipVoiceSpec(c, t.id, c.start, t.volume);
+                spec.t0 = c.start;   // the render clock IS the project clock: no output latency offline
+                spec.delay = (long long)std::llround(std::max(0.0, c.start - renderT0) * (double)g_freeze.rate);
+                clipVoices.push_back(std::move(spec));
+            }
+            for (const MidiClip& mc : t.midiClips) {
+                if (mc.muted) continue;
+                const Clip* target = findClip(mc.clipId);
+                if (!target || target->muted || target->audioFile.empty() || target->audioSegs.empty()) continue;
+                std::string derr;
+                const cawaudio::AudioHandle data = audioClipData(*target, derr);
+                if (!data || data->samples.empty()) continue;
+                const double totalSrc = data->duration();
+                const double srcStart = target->audioSegs.front().srcOffset;
+                double nR = 1.0, nG = 1.0; bool nRev = false, nNorm = false;
+                cawaudio::sampleCodeVisuals(target->code, nR, nG, nRev, nNorm);
+                for (const MidiNote& note : mc.notes) {
+                    const double onset = mc.start + note.start;
+                    if (onset < g_freeze.t0 - 1e-9 || onset >= g_freeze.t1) continue;   // sounds before the frozen range are not baked (the live join skips them too)
+                    cawaudio::VoiceSpec spec;
+                    spec.kind = 1;
+                    spec.trackId = t.id;
+                    spec.clipId = target->id;
+                    spec.t0 = onset;
+                    const double pitchRatio = std::pow(2.0, (double)(note.pitch - 60) / 12.0);
+                    spec.rate = (1.0 / std::max(0.05, (double)target->audioRate)) * pitchRatio;
+                    spec.reverse = target->audioReverse;
+                    spec.normalize = nNorm;
+                    spec.gain0 = target->audioGain * (double)note.velocity / 100.0 * (double)std::max(0.f, std::min(kMaxVolumeGain, t.volume));
+                    double srcPos = srcStart;
+                    {
+                        double lt = onset - target->start;
+                        if (lt < 0.0) lt = 0.0;
+                        const double speed = 1.0 / std::max(0.05, (double)target->audioRate);
+                        const double want = lt * speed;
+                        if (target->audioReverse) {
+                            double rem = want;
+                            srcPos = srcStart;
+                            for (auto it = target->audioSegs.rbegin(); it != target->audioSegs.rend(); ++it) {
+                                if (rem < it->dur) { srcPos = it->srcOffset + it->dur - rem; break; }
+                                rem -= it->dur;
+                                if (std::next(it) == target->audioSegs.rend()) srcPos = it->srcOffset;
+                            }
+                        } else {
+                            double rem = want;
+                            srcPos = srcStart;
+                            for (const AudioSeg& s : target->audioSegs) {
+                                if (rem < s.dur) { srcPos = s.srcOffset + rem; break; }
+                                rem -= s.dur;
+                                if (&s == &target->audioSegs.back()) srcPos = s.srcOffset + s.dur;
+                            }
+                        }
+                    }
+                    spec.srcOffset = srcPos;
+                    const double avail = spec.reverse ? srcPos : std::max(0.0, totalSrc - srcPos);
+                    spec.noteDur = std::max(0.02, std::min((double)note.dur, std::max(0.02, avail / spec.rate)));
+                    if (spec.noteDur <= 0.02) continue;
+                    spec.data = data;
+                    spec.outSrc = audioClipOutMap(*target, data);
+                    spec.script = sampleScript(*target);
+                    noteVoices.push_back({onset, std::move(spec)});
+                }
+            }
+            const double renderEnd = g_freeze.t1 + std::max(0.0, g_proj.cs.tail) + 1.0;
+            std::vector<float> gainCurve;   // the track's volume automation, one value per render block
+            const int smpBlock = 512;
+            for (double tt = renderT0; tt < renderEnd; tt += (double)smpBlock / (double)g_freeze.rate)
+                gainCurve.push_back(trackVolumeAutomation(t, tt));
+            g_freeze.csdPath.clear();
+            g_freeze.offlineWavPath = g_freeze.tmpPath + ".full.wav";
+            g_smpRender.start(std::move(clipVoices), std::move(noteVoices), t.id, g_freeze.rate,
+                              g_freeze.offlineWavPath, renderEnd - renderT0, std::move(gainCurve));
+            g_freeze.offline = true;
+            g_freeze.smpOffline = true;
+            g_freezeSilent.store(false, std::memory_order_release);
+            g_freeze.phase = 3;
+            g_freeze.startedAt = std::chrono::steady_clock::now();
+            logLine("[caw] Freezing track \"" + t.name + "\": OFFLINE render of " +
+                    std::to_string(g_freeze.t1 - g_freeze.t0) + " s in CAW's C++ sample engine (clip code and notes included, no Csound) to " + g_freeze.finalPath);
+            return true;
+        }
+        if (t.kind == 5) {
+            // PURE SUPERCOLLIDER NRT FREEZE: sclang captures every clip's OSC messages in
+            // virtual time (the embedded CAWNrt class library - no live server, no OSC leaves
+            // the capture), then scsynth -N renders the score faster than real time into the
+            // intermediate WAV (project time 0 to the render end). No Csound in the render path.
+            // The clip files carry the same code rewrites the live dispatch applies.
+            static const std::regex scPlayTarget(R"re(\.play\s*\(\s*target\s*:\s*~caw[Gg]roup)re");
+            static const std::regex scDirectOut(R"re(\bOut\.ar\(\s*0\s*,)re");
+            const double renderEnd = g_freeze.t1 + std::max(0.0, g_proj.cs.tail) + 1.0;
+            std::string error;
+            std::vector<scnrt::ScStart> starts;
+            for (const Clip& c : t.clips) {
+                if (c.muted || c.code.empty()) continue;
+                std::string routed = c.code;
+                auto snap = g_scTimelineCode.find(c.id);   // the snapshot the live play uses wins
+                if (snap != g_scTimelineCode.end() && !snap->second.empty()) routed = snap->second;
+                routed = std::regex_replace(routed, scPlayTarget, ".play(outbus: ~cawoutbus, target: ~cawgroup");
+                routed = std::regex_replace(routed, scDirectOut, "Out.ar(~cawoutbus,");
+                const std::string path = (workDir() / ("caw_sc_clip_" + std::to_string(c.id) + ".scd")).generic_u8string();
+                if (!writeTextFile(path, routed)) { error = "could not write the clip file " + path; break; }
+                scnrt::ScStart s;
+                s.delay = std::max(0.0, c.start);   // absolute placement: the render runs from project time 0
+                s.dur = std::max(0.05, c.dur);      // like a window entry exactly at the clip start
+                s.p4 = c.midiEnabled ? 60.0 : 0.0;
+                s.p5 = c.midiEnabled ? 100.0 : 0.0;
+                s.id = newScInstanceId();
+                s.clipId = c.id;
+                s.slot = -1;                        // the NRT dispatch forces outBus 0 anyway
+                s.path = path;
+                starts.push_back(std::move(s));
+            }
+            // The track's automation lanes: ~cawget reads them live through the hub, so the capture
+            // bakes them in - sampled in C++ (autoValueAt, the range/initial like pollScAutomation)
+            // and scheduled into virtual time as bus-value updates at 200 Hz (5 ms steps, only the
+            // changes) - finer than the live engine's per-block stream, so no staircase zipper.
+            std::vector<scnrt::ScLane> lanes;
+            int laneSteps = 0;
+            for (const auto& lane : t.automation) {
+                const std::string& chn = lane.first;
+                const std::vector<AutoPoint>& pts = lane.second;
+                if (pts.empty() || !autoLaneActive(t, chn)) continue;
+                double lo = 0.0, hi = 1.0, initial = 0.5;
+                const auto range = t.automationRanges.find(chn);
+                if (range != t.automationRanges.end()) {
+                    lo = range->second.min;
+                    hi = range->second.max > lo ? range->second.max : lo + 1.0;
+                    initial = range->second.value;
+                }
+                scnrt::ScLane L;
+                L.name = chn;
+                for (double tt = 0.0; tt < renderEnd; tt += 0.005) {
+                    const double v = autoValueAt(pts, tt, initial);
+                    if (L.steps.empty() || std::fabs(v - L.steps.back().second) > 1e-4) L.steps.push_back({tt, v});
+                }
+                laneSteps += (int)L.steps.size();
+                if (!L.steps.empty()) lanes.push_back(std::move(L));
+            }
+            if (error.empty() && starts.empty()) error = "the track has no SuperCollider clip code to render.";
+            if (error.empty()) {
+                std::string libErr;
+                if (!scnrt::installClassLibrary(scLangExePath(), libErr)) error = libErr;
+            }
+            std::string inWavPath, scriptPath, scorePath;
+            if (error.empty()) {
+                // scsynth -N requires a real input file: render end seconds of silence at the project rate.
+                inWavPath = g_freeze.tmpPath + ".scin.wav";
+                CawWavWriter inwav;
+                std::string werr;
+                if (!inwav.open(inWavPath, g_freeze.rate, 2, 2, werr)) {
+                    error = "could not write the NRT input WAV: " + werr;
+                } else {
+                    std::vector<float> zeros(1024, 0.f);
+                    const long long frames = (long long)std::llround(g_freeze.t1 + std::max(0.0, g_proj.cs.tail) + 1.0);
+                    for (long long f = 0; f < frames && werr.empty(); f += 512)
+                        inwav.write(zeros.data(), 512, 1.0, 1.f, werr);
+                    if (werr.empty() && !inwav.finish(werr)) werr = werr.empty() ? "could not finish" : werr;
+                    if (!werr.empty()) error = "could not write the NRT input WAV: " + werr;
+                }
+            }
+            if (error.empty()) {
+                scriptPath = (workDir() / "caw_sc_nrt_capture.scd").generic_u8string();
+                scorePath = g_freeze.tmpPath + ".osc";
+                if (!writeTextFile(scriptPath, scnrt::captureScript(starts, lanes, scorePath, renderEnd)))
+                    error = "could not write the NRT capture script.";
+            }
+            if (error.empty()) {
+                const auto sclangDir = std::filesystem::u8path(scLangExePath()).parent_path();
+                const auto scsynthExe = sclangDir / (plat::isWindows ? "scsynth.exe" : "scsynth");
+                const std::string conf = writePrivateSclangConf();
+                const std::string sclangCmd = processArg(scLangExePath()) + (conf.empty() ? "" : " -l " + processArg(conf)) +
+                                              " " + processArg(scriptPath);
+                // The scsynth output IS the intermediate file the finisher slices - set the path
+                // BEFORE the command line is built, and keep it for the finisher.
+                g_freeze.csdPath.clear();
+                g_freeze.offlineWavPath = g_freeze.tmpPath + ".full.wav";
+                const std::string scsynthCmd = processArg(scsynthExe.u8string()) + " -N " + processArg(scorePath) + " " +
+                                               processArg(inWavPath) + " " + processArg(g_freeze.offlineWavPath) +
+                                               " " + std::to_string(g_freeze.rate) + " wav int24 -o 2";
+                g_scRender.start(t.name, sclangCmd, scsynthCmd, scorePath, g_freeze.offlineWavPath,
+                                 std::max(180.0, renderEnd + 60.0), std::max(120.0, renderEnd + 60.0));
+                g_freeze.offline = true;
+                g_freeze.scOffline = true;
+                g_freezeSilent.store(false, std::memory_order_release);
+                g_freeze.phase = 3;
+                g_freeze.startedAt = std::chrono::steady_clock::now();
+                logLine("[caw] Freezing track \"" + t.name + "\": OFFLINE render of " +
+                        std::to_string(g_freeze.t1 - g_freeze.t0) + " s with the SuperCollider NRT renderer (sclang virtual-time capture + scsynth -N, no Csound) to " + g_freeze.finalPath);
+                logLine("[caw] NRT tools: sclang = " + scLangExePath() + ", scsynth = " + scsynthExe.u8string());
+                logLine("[caw] NRT clips queued: " + std::to_string(starts.size()) + " (capture script " + scriptPath + ")");
+                return true;
+            }
+            logLine("[caw] Offline SC freeze not available (" + error + ") - falling back to the real-time capture.");
+        }
+        if (t.kind == 6) {
+            // PURE C++ PD FREEZE: the C++ PD host mixer renders the clips directly into the
+            // intermediate WAV - no Csound anywhere in the render path (the user asked for PD
+            // offline in C++; the Csound-hosted PD render is gone).
+            int bad = 0; std::string pdErr;
+            std::vector<pd_timeline::Event> pdPlan;
+            if (!pd_timeline::makePlan(renderProj, g_projectPath, pdPlan, pdErr, false, &bad, true)) {
+                error = "PD clip problem: " + pdErr;
+            } else {
+                g_freeze.csdPath.clear();
+                g_cppRender.startPd({}, {}, {}, g_freeze.rate, g_freeze.offlineWavPath,
+                                    g_freeze.t1 + std::max(0.0, g_proj.cs.tail) + 1.0, g_pdLibraryPath, std::move(pdPlan));
+                g_freeze.offline = true;
+                g_freeze.cppOffline = true;
+                g_freezeSilent.store(false, std::memory_order_release);
+                g_freeze.phase = 3;
+                g_freeze.startedAt = std::chrono::steady_clock::now();
+                logLine("[caw] Freezing track \"" + t.name + "\": OFFLINE render of " +
+                        std::to_string(g_freeze.t1 - g_freeze.t0) + " s in CAW's C++ PD host (no Csound in the render path) to " + g_freeze.finalPath);
+                return true;
+            }
+        }
+        if (t.kind == 3 && t.vstPath.empty()) error = "the VSTi track has no plugin selected.";
+        if (t.kind == 3 && error.empty()) {
+            // PURE C++ VSTi FREEZE: the plugin renders in CAW's C++ VST host - MIDI clips, clip
+            // code (notes and P1..P8) and drawn automation lanes included; no Csound in the path.
+            vstui::captureAllParameters(g_proj);   // the render uses exactly what the plugin GUIs show
+            std::vector<VstJob> jobs = collectVstJobs(renderProj, {});
+            captureLiveVstInstanceState(jobs);   // the offline plugin starts where the LIVE sound is
+            std::vector<cawcpp::RackCppRender::Note> notes;
+            for (const VstSoloNote& sn : buildVstSoloNotes())
+                if (sn.trackId == t.id) notes.push_back({sn.start, sn.dur, t.id, sn.pitch, sn.velocity});
+            for (const VstJob& j : jobs) {   // parameter evidence: what the offline plugin will start from
+                std::string picks;
+                for (int k = 0; k < 8 && k < (int)j.pick.size(); ++k)
+                    picks += " P" + std::to_string(k + 1) + "->param" + std::to_string(j.pick[k]) +
+                             (k < (int)j.init.size() ? "(start " + std::to_string(j.init[(size_t)k]).substr(0, 5) + ")" : "");
+                logLine("[caw] Export part \"" + t.name + "\": plugin params saved=" + std::to_string(j.parameterState.size()) +
+                        ", state blob=" + std::to_string(j.stateBlob.size()) + " bytes," + (picks.empty() ? " no picked slots" : picks));
+            }
+            g_freeze.csdPath.clear();
+            g_freeze.offlineWavPath = g_freeze.tmpPath + ".full.wav";
+            const double vstiEnd = g_freeze.t1 + std::max(0.0, g_proj.cs.tail) + 1.0;
+            g_cppRender.start(std::move(jobs), {}, std::move(notes), g_freeze.rate, g_freeze.offlineWavPath,
+                              vstiEnd, buildVstScripts(renderProj));
+            g_freeze.offline = true;
+            g_freeze.cppOffline = true;
+            g_freezeSilent.store(false, std::memory_order_release);
+            g_freeze.phase = 3;
+            g_freeze.startedAt = std::chrono::steady_clock::now();
+            logLine("[caw] Freezing track \"" + t.name + "\": OFFLINE render of " +
+                    std::to_string(g_freeze.t1 - g_freeze.t0) + " s in CAW's C++ VST host (clip code, notes and "
+                    "automation included, no Csound) to " + g_freeze.finalPath);
+            return true;
+        }
+        if (error.empty() && !writeTextFile(g_freeze.csdPath, buildCsd(renderProj, "render", 0.0, &g_orcSpans))) {
+            error = "could not write the temporary render CSD.";
+        } else if (error.empty()) {
+            shareEngineDlls();
+            if (!g_offlineProc.prepare(csoundExePath(), error)) error = "the offline renderer is unavailable: " + error;
+        }
+        if (error.empty()) {
+            vstui::captureAllParameters(g_proj);   // the render uses exactly what the plugin GUIs show
+            g_offlineProc.setPdSource(t.kind == 6 ? g_pdLibraryPath : std::string(), t.kind == 6 ? pdPlan : std::vector<pd_timeline::Event>{});
+            g_offlineProc.setVstJobs(collectVstJobs(renderProj, {}));
+            g_offlineProc.setControlChannels(vstGateValues());
+            g_offlineProc.setOfflineSampleStreams(collectOfflineSampleStreams(renderProj));   // a locked source in the render copy feeds through its WAV
+            const int partCh = (g_exportBeginPending && g_exportOff.active) ? std::min(64, std::max(1, g_exportOff.partCh)) : 2;
+            if (!g_offlineProc.startOffline(g_freeze.csdPath, g_freeze.rate, masterChannels(g_proj.cs),
+                                            (float)g_proj.cs.zdbfs, 1.f, 2, g_freeze.offlineWavPath, error, partCh,
+                                            g_freeze.t1 + std::max(0.0, g_proj.cs.tail) + 1.0))
+                error = "the offline render could not start: " + error;
+            else if (t.kind == 6)
+                g_offlineProc.pdTransport(true, g_freeze.t0, 0.0, 0.0, false, g_freeze.rate, 1);   // the PD mixer rolls from the freeze start (no ack handshake offline)
+        }
+        if (error.empty()) {
+            g_freeze.offline = true;
+            g_freezeSilent.store(false, std::memory_order_release);
+            g_freeze.phase = 3;
+            g_freeze.startedAt = std::chrono::steady_clock::now();
+            logLine("[caw] Freezing track \"" + t.name + "\": OFFLINE render of " +
+                    std::to_string(g_freeze.t1 - g_freeze.t0) + " s (silent, faster than real time) to " + g_freeze.finalPath);
+            return true;
+        }
+        logLine("[caw] Offline freeze not available (" + error + ") - falling back to the real-time capture.");
+        g_freeze.csdPath.clear();
+        g_freeze.offlineWavPath.clear();
+        // the real-time capture needs the live engines even for kinds the offline pass did not
+        engineMissing = false;
+        if (t.kind == 0 && !engineIsUp()) { engineMissing = true; what = "Run Csound (DSP)"; }
+        else if (t.kind == 0 && !g_useCsoundApi) { logLine("[caw] Freeze needs CAW's Csound API engine (the external csound process mode cannot be frozen)."); return false; }
+        else if (t.kind == 3 && !g_vstEngineOn) { engineMissing = true; what = "Run VST"; }
+        else if (t.kind == 6 && !g_pdEngineOn && !g_mixedPd) { engineMissing = true; what = "Run Pure Data (DSP)"; }
+        else if (t.kind == 7 && !g_sampleEngineOn) { engineMissing = true; what = "Run Sample"; }
+        if (engineMissing) { logLine(std::string("[caw] Freeze needs its engine: press ") + what + " first, then freeze the track."); return false; }
+    }
+
+    // The writer thread takes it from here; the transport rolls and freezeTick watches the playhead.
+    g_freezeSilent.store(true, std::memory_order_release);   // the capture keeps working; the speakers stay silent
+    freezeStartWriter();
+    seekTimeline(g_freeze.t0);
+    toggleTimelinePlay();
+    logLine("[caw] Freezing track \"" + t.name + "\": rendering " +
+            std::to_string(g_freeze.t1 - g_freeze.t0) + " s to " + g_freeze.finalPath);
+    return true;
+}
+
+// Aborts the pass (Cancel button or an error): restore everything, drop the partial WAV.
+// Called every UI frame. Watches the playhead; when it passes the end of the extent (or the
+// transport died) the pass finalizes: stop, drain, close the WAV, restore the mixer, freeze.
+// The pure C++ offline renders (g_cppRender) poll through the same phase 3.
+void freezeCancel() {
+    if (g_freeze.phase == 0) return;
+    if (g_freeze.phase == 3) {
+        if (g_freeze.cppOffline) g_cppRender.stop.store(true, std::memory_order_release);
+        else if (g_freeze.smpOffline) g_smpRender.stop.store(true, std::memory_order_release);
+        else if (g_freeze.scOffline) g_scRender.stop.store(true, std::memory_order_release);
+        else {
+            g_offlineProc.stop();
+            for (const std::string& l : g_offlineProc.takeOutput()) logLine(l);
+        }
+    }
+    if (timelinePlaying()) toggleTimelinePlay();
+    freezeStopWriter(false);
+    freezeRestoreStates();
+    std::error_code ec;
+    std::filesystem::remove(std::filesystem::u8path(g_freeze.tmpPath), ec);
+    if (g_freeze.phase == 3) {
+        if (!g_freeze.offlineWavPath.empty()) std::filesystem::remove(std::filesystem::u8path(g_freeze.offlineWavPath), ec);
+        if (!g_freeze.csdPath.empty()) std::filesystem::remove(std::filesystem::u8path(g_freeze.csdPath), ec);
+        // the SC NRT intermediates: the OSC score and the silent input WAV (only exist for SC passes)
+        std::filesystem::remove(std::filesystem::u8path(g_freeze.tmpPath + ".osc"), ec);
+        std::filesystem::remove(std::filesystem::u8path(g_freeze.tmpPath + ".scin.wav"), ec);
+        g_freeze.offline = false;
+        g_freeze.cppOffline = false;
+        g_freeze.smpOffline = false;
+        g_freeze.scOffline = false;
+    }
+    logLine("[caw] Freeze cancelled: nothing was changed.");
+    g_freezeQueue.clear();
+    g_freezeVsteBounce = -1;
+    g_freeze.phase = 0;
+}
+
+// Called every UI frame. Watches the playhead; when it passes the end of the extent (or the
+// transport died) the pass finalizes: stop, drain, close the WAV, restore the mixer, freeze.
+// The pure C++ offline rack bounce (g_cppRender) polls through the same phase 3.
+void freezeTick() {
+    if (g_freeze.phase == 0) return;
+    if (g_freeze.phase == 3) {   // OFFLINE pass: poll the render, then slice the track's range into the freeze WAV
+        if (g_freeze.smpOffline) {
+            if (!g_smpRender.done.load(std::memory_order_acquire)) return;
+            for (const std::string& l : g_smpRender.takeLog()) logLine(l);
+            const int code = g_smpRender.code.load(std::memory_order_acquire);
+            if (code != 0) {
+                const std::string why = g_smpRender.takeError();
+                g_freeze.error = "The offline render failed" + (why.empty() ? std::string(".") : ": " + why);
+            }
+        } else if (g_freeze.cppOffline) {
+            if (!g_cppRender.done.load(std::memory_order_acquire)) return;
+            for (const std::string& l : g_cppRender.takeLog()) logLine(l);
+            const int code = g_cppRender.code.load(std::memory_order_acquire);
+            if (code != 0) {
+                const std::string why = g_cppRender.takeError();
+                g_freeze.error = "The offline render failed" + (why.empty() ? std::string(".") : ": " + why);
+            }
+        } else if (g_freeze.scOffline) {
+            if (!g_scRender.done.load(std::memory_order_acquire)) return;
+            for (const std::string& l : g_scRender.takeLog()) logLine(l);
+            const int code = g_scRender.code.load(std::memory_order_acquire);
+            if (code != 0) {
+                const std::string why = g_scRender.takeError();
+                g_freeze.error = "The offline render failed" + (why.empty() ? std::string(".") : ": " + why);
+            }
+        } else {
+        if (g_offlineProc.running()) return;
+        for (const std::string& l : g_offlineProc.takeOutput()) logLine(l);
+        const int code = g_offlineProc.exitCode();
+        if (!g_offlineProc.finished() && code == 0) {
+            // The worker stores live=false before done=true: one frame can see neither running
+            // nor finished. Wait a few frames before declaring a bogus failure (exit code 0).
+            if (++g_freeze.settle < 20) return;
+            g_freeze.error = "The offline render did not report completion.";
+        } else if (code != 0) {
+            g_freeze.error = "The offline render failed (exit code " + std::to_string(code) + ").";
+        }
+        }
+        if (!g_freeze.error.empty()) {
+            logLine("[caw] " + g_freeze.error);
+        } else {
+            std::string err;
+            const cawaudio::AudioHandle mix = cawaudio::getAudio(g_freeze.offlineWavPath, g_freeze.rate, g_proj.cs.ffmpegExe, err);
+            if (!mix || mix->samples.empty()) {
+                g_freeze.error = "The offline render produced no audio" + std::string(err.empty() ? "." : ": " + err);
+                logLine("[caw] " + g_freeze.error);
+            } else {
+                const int ch = std::max(1, mix->channels);
+                const int mixSr = std::max(8000, mix->sr);
+                const long long total = (long long)(mix->samples.size() / (size_t)ch);
+                long long f0 = (long long)std::llround(g_freeze.t0 * (double)mixSr);
+                long long f1 = (long long)std::llround(g_freeze.t1 * (double)mixSr);
+                f0 = std::max(0LL, std::min(total, f0));
+                f1 = std::max(f0, std::min(total, f1));   // the tail beyond the project end is not in the render
+                if (f1 - f0 < 16) {
+                    g_freeze.error = "The rendered range is empty.";
+                    logLine("[caw] " + g_freeze.error);
+                } else {
+                    // write stereo float32 into the freeze WAV (mono renders duplicate, >2 ch take the first two)
+                    std::string werr;
+                    std::vector<float> blk;
+                    const long long chunk = 4800;
+                    for (long long f = f0; f < f1 && g_freeze.error.empty(); f += chunk) {
+                        const long long n = std::min(chunk, f1 - f);
+                        blk.clear();
+                        blk.reserve((size_t)n * 2u);
+                        for (long long k = 0; k < n; ++k)
+                            for (int c = 0; c < 2; ++c)
+                                blk.push_back(mix->samples[(size_t)((f + k) * (size_t)ch + (size_t)std::min(c, ch - 1))]);
+                        if (!g_freeze.wav.write(blk.data(), (size_t)n, 1.0, 1.f, werr)) {
+                            g_freeze.error = "The freeze WAV could not be written (disk problem).";
+                            g_freeze.writeFailed.store(1, std::memory_order_release);
+                            logLine("[caw] " + g_freeze.error + " (" + werr + ")");
+                        }
+                    }
+                }
+            }
+            std::error_code ec;
+            if (!g_freeze.offlineWavPath.empty()) std::filesystem::remove(std::filesystem::u8path(g_freeze.offlineWavPath), ec);
+            if (!g_freeze.csdPath.empty()) std::filesystem::remove(std::filesystem::u8path(g_freeze.csdPath), ec);
+            // the SC NRT intermediates: the OSC score and the silent input WAV
+            std::filesystem::remove(std::filesystem::u8path(g_freeze.tmpPath + ".osc"), ec);
+            std::filesystem::remove(std::filesystem::u8path(g_freeze.tmpPath + ".scin.wav"), ec);
+            g_freeze.offline = false;
+            g_freeze.cppOffline = false;
+            g_freeze.smpOffline = false;
+            g_freeze.scOffline = false;
+        }
+        if (g_freeze.error.empty())
+            logLine("[caw] Offline render finished in " + std::to_string((int)(std::chrono::duration<double>(std::chrono::steady_clock::now() - g_freeze.startedAt).count() + 0.5)) + " s. Locking the track...");
+        g_freeze.phase = 2;   // the phase-2 finalizer stops the writer, restores the mixer and locks the track
+        return;
+    }
+    if (g_freeze.phase == 1) {
+        if (!timelinePlaying()) {                                 // Play could not start (PD problem etc.)
+            g_freeze.error = "The transport did not start - the freeze was cancelled.";
+            logLine("[caw] " + g_freeze.error);
+            freezeCancel();
+            return;
+        }
+        if (g_play < g_freeze.t0 - 0.5) {                         // the playhead was moved away mid-pass
+            g_freeze.error = "The playhead left the rendered range - the freeze was cancelled.";
+            logLine("[caw] " + g_freeze.error);
+            freezeCancel();
+            return;
+        }
+        if (g_freeze.writeFailed.load(std::memory_order_acquire)) {   // disk problem while rendering
+            g_freeze.error = "The freeze WAV could not be written (disk problem).";
+            logLine("[caw] " + g_freeze.error);
+            freezeCancel();
+            return;
+        }
+        if (g_play >= g_freeze.t1 - 1e-6) {                       // reached the end of the extent
+            g_freeze.phase = 2;
+        }
+        return;
+    }
+    // phase 2: the transport is stopped, the last blocks drain from the ring into the WAV.
+    if (timelinePlaying()) toggleTimelinePlay();
+    freezeStopWriter(true);
+    freezeRestoreStates();
+    if (g_freeze.writeFailed.load(std::memory_order_acquire) && g_freeze.error.empty())
+        g_freeze.error = "The freeze WAV could not be written (disk problem).";
+    Track& t = g_proj.tracks[(size_t)g_freeze.trackIdx];
+    if (g_freeze.exportPass) {   // whole-project offline export: this pass made ONE part - no lock
+        if (!g_freeze.error.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::u8path(g_freeze.tmpPath), ec);
+            logLine("[caw] Export part failed for \"" + g_freeze.trackName + "\": " + g_freeze.error);
+        } else {
+            const std::string partPath = (workDir() / ("caw_export_part_" + std::to_string(g_exportOff.partSeq++) + ".wav")).generic_u8string();
+            std::error_code ec;
+            std::filesystem::rename(std::filesystem::u8path(g_freeze.tmpPath), std::filesystem::u8path(partPath), ec);
+            if (ec) logLine("[caw] Export: the part WAV could not be kept: " + ec.message());
+            else {
+                g_exportOff.parts.push_back({partPath, g_freeze.t0, std::max(0.f, std::min(kMaxVolumeGain, t.volume))});   // t.volume is restored by now: the freeze pass rendered at unity
+                logLine("[caw] Export: \"" + g_freeze.trackName + "\" rendered (part " + std::to_string(g_exportOff.partSeq) + ").");
+            }
+        }
+        g_freeze.phase = 0;
+        if (g_exportOff.active) exportNextTrack();
+        return;
+    }
+    if (g_freeze.error.empty()) {
+        std::error_code ec;
+        std::filesystem::rename(std::filesystem::u8path(g_freeze.tmpPath), std::filesystem::u8path(g_freeze.finalPath), ec);
+        if (ec) {
+            g_freeze.error = "Could not move the rendered WAV into place: " + ec.message();
+        } else {
+            cawUndoDropBackup(g_freeze.finalPath);   // a fresh render supersedes any backup of this location
+            t.frozen = true;
+            t.freezePath = g_freeze.finalPath;
+            t.freezeStart = g_freeze.t0;
+            t.freezeEnd = g_freeze.t1;
+            for (Clip& c : t.clips) c.editorOpen = false;         // the frozen track is locked: its editors close
+            g_audioVoiceSig.clear();                              // the sample voices rebuild: the WAV voice takes over
+            if (!g_sampleEngineOn && g_langAudio) {               // the frozen WAV plays through the sample engine: start it so the result is audible
+                g_sampleEngineOn = true;
+                ensureSampleOutput();
+                logLine("[caw] Sample engine started automatically: frozen tracks play their rendered WAV through it (the track fader stays live on it).");
+            }
+            if (g_freeze.vsteBounce) {                            // the rack is locked: its sources go silent (the WAV now carries their processed sound)
+                for (int si : freezeVsteSources(g_freeze.trackIdx)) {
+                    Track& so = g_proj.tracks[(size_t)si];
+                    so.muted = true;
+                    so.solo = false;
+                }
+            }
+            pushVstActiveLive();
+            logLine("[caw] Track \"" + t.name + "\" frozen: " +
+                    std::to_string(g_freeze.t1 - g_freeze.t0) + " s rendered. The engines skip it until you unfreeze it.");
+        }
+    }
+    if (!g_freeze.error.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(std::filesystem::u8path(g_freeze.tmpPath), ec);
+        logLine("[caw] Freeze failed: " + g_freeze.error);
+        g_freeze.phase = 0;
+        return;
+    }
+    g_freeze.phase = 0;
+    // The render-and-lock sequence: the next source starts right away, and the rack bounce runs
+    // when the queue drains.
+    if (!g_freezeQueue.empty()) {
+        const int next = g_freezeQueue.front();
+        g_freezeQueue.erase(g_freezeQueue.begin());
+        if (!freezeTrackBegin(next)) { g_freezeQueue.clear(); g_freezeVsteBounce = -1; }
+        return;
+    }
+    if (g_freezeVsteBounce >= 0) {
+        const int rack = g_freezeVsteBounce;
+        g_freezeVsteBounce = -1;
+        if (!freezeVsteBegin(rack)) g_freezeQueue.clear();
+        return;
+    }
+}
+
+// Unfreezes (unlock): the WAV is deleted, the live engines play the track again.
+// A locked VSTe rack also muted its source tracks (their processed sound lives in the WAV):
+// unlocking brings them back live.
+void freezeUnfreeze(int trackIdx) {
+    if (trackIdx < 0 || trackIdx >= (int)g_proj.tracks.size()) return;
+    Track& t = g_proj.tracks[(size_t)trackIdx];
+    if (!trackFrozen(t)) { t.frozen = false; t.freezePath.clear(); t.freezeStart = t.freezeEnd = 0.0; return; }
+    std::error_code ec;
+    cawUndoKeepFile(t.freezePath);   // not deleted: undo may need to bring this WAV back
+    t.frozen = false;
+    t.freezePath.clear();
+    t.freezeStart = t.freezeEnd = 0.0;
+    if (t.kind == 4) {
+        for (Track& o : g_proj.tracks) {
+            if (o.kind == 4) continue;
+            bool isSource = false;
+            for (int s = 0; s < 8 && !isSource; ++s) {
+                const auto& in = t.vstInputs[s];
+                if (!in.on || in.mode == 2) continue;
+                isSource = in.mode == 0 ? o.name == in.name
+                    : std::any_of(o.clips.begin(), o.clips.end(), [&](const Clip& c) { return c.name == in.name; });
+            }
+            if (isSource) { o.muted = false; o.solo = false; }
+        }
+        logLine("[caw] Unlocked the rack \"" + t.name + "\": its source tracks play live again.");
+    } else {
+        logLine("[caw] Unfroze track \"" + t.name + "\": the live engines play it again.");
+    }
+    cawaudio::engine().killManaged(freezeClipId(t.id));           // the frozen WAV voice stops right now
+    g_audioVoiceSig.clear();                                      // and the sample voices rebuild on the next tick
+    clearSampleRings();
+    if (g_liveCsound && g_useCsoundApi) g_apiProc.silenceVstTaps();
+    pushVstActiveLive();
+    if (g_timelineRun) g_resync = 1;   // restart clips that already began at the current playhead
+}
+
+// --------------------------------------------------------------- VSTe rack: render-and-lock
+// The enabled inputs of a rack (mode 0 = track by name, 1 = clip by name; mode 2 is not audio)
+// resolve to source tracks. Live sources feed the plugins directly; already-locked sources feed
+// their existing WAV voices. Locking the rack never freezes its sources first.
+std::vector<int> freezeVsteSources(int rackIdx) {
+    std::vector<int> out;
+    if (rackIdx < 0 || rackIdx >= (int)g_proj.tracks.size()) return out;
+    const Track& rack = g_proj.tracks[(size_t)rackIdx];
+    if (rack.kind != 4) return out;
+    for (int s = 0; s < 8; ++s) {
+        const auto& in = rack.vstInputs[s];
+        if (!in.on || in.mode == 2) continue;
+        for (size_t i = 0; i < g_proj.tracks.size(); ++i) {
+            const Track& o = g_proj.tracks[i];
+            if ((int)i == rackIdx) continue;
+            if (o.kind != 0 && o.kind != 3 && o.kind != 5 && o.kind != 6 && o.kind != 7) continue;
+            const bool match = in.mode == 0 ? o.name == in.name
+                : std::any_of(o.clips.begin(), o.clips.end(), [&](const Clip& c) { return c.name == in.name; });
+            if (!match) continue;
+            if (std::find(out.begin(), out.end(), (int)i) == out.end()) out.push_back((int)i);
+        }
+    }
+    return out;
+}
+
+// Everything the render-and-lock sequence needs, checked without side effects (the modal shows
+// `problem` next to a disabled button while the sequence cannot run).
+bool freezeVsteReady(int rackIdx, std::string& problem) {
+    problem.clear();
+    if (rackIdx < 0 || rackIdx >= (int)g_proj.tracks.size()) { problem = "The track is gone."; return false; }
+    const Track& rack = g_proj.tracks[(size_t)rackIdx];
+    if (rack.kind != 4) { problem = "Not a VSTe track."; return false; }
+    if (rack.vstPath.empty()) { problem = "Pick a plugin for this VSTe track first."; return false; }
+    if (trackFrozen(rack)) { problem = "This rack is already locked. Press LKD again to unlock it."; return false; }
+    if (freezeActive()) { problem = "A freeze is already running - wait for it to finish."; return false; }
+    if (g_renderActive) { problem = "An audio export is running - wait for it to finish first."; return false; }
+    const std::vector<int> sources = freezeVsteSources(rackIdx);
+    if (sources.empty()) { problem = "No renderable sources: the enabled inputs name no Csound / VSTi / SuperCollider / Pure Data / Sample track."; return false; }
+    if (rack.vstOutMode != 0) { problem = "This rack is in FX+Source mode: the sources keep sounding next to the effect, so a lock would bake them together. Switch the rack to FX only first."; return false; }
+    // Rack locking runs OFFLINE in CAW's own C++ hosts when possible: the sources that must be
+    // pre-rendered (Csound through the Csound offline host; sample through its offline pass;
+    // SuperCollider still real-time) are queued one by one, and the bounce then runs in the pure
+    // C++ VST host with every source locked. VSTi and PD sources render natively in the bounce
+    // (no freeze, no Csound). Only a graph that cannot go offline falls back to the real-time
+    // capture - and that fallback needs the live engines.
+    bool pdLib = [&] { if (!g_pdLibraryPath.empty()) return true; g_pdLibraryPath = plat::bundledLibpd(); return !g_pdLibraryPath.empty(); }();
+    bool allNative = !rack.vstPath.empty();
+    for (int si : sources) {
+        const Track& st = g_proj.tracks[(size_t)si];
+        if (trackFrozen(st)) { if (!g_langAudio) { problem = "Enable Audio in Settings > Engines: a rendered source feeds this rack through the sample engine."; return false; } continue; }
+        if (st.kind == 3 && !st.vstPath.empty()) continue;      // VSTi: rendered natively in the C++ bounce
+        if (st.kind == 6 && pdLib) continue;                    // PD: rendered by the C++ PD host mixer in the bounce
+        allNative = false;
+    }
+    if (allNative) return true;   // the whole sequence runs offline in C++ / the Csound source host: no live engines needed
+    if (!g_vstEngineOn) { problem = "Run VST first: the rack's plugins do the processing."; return false; }
+    for (int si : sources) {
+        const Track& st = g_proj.tracks[(size_t)si];
+        if (trackFrozen(st)) {
+            if (!g_langAudio) { problem = "Enable Audio in Settings > Engines: a rendered source feeds this rack through the sample engine."; return false; }
+            continue;
+        }
+        if (st.kind == 0 && !g_langCsound) { problem = "Enable Csound in Settings > Engines: a source track uses it (its offline render needs it)."; return false; }
+        if (st.kind == 5 && !g_scReady) { problem = "Run SuperCollider first: a source track uses it."; return false; }
+        if (st.kind == 6 && !g_pdEngineOn && !g_mixedPd) { problem = "Run Pure Data (DSP) first: a source track uses it."; return false; }
+        if (st.kind == 7 && !g_langAudio) { problem = "Enable Audio in Settings > Engines: a live sample source feeds this rack."; return false; }
+    }
+    return true;
+}
+
+
+bool freezeVsteRenderAll(int rackIdx) {
+    std::string problem;
+    if (!freezeVsteReady(rackIdx, problem)) { logLine("[caw] " + problem); return false; }
+    const std::vector<int> sources = freezeVsteSources(rackIdx);
+    std::vector<int> pending;
+    for (int si : sources) {
+        const Track& st = g_proj.tracks[(size_t)si];
+        if (trackFrozen(st)) continue;
+        if (st.kind == 3 || st.kind == 6) continue;   // VSTi / PD: the bounce renders them natively
+        pending.push_back(si);
+    }
+    g_freezeQueue = pending;
+    g_freezeVsteBounce = rackIdx;
+    if (g_freezeQueue.empty()) {   // every source renders natively or is locked: bounce right away
+        g_freezeQueue.clear();
+        return freezeVsteBegin(rackIdx);
+    }
+    const int first = g_freezeQueue.front();
+    g_freezeQueue.erase(g_freezeQueue.begin());
+    if (!freezeTrackBegin(first)) {
+        g_freezeQueue.clear();
+        g_freezeVsteBounce = -1;
+        return false;
+    }
+    logLine("[caw] Render-and-lock: " + std::to_string(pending.size()) + " source(s) first, then the rack bounce (all offline - the render takes seconds, not the playing time).");
+    return true;
+}
+
+// The rack bounce: plays the transport once through the sources' extent with ONLY the rack audible
+// (its inputs stay wired, so the plugins process their live sources; every other track is muted and
+// the replace-mode routing already silences the raw source mixes). The WAV replaces the rack: the
+// frozen rack runs no plugin instances (the WAV voice plays instead) and its sources stay muted
+// until the rack is unlocked.
+bool freezeVsteBegin(int rackIdx) {
+    if (g_freeze.phase != 0) { logLine("[caw] A freeze is already running."); return false; }
+    if (rackIdx < 0 || rackIdx >= (int)g_proj.tracks.size()) return false;
+    Track& rack = g_proj.tracks[(size_t)rackIdx];
+    if (rack.kind != 4 || trackFrozen(rack)) return false;
+    if (g_renderActive && !g_exportBeginPending) { logLine("[caw] Wait for the export to finish before locking the rack."); return false; }
+    const std::vector<int> sources = freezeVsteSources(rackIdx);
+    if (sources.empty()) { logLine("[caw] The rack has no renderable sources to capture."); return false; }
+    // OFFLINE rack lock: possible when every source is a Csound / VSTi / sample / PD clip track that
+    // the offline host can render (silent, full CPU speed) - or is ALREADY LOCKED (its rendered WAV
+    // feeds the render through the offline sample streams, the host decodes it). SC sources keep
+    // the real-time capture. A Csound source needs its language enabled; VSTi / sample sources
+    // render offline even with the Csound engine unchecked. With the offline pass the render takes
+    // seconds, not the wall-clock length of the range.
+    bool offlineOk = !rack.vstPath.empty();
+    for (int si : sources) {
+        const Track& st = g_proj.tracks[(size_t)si];
+        if (trackFrozen(st)) continue;   // a locked source: its frozen WAV feeds the offline render (engine-4 streams)
+        if ((st.kind != 0 && st.kind != 3 && st.kind != 7 && st.kind != 6) ||
+            (st.kind == 0 && !g_langCsound) ||
+            (st.kind == 6 && [&] { if (!g_pdLibraryPath.empty()) return true; g_pdLibraryPath = plat::bundledLibpd(); return !g_pdLibraryPath.empty(); }() == false))
+            { offlineOk = false; break; }
+    }
+    if (!offlineOk) {
+    ensureSampleEngineForVstInputs();
+    if (!g_vstEngineOn) { logLine("[caw] Locking the rack needs the VST engine: press Run VST first."); return false; }
+    for (int si : sources) {
+        const Track& st = g_proj.tracks[(size_t)si];
+        if (trackFrozen(st)) {
+            if (!g_langAudio) { logLine("[caw] Locking the rack needs Audio enabled: a rendered source feeds it through the sample engine."); return false; }
+            continue;
+        }
+        if (st.kind == 0 && !engineIsUp()) { logLine("[caw] Locking the rack needs Csound (DSP) running (a source uses it)."); return false; }
+        if (st.kind == 5 && !g_scReady) { logLine("[caw] Locking the rack needs SuperCollider running (a source uses it)."); return false; }
+        if (st.kind == 6 && !g_pdEngineOn && !g_mixedPd) { logLine("[caw] Locking the rack needs Pure Data (DSP) running (a source uses it)."); return false; }
+        if (st.kind == 7 && !g_langAudio) { logLine("[caw] Locking the rack needs Audio enabled (a live sample source uses it)."); return false; }
+    }
+    }
+    double lo = 1e300, hi = 0.0;
+    for (int si : sources) {
+        const Track& st = g_proj.tracks[(size_t)si];
+        if (trackFrozen(st)) {                                       // a locked source contributes its WAV range
+            if (st.freezeEnd > st.freezeStart) { lo = std::min(lo, st.freezeStart); hi = std::max(hi, st.freezeEnd); }
+            continue;
+        }
+        for (const Clip& c : st.clips) { lo = std::min(lo, c.start); hi = std::max(hi, c.start + c.dur); }
+        for (const MidiClip& mc : st.midiClips) { lo = std::min(lo, mc.start); hi = std::max(hi, mc.start + mc.dur); }
+    }
+    if (hi <= lo) { logLine("[caw] The rack's sources have nothing to render (no clips)."); return false; }
+
+    g_freeze.resetForNewPass();
+    g_freeze.exportPass = g_exportBeginPending;   // an export-queue part: no lock at the end
+    g_freeze.phase = 1;
+    g_freeze.vsteBounce = true;
+    g_freeze.trackIdx = rackIdx;
+    g_freeze.trackId = rack.id;
+    g_freeze.trackName = rack.name;
+    g_freeze.t0 = std::max(0.0, lo);
+    g_freeze.t1 = hi + 2.0;                                       // tail: plugin releases and delays ring out
+    if (!g_freeze.exportPass) {
+        // An LKD replaces the live rack: the tail must survive like the export's bounce does.
+        g_freeze.t1 = hi + std::max(2.0, g_proj.cs.tail + 2.0);
+    }
+    if (g_freeze.exportPass) {   // the export range (Start/End) bounds the bounce exactly like the mix
+        g_freeze.t0 = std::max(g_freeze.t0, g_exportOff.t0);
+        // Ring to the end of the mix (see freezeTrackBegin): tails survive like the real-time capture.
+        g_freeze.t1 = std::max(g_freeze.t1, g_exportOff.t1 + 2.0);
+        if (g_freeze.t1 <= g_freeze.t0) {
+            logLine("[caw] Export: the rack \"" + rack.name + "\" lies outside the export range - skipped.");
+            return false;
+        }
+    }
+    g_freeze.rate = std::max(8000, g_proj.cs.sr);
+    freezeWavPaths(rack);
+    std::string err;
+    if (!g_freeze.wav.open(g_freeze.tmpPath, g_freeze.rate, 2, 2, err)) {
+        g_freeze.error = err;
+        g_freeze.phase = 0;
+        logLine("[caw] Rack lock failed: " + err);
+        return false;
+    }
+
+    // Save every mixer state the pass touches; the rack's input switches stay exactly as they are
+    // (the sources must keep feeding the plugins during the capture).
+    for (const Track& tr : g_proj.tracks) g_freeze.savedMuteSolo.push_back({tr.muted, tr.solo});
+    for (const Track& tr : g_proj.tracks) if (tr.kind == 4) {
+        std::array<bool, 8> on{};
+        for (int s = 0; s < 8; ++s) on[(size_t)s] = tr.vstInputs[s].on;
+        g_freeze.savedVstInputs.push_back(on);
+    }
+    g_freeze.savedLoopEnabled = g_proj.loopEnabled;
+    g_freeze.savedLoopStart = g_proj.loopStart;
+    g_freeze.savedLoopEnd = g_proj.loopEnd;
+    g_freeze.savedMasterChain = g_masterChainEnabled.load(std::memory_order_relaxed);
+    g_freeze.savedVolume = rack.volume;
+
+    if (timelinePlaying()) toggleTimelinePlay();                  // the capture always plays from t0
+    for (Track& tr : g_proj.tracks) { tr.muted = true; tr.solo = false; }
+    for (int si : sources) {                                      // the sources stay live: the rack hears them
+        g_proj.tracks[(size_t)si].muted = false;
+        g_proj.tracks[(size_t)si].solo = false;
+    }
+    rack.muted = false;
+    rack.solo = false;                                            // no solo: the replace-mode routing must see its sources audible
+    rack.volume = 1.f;                                            // the rack fader stays live on the frozen WAV
+    g_proj.loopEnabled = false;
+    g_masterChainEnabled.store(false, std::memory_order_relaxed);
+    pushVstActiveLive();                                          // the rack stays active: its sources are audible again
+
+    // OFFLINE rack lock (PURE C++): the rack renders in CAW's own VST host (rack_offline.h) - the
+    // same pointer-free path the live 4th engine uses. NO Csound in the bounce path: the offline
+    // Csound host is what faulted inside csound7_64.dll during the bounce, and that crash
+    // bypassed every handler (no report file was ever written). Requirements: the rack has a
+    // plugin, and every source is LOCKED (its rendered WAV feeds through the streaming reader)
+    // or is an unfrozen VSTi (the rack renders it natively, engine 3). Anything else falls back
+    // to the real-time capture below.
+    bool cppOk = !rack.vstPath.empty();
+    bool pdLibAvailable = [&] { if (!g_pdLibraryPath.empty()) return true; g_pdLibraryPath = plat::bundledLibpd(); return !g_pdLibraryPath.empty(); }();
+    for (int si : sources) {
+        const Track& st = g_proj.tracks[(size_t)si];
+        if (trackFrozen(st) || (st.kind == 3 && !st.vstPath.empty())) continue;   // locked: WAV stream; VSTi: rendered natively (engine 3)
+        if (st.kind == 6 && pdLibAvailable) continue;                             // PD: rendered by the C++ PD host mixer (engine 1) - no freeze, no Csound
+        cppOk = false;
+        break;
+    }
+    if (offlineOk) {
+        if (!cppOk) {
+            logLine("[caw] Offline rack lock needs every source locked (LKD) first - an unlocked source's sound can only be rendered live. Falling back to the real-time capture.");
+        } else {
+        // PURE C++ OFFLINE RACK BOUNCE: the rack renders in CAW's own VST host (rack_offline.h),
+        // the same pointer-free path the live 4th engine uses - no Csound anywhere in the render
+        // path. Locked sources feed their rendered WAVs through the streaming reader; unfrozen
+        // VSTi sources render natively (engine 3); the rack's and the VSTi sources' MIDI clips are
+        // scheduled on the block clock. Falls back to the real-time capture on any problem.
+        std::string error;
+        std::map<int, cawcpp::RackCppRender::SourceStream> streams;
+        for (int si : sources) {
+            const Track& st = g_proj.tracks[(size_t)si];
+            if (trackFrozen(st) && !st.freezePath.empty())
+                streams[st.id] = { st.freezePath, st.freezeStart, std::max(0.f, std::min(kMaxVolumeGain, st.volume)) };   // the fader rides on top; the volume lane is baked into the WAV
+        }
+        // Render ONLY the rack and its sources: the job set stays small and honest.
+        std::set<int> keepIds;   // freezeVsteSources returns INDICES - resolve them into track IDs first
+        for (int si : sources)
+            if (si >= 0 && si < (int)g_proj.tracks.size()) keepIds.insert(g_proj.tracks[(size_t)si].id);
+        keepIds.insert(rack.id);
+        Project renderProj = g_proj;
+        {
+            std::vector<Track> keep;
+            for (const Track& tr : renderProj.tracks)
+                if (keepIds.count(tr.id)) keep.push_back(tr);
+            renderProj.tracks = std::move(keep);
+        }
+        vstui::captureAllParameters(g_proj);   // the render uses exactly what the plugin GUIs show
+        std::vector<VstJob> jobs = collectVstJobs(renderProj, {});
+        captureLiveVstInstanceState(jobs);   // the offline rack starts where the LIVE sound is
+        for (VstJob& j : jobs)
+            if (j.id == rack.id) j.outMode = 0;   // FX only for the render: the master carries the rack's wet output alone
+        // Belt and braces: the render knows its own wiring exactly. Re-resolve the rack's ENABLED
+        // input slots here (a locked source streams its WAV through engine 4; an unfrozen VSTi
+        // source renders in this rack, engine 3; unfrozen PD renders in the C++ mixer, engine 1),
+        // so the plugin hears the sources even if the shared route resolution came up empty.
+        for (VstJob& j : jobs) {
+            if (j.id != rack.id || !j.routedIn) continue;
+            int cursor = 0;
+            for (int s = 0; s < 8; ++s) {
+                auto& in = j.inputs[s];
+                if (!in.on || in.mode == 2 || in.name.empty()) continue;
+                const Track* src = nullptr;
+                for (const Track& o : renderProj.tracks) {
+                    const bool match = in.mode == 0 ? o.name == in.name
+                        : std::any_of(o.clips.begin(), o.clips.end(),
+                            [&](const Clip& c) { return c.name == in.name; });
+                    if (match) { src = &o; break; }
+                }
+                if (!src) { logLine("[caw] Offline render: the rack's input in" + std::to_string(s + 1) + " \"" + in.name + "\" matches no source track in the render."); continue; }
+                in.lineStart = cursor;
+                in.lineCount = 2;
+                in.srcId = src->id;
+                in.engine = trackFrozen(*src) ? 4 : (src->kind == 3 ? 3 : (src->kind == 6 ? 1 : (src->kind == 5 ? 2 : 0)));
+                if (in.engine == 0) in.csChans.clear();   // a locked Csound source streams through engine 4 (cppOk guarantees locked)
+                cursor += 2;
+            }
+        }
+        if (jobs.empty()) error = "no renderable plugin set.";
+        // MIDI: the rack's own clips and the unfrozen VSTi sources' clips, on the block clock.
+        std::vector<cawcpp::RackCppRender::Note> notes;
+        auto collectNotes = [&](const Track& t) {
+            for (const MidiClip& mc : t.midiClips) {
+                if (mc.muted) continue;
+                for (const MidiNote& n : mc.notes) {
+                    if (n.start >= mc.dur) continue;
+                    cawcpp::RackCppRender::Note nn;
+                    nn.start = mc.start + n.start;
+                    nn.dur = std::max(0.005, std::min(mc.start + mc.dur, nn.start + n.dur) - nn.start);
+                    nn.pitch = std::min(127, std::max(0, n.pitch));
+                    nn.vel = std::min(127, std::max(1, n.velocity));
+                    nn.trackId = t.id;
+                    notes.push_back(nn);
+                }
+            }
+        };
+        collectNotes(rack);
+        for (int si : sources) {
+            const Track& st = g_proj.tracks[(size_t)si];
+            if (!trackFrozen(st)) collectNotes(st);
+        }
+        g_freeze.csdPath.clear();
+        g_freeze.offlineWavPath = g_freeze.tmpPath + ".full.wav";
+        if (error.empty()) {
+            if (error.empty()) {
+            // Say exactly what the rack will hear, so a silent render is diagnosable from the console.
+            for (const VstJob& j : jobs) if (j.id == rack.id) {
+                std::string sum;
+                for (int s = 0; s < 8; ++s) {
+                    const auto& src = j.inputs[s];
+                    if (!src.on || src.lineCount <= 0) continue;
+                    sum += " in" + std::to_string(s + 1) + " \"" + src.name + "\" engine=" + std::to_string(src.engine) + " (" + std::to_string(src.lineCount) + " lines),";
+                }
+                logLine("[caw] Offline render: the rack's inputs:" + (sum.empty() ? " (none enabled)" : sum));
+            }
+        }
+        // Unfrozen PD sources: the C++ PD host mixer renders their clips (engine 1 via pdMix).
+            std::vector<pd_timeline::Event> pdPlan;
+            std::string pdLib;
+            bool pdNeeded = false;
+            for (int si : sources)
+                if (!trackFrozen(g_proj.tracks[(size_t)si]) && g_proj.tracks[(size_t)si].kind == 6) pdNeeded = true;
+            if (pdNeeded) {
+                int bad = 0; std::string pdErr;
+                if (!pd_timeline::makePlan(renderProj, g_projectPath, pdPlan, pdErr, false, &bad, true))
+                    error = "PD clip problem: " + pdErr;
+                else
+                    pdLib = pdLibAvailable ? g_pdLibraryPath : std::string();
+            }
+            if (error.empty()) {
+                if (pdNeeded)
+                    g_cppRender.startPd(std::move(jobs), std::move(streams), std::move(notes), g_freeze.rate,
+                                        g_freeze.offlineWavPath, g_freeze.t1 + std::max(0.0, g_proj.cs.tail) + 1.0,
+                                        std::move(pdLib), std::move(pdPlan), buildVstScripts(renderProj));
+                else
+                    g_cppRender.start(std::move(jobs), std::move(streams), std::move(notes), g_freeze.rate,
+                                      g_freeze.offlineWavPath, g_freeze.t1 + std::max(0.0, g_proj.cs.tail) + 1.0,
+                                      buildVstScripts(renderProj));
+            }
+        }
+        if (error.empty()) {
+            g_freeze.offline = true;
+            g_freeze.cppOffline = true;
+            g_freezeSilent.store(false, std::memory_order_release);   // nothing plays during the offline pass: no silence to keep
+            g_freeze.phase = 3;
+            g_freeze.startedAt = std::chrono::steady_clock::now();
+            logLine("[caw] Locking the rack \"" + rack.name + "\": OFFLINE render of " +
+                    std::to_string(g_freeze.t1 - g_freeze.t0) + " s in CAW's C++ VST host (no Csound in the render path) to " + g_freeze.finalPath);
+            return true;
+        }
+        logLine("[caw] Offline rack lock not available (" + error + ") - falling back to the real-time capture.");
+        g_freeze.offlineWavPath.clear();
+        }
+        if (!g_vstEngineOn) { logLine("[caw] Locking the rack needs the VST engine: press Run VST first."); return false; }
+        for (int si : sources) {
+            const Track& st = g_proj.tracks[(size_t)si];
+            if (st.kind == 5 && !g_scReady) { logLine("[caw] Locking the rack needs SuperCollider running (a source uses it)."); return false; }
+            if (st.kind == 6 && !g_pdEngineOn && !g_mixedPd) { logLine("[caw] Locking the rack needs Pure Data (DSP) running (a source uses it)."); return false; }
+            if (st.kind == 7 && !g_langAudio) { logLine("[caw] Locking the rack needs Audio enabled (a live sample source uses it)."); return false; }
+        }
+    }
+
+    g_freezeSilent.store(true, std::memory_order_release);   // the capture keeps working; the speakers stay silent
+    freezeStartWriter();
+    seekTimeline(g_freeze.t0);
+    toggleTimelinePlay();
+    logLine("[caw] Locking the rack \"" + rack.name + "\": rendering " + std::to_string(sources.size()) +
+            " source(s) through its plugins, " + std::to_string(g_freeze.t1 - g_freeze.t0) + " s to " + g_freeze.finalPath);
+    return true;
+}

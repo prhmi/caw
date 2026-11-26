@@ -79,7 +79,7 @@ inline bool write(const Project& project, const std::filesystem::path& parent,
                 const ParsedTrack parsed = parseClipForTrack(clip, track, false);
                 text << "; Track: " << track.name << " | Clip: " << clip.name << "\n";
                 for (const auto& param : parsed.params)
-                    text << "chn_k \"" << channelName(clip.name, param.chn) << "\", 3\n";
+                    text << "chnk \"" << channelName(clip.name, param.chn) << "\", 3\n";
                 text << "instr " << clip.name << "\n" << parsed.body << "\nendin\n\n";
             }
         }

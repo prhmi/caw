@@ -7,6 +7,7 @@
 //   pitch vel dur time  pitch / velocity of the MIDI clip note that started this clip, clip length, seconds since the clip started
 //   lfo(f) tri(f) saw(f) sqr(f) rnd(n) rnd(a,b) smooth(x,t) line(a,b) clip(x,lo,hi) min max abs sin cos int sqrt level(in) mtof(n) uni(x)
 //   p2 = cawget("test1")  bind parameter 2 to the automation lane "test1" (wins over the slot's own lane)
+//   seed 0              new random numbers every run (like Csound's seed 0); seed 5 = the same sequence every run
 //   csound: <any Csound line>
 #include <algorithm>
 #include <cctype>
@@ -212,7 +213,7 @@ inline std::string translate(const Track& t, const std::string& code) {
     }
     else o << "aInL = 0\naInR = 0\n";
     for (const std::string& v : c.vars) if (!(v.size() == 3 && v[1] == 'P')) o << v << " init 0\n";
-    o << "if p4 > 0 then\nevent_i \"i\", \"CawVstNote_" << idStr << "\", 0, p3, p4, p5\nendif\n";
+    o << "if p4 > 0 then\neventi \"i\", \"CawVstNote_" << idStr << "\", 0, p3, p4, p5\nendif\n";
     o << body.str();
     // Send every slot that has a picked parameter AND every code-bound slot (p2 = cawget "lane"),
     // even when nothing is picked: the channel exists (vstOrchestra declares bound slots too) and

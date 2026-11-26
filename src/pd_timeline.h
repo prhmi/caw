@@ -21,6 +21,7 @@ struct Event {
     int trackId=0;
     std::vector<Automation> automation;
     std::vector<pd_control_syntax::Output> outputs;
+    std::vector<pd_control_syntax::BusLink> buses;   // CAW AUDIO BUSES: cawbrecv / cawbsend comment lines of the patch
     // Muted by the track / clip M / S state. The clip stays loaded (its instance is
     // preloaded with the rest), it is simply not ticked - so muting never restarts
     // the engine or stops the transport while the other engines keep playing.
@@ -42,7 +43,7 @@ inline bool makePlan(const Project& p, const std::string& projectPath,
     bool otherAudio=false;
     bool audiblePd=false;   // a PD clip that can actually sound: muted PD clips are not a conflict
     for(const auto& t:p.tracks) {
-        const bool trackAudible = !t.muted && !(anySolo && !t.solo);
+        const bool trackAudible = !t.muted && !(anySolo && !t.solo) && !trackFrozen(t);   // frozen: the PD clips are baked into the WAV
         if(!trackAudible && !includeMuted) continue;
         for(const auto& c:t.clips) {
             const bool clipAudible = trackAudible && !c.muted;
@@ -71,6 +72,7 @@ inline bool makePlan(const Project& p, const std::string& projectPath,
                     error="Cannot read PD patch for clip '"+c.name+"': "+readError;if(badClip)*badClip=c.id;return false;
                 }
                 ev.outputs=pd_control_syntax::outputs(source);
+                ev.buses=pd_control_syntax::busLinks(source);
                 for(const auto& name:pd_control_syntax::inputs(source)) {
                     Automation a;a.name=name;
                     auto range=t.automationRanges.find(name);

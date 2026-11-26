@@ -1,9 +1,11 @@
+#include "volume_limits.h"
 #include "project_io.h"
 #include "csd_builder.h"
 #include "master_fx.h"
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -31,7 +33,7 @@ bool readString(std::istream& in, std::string& value) {
 namespace {
 void writeProject(std::ostream& out, const Project& p) {
     const CsoundSettings& s = p.cs;
-    out << "CAW_PROJECT 58\n"
+    out << "CAW_PROJECT 68\n"   // 61: EXPORTRANGE1 (the version constant was missed when the field was added - fixed)
         << s.sr << ' ' << s.ksmps << ' ' << s.nchnls << ' ' << s.nchnlsIn << ' '
         << std::setprecision(17) << s.zdbfs << ' ' << s.a4 << ' ' << s.bufSW << ' ' << s.bufHW << ' '
         << s.outDev << ' ' << s.inDev << ' ' << s.renderFormat << ' ' << s.tail << ' '
@@ -275,15 +277,42 @@ void writeProject(std::ostream& out, const Project& p) {
     for (const Track& t : p.tracks) {
         out << (t.vstOutMode == 1 ? 1 : 0) << '\n';
         for (int i = 0; i < 8; ++i) {
-            out << (t.vstInputs[i].on ? 1 : 0) << ' ' << std::min(2, std::max(0, t.vstInputs[i].mode)) << '\n';
+            out << ((t.vstInputs[i].on ? 1 : 0) | (t.vstInputs[i].sidechain ? 2 : 0)) << ' ' << std::min(2, std::max(0, t.vstInputs[i].mode)) << '\n';
             writeString(out, t.vstInputs[i].name);
         }
     }
+    out << "VSTINRX1\n";                           // version 62: per-input receive mode (0 = stereo fold, 1 = multichannel)
+    for (const Track& t : p.tracks)
+        for (int i = 0; i < 8; ++i) out << std::min(1, std::max(0, t.vstInputs[i].receive)) << '\n';
+    out << "VSTOUTW1\n";                           // version 63: the plugin output width (0 = stereo fold, 1 = as source)
+    for (const Track& t : p.tracks) out << std::min(1, std::max(0, t.vstOutWide)) << '\n';
+    out << "VSTCH1\n";                             // version 64: the VSTe effect chain (stages 2..8 in order) + each slot's stage
+    for (const Track& t : p.tracks) {
+        out << t.vstChainCount() << '\n';
+        for (int st = 0; st < t.vstChainCount(); ++st) {
+            const Track::VstStage& sg = t.vstChain[st];
+            writeString(out, sg.path);
+            writeString(out, sg.classId);
+            out << sg.parameterState.size();
+            for (const auto& kv : sg.parameterState) out << ' ' << kv.first << ' ' << std::setprecision(17) << kv.second;
+            out << '\n';
+            writeString(out, sg.patchState);
+        }
+        for (int k = 0; k < 8; ++k) out << std::min(7, std::max(0, t.vstSlotStage[k])) << ' ';
+        out << '\n';
+    }
+    // version 65: the VST output routing text (out<n> = in<m>). ONE block after the chain block: an
+    // earlier build wrote it inside the per-track loop (once per track), the reader accepts both.
+    out << "VSTROUTE1\n";
+    for (const Track& t : p.tracks) writeString(out, t.vstRouteCode);
     out << "VSTCID1\n";                             // version 54: the plugin class inside the .vst3 (a bundle can hold several)
     for (const Track& t : p.tracks) writeString(out, t.vstClassId);
     out << "AUTOSAVE1 " << (s.autosaveEnabled ? 1 : 0) << ' ' << s.autosaveMinutes << '\n';
     out << "MASTER1 " << std::setprecision(9) << s.masterGain << '\n';
     out << "EXPORT1 " << s.exportChannels << ' ' << s.exportFlacBits << ' ' << s.exportMp3Kbps << '\n';
+    out << "RENDERMODE1 " << (s.renderMode == 1 ? 1 : 0) << '\n';
+    out << "EXPORTRANGE1 " << std::setprecision(9) << std::max(0.0, s.exportStart) << ' ' << std::max(0.0, s.exportEnd) << '\n';
+    out << "EXTENS1 " << s.exportSource << ' ' << s.exportConvert << ' ' << (s.exportConvertOn ? 1 : 0) << ' ' << (s.exportSplit ? 1 : 0) << '\n';
     out << "UIFONT1 " << std::setprecision(9) << s.programFontSize << '\n';
     out << "VSTPARAMS1\n";
     for (const Track& t : p.tracks) {
@@ -333,6 +362,26 @@ void writeProject(std::ostream& out, const Project& p) {
             writeString(out, s.name);
             writeString(out, s.state);
         }
+    }
+    // version 59: frozen tracks (freeze WAV path, timeline start and end of the rendered span)
+    out << "FREEZE1\n";
+    for (const Track& t : p.tracks) {
+        out << (t.frozen ? 1 : 0) << ' ';
+        writeString(out, t.freezePath);
+        out << std::setprecision(17) << t.freezeStart << ' ' << t.freezeEnd << '\n';
+    }
+    // version 66: the VST track channel format (1..8, 0 = derive from the old Out stereo / Out source)
+    out << "VSTCHANS1\n";
+    for (const Track& t : p.tracks) out << std::min(8, std::max(0, t.vstChannels)) << '\n';
+    // version 67: plugin-window sync options (bit 0 = parameter poll, bit 1 = window audio feed)
+    out << "VSTSYNC1\n";
+    for (const Track& t : p.tracks) out << ((t.vstParamPoll ? 1 : 0) | (t.vstWindowFeed ? 2 : 0)) << '\n';
+    // version 68: effect on/off (bit k = effect k+1 bypassed)
+    out << "VSTBYPASS1\n";
+    for (const Track& t : p.tracks) {
+        unsigned b = t.vstBypass0 ? 1u : 0u;
+        for (int st = 1; st < 8; ++st) if (t.vstChain[st - 1].bypass) b |= 1u << st;
+        out << b << '\n';
     }
 }
 
@@ -423,7 +472,7 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
     Project candidate;
     std::string magic;
     int version = 0;
-    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 58)) {
+    if (!(in >> magic >> version) || magic != "CAW_PROJECT" || (version < 1 || version > 68)) {
         error = "This is not a supported CAW project file.";
         return false;
     }
@@ -1042,7 +1091,8 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
             for (int i = 0; i < 8; ++i) {
                 int on = 0, mode = 0;
                 if (!(in >> on >> mode) || !readString(in, track.vstInputs[i].name)) { error = "A VST input setting is invalid."; return false; }
-                track.vstInputs[i].on = on != 0;
+                track.vstInputs[i].on = (on & 1) != 0;
+                track.vstInputs[i].sidechain = (on & 2) != 0;   // bit 1 = sidechain (older builds read the field as plain on/off)
                 track.vstInputs[i].mode = std::min(2, std::max(0, mode));
             }
         }
@@ -1069,6 +1119,76 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
             if (marker != "VSTIN1") { in.clear(); in.seekg(pos); break; }
         }
     }
+    if (version >= 62) {
+        std::string marker;
+        if (!(in >> marker) || marker != "VSTINRX1") { error = "The VST input receive block is invalid."; return false; }
+        for (Track& track : candidate.tracks)
+            for (int i = 0; i < 8; ++i) {
+                int rx = 0;
+                if (!(in >> rx)) { error = "A VST input receive mode is invalid."; return false; }
+                track.vstInputs[i].receive = std::min(1, std::max(0, rx));
+            }
+    }
+    if (version >= 63) {
+        std::string marker;
+        if (!(in >> marker) || marker != "VSTOUTW1") { error = "The VST output-width block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            int ow = 0;
+            if (!(in >> ow)) { error = "A VST output width is invalid."; return false; }
+            track.vstOutWide = std::min(1, std::max(0, ow));
+        }
+    }
+    if (version >= 64) {
+        std::string marker;
+        if (!(in >> marker) || marker != "VSTCH1") { error = "The VST chain block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            int n = 0;
+            if (!(in >> n)) { error = "A VST chain stage count is invalid."; return false; }
+            n = std::min(7, std::max(0, n));
+            for (int st = 0; st < n; ++st) {
+                Track::VstStage& sg = track.vstChain[st];
+                std::string pathBuf, classBuf, patchBuf;
+                if (!readString(in, pathBuf) || !readString(in, classBuf)) { error = "The VST chain block is invalid."; return false; }
+                sg.path = pathBuf; sg.classId = classBuf;
+                size_t count = 0;
+                if (!(in >> count)) { error = "A VST chain stage parameter count is invalid."; return false; }
+                for (size_t pi = 0; pi < count; ++pi) {
+                    uint32_t id = 0; double v = 0;
+                    if (!(in >> id >> v)) { error = "A VST chain stage parameter is invalid."; return false; }
+                    sg.parameterState[id] = v;
+                }
+                if (!readString(in, patchBuf)) { error = "The VST chain block is invalid."; return false; }
+                sg.patchState = patchBuf;
+            }
+            for (int k = 0; k < 8; ++k) {
+                int stg = 0;
+                if (!(in >> stg)) { error = "A VST slot stage is invalid."; return false; }
+                track.vstSlotStage[k] = std::min(7, std::max(0, stg));
+            }
+            // Files from the build that wrote VSTROUTE1 inside this loop: a routing block follows EVERY
+            // track (each copy holds all tracks' texts). Read it here; the last copy wins (they are equal).
+            if (version >= 65 && &track != &candidate.tracks.back()) {
+                const std::streampos pos = in.tellg();
+                std::string peek;
+                if (in >> peek && peek == "VSTROUTE1") {
+                    for (Track& rt : candidate.tracks) {
+                        std::string routeBuf;
+                        if (!readString(in, routeBuf)) { error = "The VST routing block is invalid."; return false; }
+                        rt.vstRouteCode = routeBuf;
+                    }
+                } else { in.clear(); in.seekg(pos); }
+            }
+        }
+    }
+    if (version >= 65) {
+        std::string marker;
+        if (!(in >> marker) || marker != "VSTROUTE1") { error = "The VST routing block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            std::string routeBuf;
+            if (!readString(in, routeBuf)) { error = "The VST routing block is invalid."; return false; }
+            track.vstRouteCode = routeBuf;
+        }
+    }
     if (version >= 54) {
         std::string marker;
         if (!(in >> marker) || marker != "VSTCID1") { error = "The VST class block is invalid."; return false; }
@@ -1087,7 +1207,7 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
     if (version >= 47) {
         std::string marker;
         if (!(in >> marker >> s.masterGain) || marker != "MASTER1" ||
-            !std::isfinite(s.masterGain) || s.masterGain < 0.f || s.masterGain > 2.f) {
+            !std::isfinite(s.masterGain) || s.masterGain < 0.f || s.masterGain > kMaxVolumeGain) {
             error = "The master gain setting is invalid."; return false;
         }
     }
@@ -1099,6 +1219,42 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
             error = "The audio export settings are invalid."; return false;
         }
     } else s.exportChannels = std::min(64, std::max(1, s.nchnls));
+    // The read order MUST mirror the writer (serializeSettings): RENDERMODE1 / EXPORTRANGE1 sit
+    // between EXPORT1 and UIFONT1. (A mismatch here made every load since round 160 fail.)
+    if (version >= 56) {
+        std::string marker;
+        if (!(in >> marker >> s.renderMode) || marker != "RENDERMODE1" || s.renderMode < 0 || s.renderMode > 1) {
+            error = "The render mode setting is invalid."; return false;
+        }
+    }
+    // The export range was added (round 166) while the version constant stayed 60, so saves from
+    // rounds 166-168 carry it with version 60: accept the marker at ANY version and push an
+    // unexpected marker back for the next block (an old file simply has none).
+    {
+        std::string marker;
+        if (!(in >> marker)) { error = "The export range setting is invalid."; return false; }
+        if (marker == "EXPORTRANGE1") {
+            if (!(in >> s.exportStart >> s.exportEnd) ||
+                !std::isfinite(s.exportStart) || !std::isfinite(s.exportEnd) || s.exportStart < 0.0 || s.exportEnd < 0.0) {
+                error = "The export range setting is invalid."; return false;
+            }
+        } else {
+            for (auto it = marker.rbegin(); it != marker.rend(); ++it) in.unget();
+        }
+    }
+    {
+        std::string marker;
+        if (!(in >> marker)) { error = "The export source setting is invalid."; return false; }
+        if (marker == "EXTENS1") {
+            int cvOn = 0, split = 0;
+            if (!(in >> s.exportSource >> s.exportConvert >> cvOn >> split) || s.exportSource < 0 || s.exportSource > 1 ||
+                s.exportConvert < 0 || s.exportConvert > 4) { error = "The export source setting is invalid."; return false; }
+            s.exportConvertOn = cvOn != 0;
+            s.exportSplit = split != 0;
+        } else {
+            for (auto it = marker.rbegin(); it != marker.rend(); ++it) in.unget();
+        }
+    }
     if (version >= 49) {
         std::string marker;
         if (!(in >> marker >> s.programFontSize) || marker != "UIFONT1" ||
@@ -1198,7 +1354,7 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
         if (!(in >> marker) || marker != "TRACKV1") { error = "The track volume block is invalid."; return false; }
         for (Track& track : candidate.tracks) {
             float vol = 1.f;
-            if (!(in >> vol) || vol < 0.f || vol > 2.f) { error = "A track volume is invalid."; return false; }
+            if (!(in >> vol) || vol < 0.f || vol > kMaxVolumeGain || !std::isfinite(vol)) { error = "A track volume is invalid."; return false; }
             track.volume = vol;
         }
         std::string fxMarker;
@@ -1215,6 +1371,61 @@ bool readProject(std::istream& in, Project& project, std::string& error) {
         }
         masterfx::rack().restore(slots);   // the plugins load lazily when the Master FX window opens
     }
+    if (version >= 59) {
+        std::string fzMarker;
+        if (!(in >> fzMarker) || fzMarker != "FREEZE1") { error = "The freeze block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            int frozen = 0;
+            std::string path;
+            double start = 0.0, end = 0.0;
+            if (!(in >> frozen) || (frozen != 0 && frozen != 1) || !readString(in, path) ||
+                !(in >> start >> end) || start < 0.0 || end < start) {
+                error = "A frozen track entry is invalid."; return false;
+            }
+            if (frozen) {
+                // The freeze WAV must exist: a project moved to another computer without its
+                // freeze folder just loads the track unfrozen (the live engines play again).
+                std::error_code ec;
+                if (!path.empty() && std::filesystem::exists(std::filesystem::u8path(path), ec)) {
+                    track.frozen = true;
+                    track.freezePath = path;
+                    track.freezeStart = start;
+                    track.freezeEnd = end;
+                }
+            }
+        }
+    }
+    if (version >= 66) {
+        std::string marker;
+        if (!(in >> marker) || marker != "VSTCHANS1") { error = "The VST channel block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            int ch = 0;
+            if (!(in >> ch)) { error = "A VST track channel count is invalid."; return false; }
+            track.vstChannels = std::min(8, std::max(0, ch));
+        }
+    }
+    if (version >= 67) {
+        std::string marker;
+        if (!(in >> marker) || marker != "VSTSYNC1") { error = "The VST window sync block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            int bits = 0;
+            if (!(in >> bits)) { error = "A VST window sync setting is invalid."; return false; }
+            track.vstParamPoll = (bits & 1) != 0;
+            track.vstWindowFeed = (bits & 2) != 0;
+        }
+    }
+    if (version >= 68) {
+        std::string marker;
+        if (!(in >> marker) || marker != "VSTBYPASS1") { error = "The VST bypass block is invalid."; return false; }
+        for (Track& track : candidate.tracks) {
+            unsigned b = 0;
+            if (!(in >> b)) { error = "A VST bypass setting is invalid."; return false; }
+            track.vstBypass0 = (b & 1u) != 0;
+            for (int st = 1; st < 8; ++st) track.vstChain[st - 1].bypass = (b >> st) & 1u;
+        }
+    }
+    for (Track& track : candidate.tracks)   // older projects: Out stereo -> 2 channels, Out source -> 4 (change it in the panel)
+        if ((track.kind == 3 || track.kind == 4) && track.vstChannels <= 0) track.vstChannels = track.vstOutWide == 1 ? 4 : 2;
     if (version < 37) {
         for (Track& track : candidate.tracks) {
             for (Clip& clip : track.clips) migrateOldCaw(track, clip);

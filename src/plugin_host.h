@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <string>
 #include <vector>
 #include <memory>
@@ -31,14 +32,33 @@ struct IPlugin {
     virtual std::string classId() const = 0;               // the class the plugin actually loaded
     virtual bool isInstrument() const = 0;
     virtual void prepare(double sr, int maxBlock) = 0;
+    // The channel count the host wants on the main buses (the track's channel format). Set BEFORE
+    // prepare(): prepare asks the plugin for that layout (VST3 setBusArrangements). 0 = keep its own.
+    virtual void setWantedChannels(int n) { (void)n; }
     // The plugin's reported processing latency in samples (0 for most plugins; oversampled / look-ahead
     // FX report their internal delay). The host uses it to align the raw source with the effect in mix mode.
     virtual int latencySamples() const { return 0; }
     // Configure/activate the editor-side component when the host audio engine becomes ready.
     // This is deliberately separate from prepare(): the editor instance must not start audio processing.
     virtual void prepareEditor(double sr, int maxBlock) { (void)sr; (void)maxBlock; }
+    // ONE INSTANCE PER PLUGIN: true while the live engine renders THIS object. The window's own
+    // idle processing (prepareEditor / processIdle / the feed) is then skipped - the window already
+    // shows the playing plugin, and process() must never run on two threads at once.
+    std::atomic<int> engineOwnedCount{0};   // how many live rack Insts wrap this object (a graph swap briefly has two)
+    std::atomic<bool> engineOwned{false};
     // in = bus audio (null for instruments), out = result. MIDI and param events are pulled from ep.
     virtual void process(const float* in, float* out, int frames, int channels, Endpoint& ep) = 0;
+    // The plugin's first audio OUTPUT bus channel count (queried from the VST3 bus info).
+    // CAW is the virtual soundcard: a 4-channel instrument plays 4 meters and folds into the
+    // master with the same k mod N rule every engine follows.
+    virtual int outputChannels() const { return 2; }
+    // The main audio INPUT bus width (VSTe): a chain stage folds the previous stage's output
+    // into this many lines (channel c plays on input c mod M - the virtual-soundcard rule).
+    virtual int inputChannels() const { return 2; }
+    // SIDECHAIN: interleaved stereo (frames * 2) for the plugin's auxiliary (sidechain) input bus, valid for the
+    // NEXT process() call only (nullptr = silence). sidechainChannels() is 0 when the plugin has no such bus.
+    virtual void setSidechain(const float* interleavedStereo) { (void)interleavedStereo; }
+    virtual int sidechainChannels() const { return 0; }
     virtual const std::vector<PluginParam>& params() const = 0;
     virtual void setParam(int index, double normalized) = 0;
     virtual double getParam(int index) const = 0;

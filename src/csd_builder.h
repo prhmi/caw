@@ -1,6 +1,7 @@
 #pragma once
 #include "model.h"
 #include <filesystem>
+#include <functional>
 
 // Where one clip's code sits in a generated orchestra, to turn Csound's "line N" back into "instr Lead1, clip line K".
 struct OrcSpan {
@@ -57,7 +58,11 @@ ParsedTrack parseTrack(const Track& t);
 // Master meter = one entry per output channel (nchnls), so indices 0 .. masterChannels-1 are the master outputs.
 inline int masterChannels(const CsoundSettings& s) { return s.nchnls < 1 ? 1 : (s.nchnls > 64 ? 64 : s.nchnls); }
 struct LaneMeterInfo { int trackId = 0; int first = 0; int channels = 0; bool csoundOnly = false; };
-std::vector<LaneMeterInfo> meterLayout(const Project& p);
+// A live hook the app wires to the VST engine: a track id -> the loaded plugin's real output
+// channel count (2 when unknown / not loaded). The meter lane layout uses it so a 4-channel
+// instrument gets 4 lanes. Must stay in sync with the CSD's lane allocation (both call it).
+inline std::function<int(int)> vstTrackOutputChannels;
+std::vector<LaneMeterInfo> meterLayout(const Project& p, const std::string& projectPath = {});
 // Clips (unique names, project order) whose code sends to the channel "rec": the engine monitor streams them to the app for the live Rec button.
 std::vector<std::string> recClipNames(const Project& p);
 struct CawWriteTarget { std::string clip, channel; };
@@ -72,7 +77,11 @@ std::string defaultOptions(const CsoundSettings& s);
 void syncSettingsFromOptions(CsoundSettings& s);
 // Writes the settings fields (device, backend, buffers) into the matching tokens of s.options.
 void syncOptionsFromSettings(CsoundSettings& s);
-std::string buildHeader(const CsoundSettings& s);                            // sr, ksmps, nchnls, 0dbfs, A4
+std::string buildHeader(const CsoundSettings& s, int renderNchnls = 0);      // sr, ksmps, nchnls, 0dbfs, A4 (renderNchnls 0 = s.nchnls)
+// The channel count the Csound engine really renders: the soundcard setup's width, widened to
+// the widest out / outs / outch / outq ... channel any clip code (or the orchestra code) writes.
+// Wider than the setup is fine: the engine folds the extra channels into the master (k mod N).
+int csoundRenderChannels(const Project& p);
 // mode: "engine" (Run: real time, instruments only, the timeline triggers them over stdin) or "render" (the output file is given on the csound command line with -o)
 std::string buildOptions(const CsoundSettings& s, const std::string& mode);
 // fromTime: start playing from this position (seconds); clips are shifted so the CSD starts at 0

@@ -9,6 +9,7 @@
 // plain Csound statements. They are ignored, exactly like unknown lines are skipped.
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -35,6 +36,7 @@ struct Expr {
 struct Stmt {
     enum Kind { Every, When, Assign, Note, Cc, Msg, Play, Once, Skip } kind = Skip;
     ExprP a, b, c;         // Every: interval | When: condition | Assign: value | Note: pitch/vel/len | Cc: num/val | Msg: status/d1/d2 | Play: start/dur/speed
+    ExprP d = nullptr;     // Play: the grain's output channel (1..8, any expression - rnd(8) = a random channel each grain)
     int var = -1;          // Assign target: variable index
     int slot = -1;         // Assign target: P slot (0..7)
     char op = 0;           // Assign: 0 set, else + - * /
@@ -48,6 +50,9 @@ struct Program {
     bool writesP[8] = {false, false, false, false, false, false, false, false};
     int states = 0;        // runtime state doubles (Every timers, smooth values)
     bool hasPlay = false;  // the code contains play: grains (the sample engine runs only them, not the straight file)
+    // seed N (like Csound's seed opcode): -1 = no seed line (the fixed per-clip sequence, as
+    // before), 0 = a new random sequence every run (from the clock), N > 0 = a fixed sequence N.
+    long long seed = -1;
     bool ok = true;
     std::string error;     // human-readable parse problems (empty = clean); valid parts still run
 };
@@ -63,7 +68,7 @@ struct Env {
 struct Events {
     struct Note { int pitch = 60, vel = 100; double len = 0.5; };
     struct Midi { int status = 0, d1 = 0, d2 = 0; };
-    struct Grain { double at = 0.0; double start = 0.0, dur = 0.1, speed = 1.0; };   // sample engine: one grain (speed < 0 plays it backwards)
+    struct Grain { double at = 0.0; double start = 0.0, dur = 0.1, speed = 1.0; double out = 0.0; };   // sample engine: one grain (speed < 0 plays it backwards; out = the grain's output channel, 1-based, 0 = the clip's routing)
     std::vector<Note> notes;
     std::vector<Midi> midi;
     std::vector<Grain> grains;
@@ -77,7 +82,16 @@ struct Runtime {
     void init(const Program& prog, const double* initP) {
         vars.assign(prog.varNames.size(), 0.0);
         state.assign((size_t)prog.states, std::nan(""));
-        rng = 0x9E3779B97F4A7C15ull ^ (uint64_t)(prog.states * 2654435761u + 1u);
+        if (prog.seed == 0) {   // seed 0: "real" random - different every run (clock + this object's address)
+            const uint64_t clock = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+            rng = clock ^ (uint64_t)(uintptr_t)this ^ 0x9E3779B97F4A7C15ull;
+        } else if (prog.seed > 0) {   // seed N: the same sequence every run, chosen by N
+            rng = 0x9E3779B97F4A7C15ull ^ ((uint64_t)prog.seed * 0xBF58476D1CE4E5B9ull);
+        } else {
+            rng = 0x9E3779B97F4A7C15ull ^ (uint64_t)(prog.states * 2654435761u + 1u);
+        }
+        if (rng == 0) rng = 0x9E3779B97F4A7C15ull;   // xorshift must never be 0
+        for (int w = 0; w < 4; ++w) nextRand();      // mix the start state
         for (int k = 0; k < 8; ++k) {
             double v = initP ? initP[k] : 0.5;
             if (!std::isfinite(v)) v = 0.5;
@@ -479,6 +493,7 @@ inline void runOne(const Stmt& s, Env& env, Runtime& rt, Events& out) {
         gr.start = std::max(0.0, eval(s.a, env, rt));
         gr.dur = std::max(0.005, eval(s.b, env, rt));
         gr.speed = eval(s.c, env, rt);
+        if (s.d) gr.out = eval(s.d, env, rt);   // the grain's output channel: 1..8 (0/negative = the clip's saved routing)
         if (!std::isfinite(gr.start) || gr.start < 0.0) gr.start = 0.0;
         if (!std::isfinite(gr.dur)) gr.dur = 0.1;
         gr.dur = std::min(30.0, gr.dur);   // a runaway duration cannot hold a voice forever
@@ -537,6 +552,13 @@ inline void Compiler::skipBlock() {
 
 inline void Compiler::statement(const std::string& line, std::vector<Stmt>& out) {
     auto has = [&](const char* p) { return detail::startsWith(line, p); };
+    if (has("seed ") || line == "seed") {   // seed N (Csound's seed): 0 = new random each run, N = fixed sequence
+        const std::string a = detail::trim(line.size() > 4 ? line.substr(4) : "0");
+        long long v = 0;
+        try { v = a.empty() ? 0 : std::stoll(a); } catch (...) { v = 0; }
+        prog_.seed = v < 0 ? 0 : v;
+        return;   // a setting, not a statement: it runs nothing per tick
+    }
     if (has("note ") || line == "note") {
         const auto a = detail::splitArgs(line.size() > 5 ? line.substr(5) : "");
         Stmt s; s.kind = Stmt::Note;
@@ -579,6 +601,7 @@ inline void Compiler::statement(const std::string& line, std::vector<Stmt>& out)
         s.b = expr(clean(a.size() > 1 ? a[1] : "0.1"));
         s.c = expr(clean(a.size() > 2 ? a[2] : "1"));
         if (!s.a || !s.b || !s.c) return;
+        if (a.size() > 3 && !a[3].empty()) s.d = expr(clean(a[3]));   // play: start, dur, speed, out-channel (any expression)
         prog_.hasPlay = true;
         out.push_back(std::move(s)); return;
     }
@@ -638,6 +661,9 @@ inline std::vector<Stmt> Compiler::parseBlock() {
             out.push_back(std::move(s));
             continue;
         }
+        // seed N is a SETTING (it adds no statement), so it is handled here and never counted
+        // as a dropped line ("cannot parse: seed 0" was that check misreading it).
+        if (detail::startsWith(line, "seed ") || line == "seed") { statement(line, out); continue; }
         const size_t before = out.size();
         statement(line, out);
         if (out.size() == before)   // the statement was dropped: bad keyword, wrong argument count, bad expression ...

@@ -76,15 +76,21 @@ public:
         p->setEditorSystemScaling(true);
         try {
             if (!p->load(path, classId, err)) {
-                std::lock_guard<std::mutex> lock(mu_);
-                slots_[(size_t)i].plugin.reset();
-                slots_[(size_t)i].ep.reset();
+                std::shared_ptr<caw::IPlugin> gone;
+                {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    gone = std::move(slots_[(size_t)i].plugin);
+                    slots_[(size_t)i].ep.reset();
+                }
+                gone.reset();   // outside the audio lock
                 return err.empty() ? "the plugin failed to load" : err;
             }
             p->prepare(sampleRate, std::max(64, maxBlock));
         } catch (...) { return "the plugin failed while loading"; }
-        std::lock_guard<std::mutex> lock(mu_);
+        std::shared_ptr<caw::IPlugin> old;   // the replaced plugin is destroyed AFTER the lock: its destructor may block for long
+        std::unique_lock<std::mutex> lock(mu_);
         Slot& s = slots_[(size_t)i];
+        old = std::move(s.plugin);
         s.plugin = std::move(p);
         s.ep = std::make_shared<caw::Endpoint>();   // paramLast stays empty, like the VST rack's endpoints (vector<atomic> cannot resize)
         s.path = path;
@@ -96,14 +102,20 @@ public:
         if (!s.state.empty()) {
             try { s.plugin->setState(s.state); } catch (...) {}
         }
+        lock.unlock();
+        old.reset();
         return {};
     }
 
     void clear(int i) {
-        std::lock_guard<std::mutex> lock(mu_);
-        Slot& s = slots_[(size_t)i];
-        if (s.plugin) try { s.plugin->closeEditor(); } catch (...) {}
-        s = Slot{};
+        Slot dead;   // destroyed after the lock is released: the audio thread never waits on a plugin destructor
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            Slot& s = slots_[(size_t)i];
+            if (s.plugin) try { s.plugin->closeEditor(); } catch (...) {}
+            dead = std::move(s);
+            s = Slot{};
+        }
     }
 
     void setOn(int i, bool on) {

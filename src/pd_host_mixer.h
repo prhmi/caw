@@ -1,4 +1,5 @@
 #pragma once
+#include "pd_cables.h"
 #include "pd_daw_engine.h"
 #include <algorithm>
 #include <atomic>
@@ -51,6 +52,7 @@ class PdHostMixer {
         result=static_cast<std::int64_t>(std::llround(time*rate));return true;
     }
 public:
+    int channels() const { return channels_; }   // the real render width (the widest [dac~], at least the caller's)
     void replan(const std::vector<pd_timeline::Event>& plan) {
         std::lock_guard<std::mutex> lock(mutex_);pendingPlan_=plan;++planGeneration_;
     }
@@ -95,9 +97,13 @@ public:
         if(rate<8000||rate>192000||channels<1||channels>8||maxFrames==0||maxFrames>65536) {
             error="Unsupported shared PD audio format.";return false;
         }
-        channels_=channels; rate_=rate;library_=library;sink_.outputQueue=&controlQueue_;
+        // The virtual soundcard render width: the caller passes the engine's channel count; the
+        // planned patches' [dac~ N] needs widen it. The consumer (the spout add, the rack's
+        // pdMix) folds the wider render with the k mod N rule - channels() says the real width.
+        const int renderCh=std::min(8,std::max(channels,pdPlanMaxChannel(plan)));
+        channels_=renderCh; rate_=rate;library_=library;sink_.outputQueue=&controlQueue_;
         if(plan.empty()) {
-            if(!empty_.openEngine(library,rate,channels,error))return false;
+            if(!empty_.openEngine(library,rate,renderCh,error))return false;
         } else if(!copies_.create(library,plan.size(),error))return false;
         std::vector<pd_frame_scheduler::Event> events;
         std::vector<pd_frame_scheduler::Control> controls;
@@ -107,7 +113,7 @@ public:
             if(!frame(e.start,rate,start)||!frame(e.end,rate,end)||end<=start) {
                 error="PD clip "+std::to_string(e.clipId)+": invalid or sub-sample timing.";return false;
             }
-            PdDawEngine::Clip clip;clip.event=e;clip.channels=channels;clip.sampleRate=rate;
+            PdDawEngine::Clip clip;clip.event=e;clip.channels=renderCh;clip.sampleRate=rate;
             if(e.trackId>0) {
                 for(const auto& meter:meters_)if(meter->trackId==e.trackId){clip.meter=meter;break;}
                 if(!clip.meter){clip.meter=std::make_shared<PdDawEngine::Meter>(e.trackId);meters_.push_back(clip.meter);}
@@ -116,11 +122,14 @@ public:
                 error="PD clip "+std::to_string(e.clipId)+": p-fields: "+error;return false;
             }
             clip.pd=std::make_unique<PdBackend>();
-            if(!clip.pd->open(copies_.paths()[i],e.patch,rate,channels,error)) {
+            if(!clip.pd->open(copies_.paths()[i],e.patch,rate,renderCh,error)) {
                 error="PD clip "+std::to_string(e.clipId)+": "+error;return false;
             }
             if(!clip.pd->bindOutputs(e.outputs,error)) {
                 error="PD clip "+std::to_string(e.clipId)+": outputs: "+error;return false;
+            }
+            if(!clip.pd->openBridge(pd_cables::prepare(e.patch,e.clipId,e.buses),error)) {   // CAW cables (cawr~ / caws~)
+                error="PD clip "+std::to_string(e.clipId)+": cables: "+error;return false;
             }
             sink_.collectDiagnostics(clip);
             events.push_back({e.clipId,start,end,e.muted});
@@ -139,9 +148,9 @@ public:
             }
             sink_.clips.push_back(std::move(clip));
         }
-        if(!scheduler_.prepare(events,channels,error,std::move(controls)))return false;
+        if(!scheduler_.prepare(events,renderCh,error,std::move(controls)))return false;
         plan_=plan;
-        samples_.resize(static_cast<std::size_t>(maxFrames)*channels);
+        samples_.resize(static_cast<std::size_t>(maxFrames)*renderCh);
         return true;
     }
     // UI publishes a transport request; only the host worker touches PD.

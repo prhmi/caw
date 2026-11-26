@@ -1,4 +1,6 @@
 #include "app_shared.h"
+#include <mutex>
+#include <ctime>
 
 // src/ui_panels.cpp (phase 2: extracted from app.cpp; the shared state is app_state.h, the
 //  internal declarations are app_internal.h - all included through app_shared.h.)
@@ -53,7 +55,8 @@ LogLine classifyLog(const std::string& text) {
                       low.find("used before defined") != std::string::npos || low.find("undefined variable") != std::string::npos || low.find("syntax") != std::string::npos)) l.level = kLogError;
     else if (low.find("warning") != std::string::npos || (!app && low.find("extra arguments") != std::string::npos)) l.level = kLogImportant;
     else if (app)
-        for (const char* key : {"run ", "rendered", "render", "playback", "stopped", "saved", "opened"})
+        for (const char* key : {"run ", "rendered", "render", "playback", "stopped", "saved", "opened",
+                                "build", "vst", "sample engine", "input", "output", "silent", "silence", "not active", "problem"})
             if (low.find(key) != std::string::npos) { l.level = kLogImportant; break; }
     return l;
 }
@@ -140,6 +143,42 @@ void logPdFailureStatus(const std::string& status) {
 }
 #include "app.h"
 void logLine(const std::string& s) {
+    {   // the crash-proof trail: the console log is memory-only and a hard crash loses it; every
+        // line also lands in caw_log.txt next to caw.exe, flushed per line
+        static std::mutex s_logMu;
+        std::lock_guard<std::mutex> lock(s_logMu);
+        static FILE* s_logFile = nullptr;
+        if (!s_logFile) {
+            char exe[MAX_PATH] = {};
+            if (GetModuleFileNameA(nullptr, exe, MAX_PATH)) {
+                std::string base = exe;
+                const size_t slash = base.find_last_of("\\/");
+                if (slash != std::string::npos) base.resize(slash + 1);
+                s_logFile = fopen((base + "caw_log.txt").c_str(), "a");
+                if (s_logFile) {
+                    time_t now = time(nullptr);
+                    char stamp[32] = {};
+                    strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", localtime(&now));
+                    fprintf(s_logFile, "---- CAW started %s ----\n", stamp);
+                }
+            }
+        }
+        if (s_logFile) {
+            long long size = ftell(s_logFile);
+            if (size > 8 * 1024 * 1024) {   // rotate: a runaway log must not grow forever
+                fclose(s_logFile);
+                char exe[MAX_PATH] = {};
+                GetModuleFileNameA(nullptr, exe, MAX_PATH);
+                std::string base = exe;
+                const size_t slash = base.find_last_of("\\/");
+                if (slash != std::string::npos) base.resize(slash + 1);
+                s_logFile = fopen((base + "caw_log.txt").c_str(), "w");
+                if (s_logFile) fprintf(s_logFile, "---- log rotated ----\n");
+            }
+            fprintf(s_logFile, "%s\n", s.c_str());
+            fflush(s_logFile);
+        }
+    }
     LogLine l = classifyLog(s);
     if (l.level == kLogError && !l.clip.empty() && l.clipId < 0) fillLoc(l, l.clip, 0, s);
     pushLog(std::move(l));
@@ -260,8 +299,11 @@ void drawScoreRoutingMap() {
 void drawScoreMapWindow() {
     if (!g_scoreMapOpen) return;
     ImGui::SetNextWindowSize(ImVec2(S(700), S(500)), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Map score", &g_scoreMapOpen))
+    winMaxPrepareT("Map score");
+    if (ImGui::Begin("Map score", &g_scoreMapOpen, ImGuiWindowFlags_NoCollapse)) {
+        winMaxTitleButtonT("Map score");
         drawScoreRoutingMap();
+    }
     ImGui::End();
 }
 #include "app.h"
@@ -278,7 +320,9 @@ void drawScoreExportControls() {
 void drawScoreExportWindow() {
     if (!g_scoreExportOpen) return;
     ImGui::SetNextWindowSize(ImVec2(S(360), S(210)), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Export score", &g_scoreExportOpen)) {
+    winMaxPrepareT("Export score");
+    if (ImGui::Begin("Export score", &g_scoreExportOpen, ImGuiWindowFlags_NoCollapse)) {
+        winMaxTitleButtonT("Export score");
         drawScoreExportControls();
     }
     ImGui::End();
@@ -288,7 +332,9 @@ void drawCodeExportWindow() {
     if (!g_codeExportOpen) return;
     static int mode = 0, filter = 0;
     ImGui::SetNextWindowSize(ImVec2(S(570), S(330)), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Export code", &g_codeExportOpen)) {
+    winMaxPrepareT("Export code");
+    if (ImGui::Begin("Export code", &g_codeExportOpen, ImGuiWindowFlags_NoCollapse)) {
+        winMaxTitleButtonT("Export code");
         ImGui::TextUnformatted("Format");
         ImGui::SetNextItemWidth(-1);
         caw_ui::combo("##code_export_format", &mode,
@@ -344,7 +390,7 @@ void drawMainMenuBar() {
         ImGui::SetNextWindowPos(ImVec2(exportB.x, exportA.y), ImGuiCond_Appearing);
         bool exportAction = false;
         if (ImGui::BeginPopup("##export_flyout")) {
-            if (ImGui::MenuItem("Audio export (Csound)...", nullptr, false, g_langCsound)) { g_audioExportOpen = true; exportAction = true; }
+            if (ImGui::MenuItem("Audio export...", nullptr, false, true)) { g_audioExportOpen = true; exportAction = true; }
             if (g_renderActive && ImGui::MenuItem("Cancel audio export")) { cancelRender(); exportAction = true; }
             if (ImGui::MenuItem("Code clips...")) { g_codeExportOpen = true; exportAction = true; }
             if (ImGui::MenuItem("Score...")) { g_scoreExportOpen = true; exportAction = true; }
@@ -511,13 +557,13 @@ void drawMainMenuBar() {
         ImGui::BeginGroup();
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::max(0.f, (aboutLogo - ImGui::GetTextLineHeightWithSpacing() * 3.f) * .5f));
         ImGui::TextColored(ImVec4(0.93f, 0.50f, 0.15f, 1.f), "CAW - Code Audio Workstation");
-        ImGui::TextDisabled("Version 0.0.34 beta");
+        ImGui::TextDisabled("Version 0.0.57 beta");
         ImGui::TextDisabled("Parham Izadyar  -  parhamizadyar.net");
         ImGui::EndGroup();
         ImGui::Spacing();
-        ImGui::TextUnformatted("simple audio workstation, driven by code: Csound, SuperCollider, Pure Data");
-        ImGui::TextUnformatted("Use any one, two, or all three engines in the same project, with data passing between them.");
-        ImGui::TextUnformatted("Project score export, with VST effects and instruments also working alongside CAW’s own code");
+        ImGui::TextUnformatted("simple audio workstation written in C++, with a focus on code-based compositions and audio programming.");
+        ImGui::TextUnformatted("Csound, SuperCollider and Pure Data can run at the same time in one project, with data passing between them.");
+        ImGui::TextUnformatted("VSTs and audio files run and modulated by CAW’s own code, with project export to a musical score");
         ImGui::Spacing();
         if (ImGui::Button("Close", ImVec2(S(100), 0))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
@@ -557,10 +603,21 @@ void drawMainMenuBar() {
 }
 #include "app.h"
 void analyzeCurrentRaw() {
+    // DC / infrasonic blocker on the ANALYSIS input only (the audio is untouched): analog-modeled
+    // plugins put DC on their output, and the FFT window smears it across the lowest bins - a wall
+    // of fake low-frequency bars that is not in the sound (user report). A one-pole blocker at
+    // ~35 Hz removes it, exactly what a standard analyzer does before displaying.
+    static float dcLx = 0.f, dcLy = 0.f, dcRx = 0.f, dcRy = 0.f;
+    float blockedL[monitor_fft::size], blockedR[monitor_fft::size];
+    for (int i = 0; i < monitor_fft::size; ++i) {
+        const float l = g_rawLeft[i], r = g_rawRight[i];
+        dcLy = (l - dcLx) + 0.995f * dcLy; dcLx = l; blockedL[i] = dcLy;
+        dcRy = (r - dcRx) + 0.995f * dcRy; dcRx = r; blockedR[i] = dcRy;
+    }
     float input[monitor_fft::size];
     for (int i = 0; i < monitor_fft::size; ++i)
-        input[i] = g_fftChannel == 1 ? g_rawRight[i] : g_fftChannel == 2 ? (g_rawLeft[i] + g_rawRight[i]) * 0.5f : g_rawLeft[i];
-    g_fftDb = monitor_fft::spectrum(input, g_specFast ? monitor_fft::fastSize : monitor_fft::size);
+        input[i] = g_fftChannel == 1 ? blockedR[i] : g_fftChannel == 2 ? (blockedL[i] + blockedR[i]) * 0.5f : blockedL[i];
+    g_fftDb = monitor_fft::spectrum(input, monitor_fft::size);
 }
 #include "app.h"
 void applyRawSamples(const float* left, const float* right) {
@@ -572,13 +629,31 @@ void applyRawSamples(const float* left, const float* right) {
     g_haveRaw = true;
     g_rawAge = 0.f;
     const auto work = monitor_work::select(g_showMonitor && g_viewSpectrum, g_specFreeze, g_analyzerMode, g_specStyle);
-    if (work.fft) {
-        analyzeCurrentRaw();
-        if (work.thirdBands || work.columnBands || work.tonalPeaks) updateSpectrumDerived();
-        if (work.history) {
-            g_fftHistory.push_back(g_fftDb);
-            if (g_fftHistory.size() > 120) g_fftHistory.pop_front();
+    if (!work.fft || g_specFreeze) return;
+    // The analyzer pipeline runs at ~30 Hz, not per arriving frame. A standard RTA updates
+    // 20-30 times a second; this cuts the FFT / band / peak work by several times with no
+    // visual change (much less CPU, user request).
+    static std::chrono::steady_clock::time_point last{};
+    const auto now = std::chrono::steady_clock::now();
+    if (last.time_since_epoch().count() != 0 && now - last < std::chrono::milliseconds(33)) return;
+    last = now;
+    analyzeCurrentRaw();
+    if (g_analyzerMode == 0 && g_specStyle == 2) {   // the FFT line gets the same attack/release smoothing as the band view
+        if (g_fftDbDisp.size() != g_fftDb.size()) g_fftDbDisp.assign(g_fftDb.size(), g_specDbFloor);
+        // BOTH directions speed-limited (user request: smooth motion): a raw frame-to-frame jump
+        // would read as flicker; the attack is fast but not instant.
+        const float rise = g_specBetter ? 240.f : 800.f;     // dB per second
+        const float fall = g_specBetter ? 45.f : 160.f;      // dB per second
+        for (size_t k = 0; k < g_fftDb.size(); ++k) {
+            const float v = g_fftDb[k];
+            float& d = g_fftDbDisp[k];
+            d = v > d ? std::min(v, d + rise * 0.033f) : std::max(v, d - fall * 0.033f);   // the pipeline is throttled to ~30 Hz
         }
+    }
+    if (work.thirdBands || work.columnBands || work.tonalPeaks) updateSpectrumDerived();
+    if (work.history) {
+        g_fftHistory.push_back(g_fftDb);
+        if (g_fftHistory.size() > 120) g_fftHistory.pop_front();
     }
 }
 #include "app.h"
@@ -685,6 +760,18 @@ void pollMonitor() {
 #include "app.h"
 void drawExportOptions(CsoundSettings& s) {
     s.renderFormat = std::min(4, std::max(0, s.renderFormat));
+    // Render mode: offline (faster than real time) or real-time capture - global for every engine
+    // (LKD freezes AND whole-project exports). Offline renders through each engine's own offline
+    // pipeline; real-time plays the transport once and captures the final master mix.
+    ImGui::SetNextItemWidth(S(180));
+    if (caw_ui::beginCombo("Render mode", s.renderMode == 0 ? "Offline (faster than real time)" : "Real-time capture")) {
+        if (ImGui::Selectable("Offline (faster than real time)", s.renderMode == 0)) s.renderMode = 0;
+        if (ImGui::Selectable("Real-time capture", s.renderMode == 1)) s.renderMode = 1;
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered()) helpTip(s.renderMode == 0
+        ? "Offline: every engine renders through its own offline pipeline (Csound host, PD C++ host, SC NRT, sample engine) at full CPU speed. SuperCollider tracks need the NRT tools."
+        : "Real-time: the transport plays once from the start and the final master mix (every engine live) is captured - works for all engines, but takes as long as the song.");
     const int kind = s.renderFormat < 3 ? 0 : s.renderFormat == 3 ? 1 : 2;
     const char* formats[] = {"WAV", "FLAC", "MP3"};
     ImGui::SetNextItemWidth(S(180));
@@ -731,6 +818,33 @@ void drawExportOptions(CsoundSettings& s) {
             ImGui::EndCombo();
         }
     }
+    // EXPORT SOURCE: the master mixdown (as virtual) or the whole virtual bus (as real routing)
+    ImGui::SetNextItemWidth(S(180));
+    if (caw_ui::beginCombo("Source", s.exportSource == 0 ? "as virtual (master mixdown)" : "as real routing (virtual bus)")) {
+        if (ImGui::Selectable("as virtual (master mixdown)", s.exportSource == 0)) s.exportSource = 0;
+        if (ImGui::Selectable("as real routing (virtual bus)", s.exportSource == 1)) s.exportSource = 1;
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered()) helpTip("as virtual: the export is the master mixdown (the Channels combo below decides its fold).\nas real routing: the export is the virtual soundcard bus - the whole project at the audio settings width N, every track at its routed positions (out<n> lines, Out source folds), like the live master but not folded to stereo.\nOffline export only; the real-time capture always captures the stereo master.");
+    // CONVERT: when checked, the rendered channels fold to mono / stereo / quadro
+    ImGui::Checkbox("Convert", &s.exportConvertOn);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(S(120));
+    if (caw_ui::beginCombo("##conv_to", s.exportConvert == 1 ? "Mono" : s.exportConvert == 2 ? "Stereo" : "Quadro")) {
+        if (ImGui::Selectable("Mono", s.exportConvert == 1)) s.exportConvert = 1;
+        if (ImGui::Selectable("Stereo", s.exportConvert == 2)) s.exportConvert = 2;
+        if (ImGui::Selectable("Quadro", s.exportConvert == 4)) s.exportConvert = 4;
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered()) helpTip("When checked, the rendered channels fold to the chosen width (channel k -> k mod M summed, the virtual soundcard rule): Mono / Stereo / Quadro. Off = the source width passes through.");
+    // ONE FILE vs SEPARATED
+    ImGui::SetNextItemWidth(S(180));
+    if (caw_ui::beginCombo("Files", s.exportSplit ? "Each channel separated" : "One file (all channels)")) {
+        if (ImGui::Selectable("One file (all channels)", !s.exportSplit)) s.exportSplit = false;
+        if (ImGui::Selectable("Each channel separated", s.exportSplit)) s.exportSplit = true;
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered()) helpTip("One file: every channel in one file.\nEach channel separated: the export writes one mono file per channel, named <file>_1, <file>_2 ... (WAV formats).");
     const int channelChoice = s.exportChannels == 1 ? 0 : s.exportChannels == 2 ? 1 : s.exportChannels == 4 ? 2 : 3;
     const char* channels[] = {"Mono", "Stereo", "Quadro", "Other"};
     ImGui::SetNextItemWidth(S(180));
@@ -752,7 +866,9 @@ void drawExportOptions(CsoundSettings& s) {
 void drawAudioExport() {
     if (!g_audioExportOpen) return;
     ImGui::SetNextWindowSize(ImVec2(S(560), S(410)), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Audio export", &g_audioExportOpen)) {
+    winMaxPrepareT("Audio export");
+    if (ImGui::Begin("Audio export", &g_audioExportOpen, ImGuiWindowFlags_NoCollapse)) {
+        winMaxTitleButtonT("Audio export");
         CsoundSettings& s = g_proj.cs;
         ImGui::TextUnformatted("Output file");
         ImGui::SetNextItemWidth(-S(105));
@@ -773,6 +889,14 @@ void drawAudioExport() {
         ImGui::SetNextItemWidth(S(120));
         if (ImGui::InputDouble("Tail (seconds)", &s.tail, .5, 2, "%.1f"))
             s.tail = std::min(60.0, std::max(0.0, s.tail));
+        ImGui::SetNextItemWidth(S(120));
+        double expStart = s.exportStart;
+        if (ImGui::InputDouble("Start (seconds)", &expStart, 0, 0, "%.2f")) s.exportStart = std::max(0.0, expStart);
+        if (ImGui::IsItemHovered()) helpTip("The export begins here. 0 = the project start.");
+        ImGui::SetNextItemWidth(S(120));
+        double expEnd = s.exportEnd;
+        if (ImGui::InputDouble("End (seconds)", &expEnd, 0, 0, "%.2f")) s.exportEnd = std::max(0.0, expEnd);
+        if (ImGui::IsItemHovered()) helpTip("The export stops here. 0 = the project end (automatic).\nA value greater than 0 renders exactly that range - useful when the project runs long past the last clip.");
         ImGui::TextDisabled("Destination: %s", renderFilePath().string().c_str());
         if (!g_exportError.empty()) ImGui::TextColored(ImVec4(.98f, .43f, .34f, 1.f), "%s", g_exportError.c_str());
         if (g_renderActive) {
@@ -1080,14 +1204,13 @@ void drawMeterPanel(float dt, float width, float belowH) {
     const bool legacyOutput = g_playing && !g_useCsoundApi;
     if (legacyOutput) ImGui::BeginDisabled();
     const float dbValue = g_proj.cs.masterGain <= 0.f ? -80.f : 20.f * std::log10(g_proj.cs.masterGain);
-    int db = std::min(6, std::max(-80, (int)std::lround(dbValue)));
+    int db = std::max(-80, (int)std::lround(dbValue));
     ImGui::SetCursorScreenPos(ImVec2(bx0 + (barGroupW - gainBoxW) * .5f, mA.y + S(6)));
-    ImGui::SetNextItemWidth(gainBoxW);
-    if (ImGui::DragInt("##master_gain_db", &db, 1.f, -80, 6, "%d", ImGuiSliderFlags_AlwaysClamp)) {
-        g_proj.cs.masterGain = std::pow(10.f, db / 20.f);
+    if (dbIntBox("##master_gain_db", db, -80, kMaxVolumeDb, gainBoxW, "")) {   // whole dB text box: double-click, then type
+        g_proj.cs.masterGain = db <= -80 ? 0.f : std::pow(10.f, db / 20.f);
     }
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        helpTip(legacyOutput ? "Master gain requires CAW host audio. Restart with the Csound API." : "Master gain in whole dB: drag, or Ctrl-click to type. 0 is unity.");
+        helpTip(legacyOutput ? "Master gain requires CAW host audio. Restart with the Csound API." : "Master gain in whole dB: double-click, then type (-80 = silence, 0 is unity, no upper limit).");
     if (legacyOutput) ImGui::EndDisabled();
     ImGui::SameLine(0, S(3));
     ImGui::TextDisabled("dB");
@@ -1275,69 +1398,223 @@ void drawMonitor(float dt) {
                     prevX = px;
                 }
             }
-            // Optional detailed FFT line. The default is narrower 1/6-octave columns.
-            const int samples = std::max(16, std::min(1600, (int)w));
+            // Smoothed FFT line: a MAX envelope over a +-1/6-octave window per point. The raw line
+            // wiggles with window lobes and reads as noise; the envelope is what you can trust.
+            const int samples = std::max(32, std::min(1200, (int)(w / S(2.f))));   // one point per ~2 px: the spline does the rest
             std::vector<ImVec2> curve;
             if (g_specStyle == 2 && spectrumAvailable) {
               curve.reserve((size_t)samples + 1);
+              const float oct6 = std::pow(2.f, 1.f / 12.f);   // +-1 semitone max window
               for (int j = 0; j <= samples; ++j) {
                 const float u = (float)j / samples;
                 const float freq = monitor_math::frequencyAt(u, fLo, fHi, logarithmic);
-                const float nextFreq = monitor_math::frequencyAt(std::min(1.f, (float)(j + 1) / samples), fLo, fHi, logarithmic);
-                const float bin = freq * monitor_fft::fftSize / g_rawSampleRate;
-                const float nextBin = nextFreq * monitor_fft::fftSize / g_rawSampleRate;
-                float v = g_specDbFloor;
-                if (spectrumAvailable) {
-                    v = std::max(monitor_math::sample(g_fftDb.data(), monitor_fft::bins, bin, false),
-                                 monitor_math::sample(g_fftDb.data(), monitor_fft::bins, nextBin, false));
-                    int a = std::max(0, (int)std::ceil(bin)), b = std::min(monitor_fft::bins - 1, (int)std::floor(nextBin));
-                    for (int k = a; k <= b; ++k) v = std::max(v, g_fftDb[(size_t)k]);
+                const int a = std::max(0, (int)std::ceil((freq / oct6) * monitor_fft::fftSize / g_rawSampleRate));
+                const int b = std::min(monitor_fft::bins - 1, (int)std::floor((freq * oct6) * monitor_fft::fftSize / g_rawSampleRate));
+                int wa = a, wb = b;
+                if (wb < wa) {
+                    // At low frequencies the +-1-semitone window is narrower than one FFT bin: an
+                    // empty window used to drop the curve to the floor, which read as narrow
+                    // spikes below ~100 Hz. Take the bin that owns the frequency instead.
+                    wa = wb = std::max(0, std::min(monitor_fft::bins - 1,
+                            (int)std::lround(freq * monitor_fft::fftSize / g_rawSampleRate)));
                 }
-                const float xx = x0 + u * w, yy = dy(v);
-                curve.push_back(ImVec2(xx, yy));
+                const float* src = g_fftDbDisp.size() == g_fftDb.size() ? g_fftDbDisp.data() : g_fftDb.data();
+                float v = g_specDbFloor;
+                if (b < a) {
+                    // Narrower than one FFT bin (the low end on a log axis): interpolate BETWEEN the bins
+                    // (cubic, no overshoot) instead of holding one bin - holding it drew flat steps.
+                    v = monitor_math::sample(src, monitor_fft::bins, freq * monitor_fft::fftSize / g_rawSampleRate, true);
+                } else {
+                    for (int k = wa; k <= wb; ++k) v = std::max(v, src[(size_t)k]);
+                }
+                v = std::max(g_specDbFloor, std::min(0.f, v));   // the line never leaves the plot (below the floor or above 0 dB)
+                curve.push_back(ImVec2(x0 + u * w, dy(v)));
+              }
+              if (curve.size() > 4) {   // a light 5-point smoothing along the (log) frequency axis: no visible stairs
+                  std::vector<ImVec2> sm = curve;
+                  for (size_t k = 2; k + 2 < curve.size(); ++k)
+                      sm[k].y = (curve[k - 2].y + 2.f * curve[k - 1].y + 3.f * curve[k].y + 2.f * curve[k + 1].y + curve[k + 2].y) / 9.f;
+                  curve.swap(sm);
               }
             }
             if (spectrumAvailable) {
                 if (g_specStyle == 0) {
-                    for (const auto& peak : g_tonePeaks) {
-                        const auto bounds = monitor_peaks::visualBounds(peak);
-                        if (bounds.second <= fLo || bounds.first >= fHi || peak.db <= g_specDbFloor) continue;
-                        const float a = fx((float)std::max<double>(fLo, bounds.first));
-                        const float b = fx((float)std::min<double>(fHi, bounds.second));
-                        if (b > a) dl->AddRectFilled(ImVec2(a, dy((float)peak.db)),
-                                                     ImVec2(b, py1), IM_COL32(121, 215, 192, 240));
+                    // Whole-spectrum underlay (user request): EVERY semitone slot is measured
+                    // straight from the FFT (strongest bin in the slot), in BOTH Better and
+                    // Realistic. With noise - where no tonal peak exists - the axis still fills
+                    // completely, so the display never shows empty stretches. Fixed positions,
+                    // one hue at low opacity: a backdrop for the peaks, not a second data source.
+                    // The backdrop also moves calmly: its level is speed-limited in BOTH
+                    // directions (attack AND release), slow in Better, quick in Realistic -
+                    // raw noise bins would otherwise flicker frame to frame.
+                    {
+                        static std::vector<float> s_slotDisp;   // display level per semitone slot, indexed [n - kSlotBase]
+                        static constexpr int kSlotBase = -64;   // semitone index of 25 Hz is about -62
+                        static constexpr int kSlotCount = 192;
+                        if (s_slotDisp.size() != (size_t)kSlotCount) s_slotDisp.assign((size_t)kSlotCount, g_specDbFloor);
+                        const float slotDt = std::max(0.001f, ImGui::GetIO().DeltaTime);
+                        const float up = g_specBetter ? 240.f : 620.f;    // dB per second rise
+                        const float down = g_specBetter ? 90.f : 230.f;   // dB per second fall
+                        const double slotHalf = std::pow(2.0, 0.5 / 12.0);
+                        const int n0 = (int)std::ceil(12.0 * std::log2(std::max(1.0, (double)fLo) / 440.0));
+                        const int n1 = (int)std::floor(12.0 * std::log2(std::max(1.0, (double)fHi) / 440.0));
+                        for (int n = n0; n <= n1; ++n) {
+                            const int si = n - kSlotBase;
+                            if (si < 0 || si >= kSlotCount) continue;
+                            const double slotHz = 440.0 * std::pow(2.0, n / 12.0);
+                            const double blo = slotHz / slotHalf, bhi = slotHz * slotHalf;
+                            if (bhi <= fLo || blo >= fHi) continue;
+                            int a = std::max(1, (int)std::ceil(blo * monitor_fft::fftSize / g_rawSampleRate));
+                            int b = std::min(monitor_fft::bins - 1, (int)std::floor(bhi * monitor_fft::fftSize / g_rawSampleRate));
+                            float v = -160.f;
+                            if (b < a) {
+                                // narrower than one bin: take the bin that owns the slot center
+                                const int c = std::max(1, std::min(monitor_fft::bins - 1,
+                                        (int)std::lround(slotHz * monitor_fft::fftSize / g_rawSampleRate)));
+                                v = g_fftDb[(size_t)c];
+                            } else {
+                                for (int i = a; i <= b; ++i) v = std::max(v, g_fftDb[(size_t)i]);
+                            }
+                            float& d = s_slotDisp[(size_t)si];
+                            if (!g_specFreeze)
+                                d = v > d ? std::min(v, d + up * slotDt) : std::max(v, d - down * slotDt);
+                            if (d <= g_specDbFloor) continue;
+                            const float sa = fx((float)std::max<double>(fLo, blo));
+                            const float sb = fx((float)std::min<double>(fHi, bhi));
+                            if (sb <= sa) continue;
+                            const float top = dy(d);
+                            if (top < py1) dl->AddRectFilled(ImVec2(sa, top), ImVec2(sb, py1), IM_COL32(121, 215, 192, 55));
+                        }
                     }
-                } else if (g_specStyle == 3) {
-                    for (const auto& band : g_columnBands) {
-                        if (band.hi <= fLo || band.lo >= fHi || band.db <= g_specDbFloor) continue;
+                    // ONE color, always (designer pass): a two-tone display reads as two different
+                    // data sources, which is exactly what confused the reading before.
+                    const ImU32 peakCol = IM_COL32(121, 215, 192, 235);
+                    if (g_specBetter) {
+                        // Better view = the gliding cluster (user mockup, clean mode): ONE anchor
+                        // column on the dominant tone, gliding calmly (its position comes from the
+                        // tracker), and every detected harmonic LOCKED to the anchor's position
+                        // (k x anchor) so the whole cluster glides together - never one bar down
+                        // while the next goes up. One hue, two opacities: attention levels, not a
+                        // second data source. (Everything else - the full spectrum - is the
+                        // underlay above; no loose singles, they read as clutter in dense material.)
+                        if (!g_tonePeaks.empty()) {
+                            // Anchor stability (designer pass): the strongest peak flickers frame to
+                            // frame in dense material, and every harmonic column is positioned
+                            // relative to the anchor - an unstable anchor scatters the cluster. The
+                            // anchor only changes when another tone is clearly stronger.
+                            const monitor_peaks::Peak* anchor = &g_tonePeaks.front();
+                            static double s_anchorHz = 0.0;
+                            const monitor_peaks::Peak* strongest = anchor;
+                            for (const auto& p : g_tonePeaks) if (p.db > strongest->db) strongest = &p;
+                            if (s_anchorHz > 0.0) {
+                                for (const auto& p : g_tonePeaks) {
+                                    if (std::abs(std::log(std::max(1.0, p.frequency) / s_anchorHz)) < std::log(1.02)) {
+                                        if (p.db >= strongest->db - 3.0) anchor = &p;   // stays unless beaten by > 3 dB
+                                        break;
+                                    }
+                                }
+                            }
+                            s_anchorHz = anchor->frequency;
+                            const double anchorHalf = std::pow(2.0, 0.75 / 12.0);   // +-3/4 semitone anchor column
+                            const double harmHalf = std::pow(2.0, 0.5 / 12.0);      // +-1/2 semitone harmonic columns
+                            const ImU32 anchorCol = IM_COL32(121, 215, 192, 242), harmCol = IM_COL32(121, 215, 192, 118);
+                            for (size_t pi = 0; pi < g_tonePeaks.size(); ++pi) {
+                                const monitor_peaks::Peak& peak = g_tonePeaks[pi];
+                                if (peak.db <= g_specDbFloor) continue;
+                                double lo, hi;
+                                ImU32 col;
+                                if (&peak == anchor) {
+                                    lo = anchor->frequency / anchorHalf;
+                                    hi = anchor->frequency * anchorHalf;
+                                    col = anchorCol;
+                                } else {
+                                    const double r = peak.frequency / anchor->frequency;
+                                    const int k = (int)std::lround(r);
+                                    if (k < 2 || std::abs(r - (double)k) > 0.03) continue;   // not a harmonic of the anchor: the underlay already shows it
+                                    lo = anchor->frequency * k / harmHalf;
+                                    hi = anchor->frequency * k * harmHalf;
+                                    col = harmCol;
+                                }
+                                if (hi <= fLo || lo >= fHi) continue;
+                                const float a = fx((float)std::max<double>(fLo, lo));
+                                const float b = fx((float)std::min<double>(fHi, hi));
+                                if (b <= a) continue;
+                                const float top = dy((float)peak.db);
+                                if (top >= py1) continue;
+                                dl->AddRectFilled(ImVec2(a, top), ImVec2(b, py1), col);
+                            }
+                        }
+                    } else {
+                        // Realistic: the raw estimated positions, every peak, one color.
+                        for (const auto& peak : g_tonePeaks) {
+                            const auto bounds = monitor_peaks::visualBounds(peak);
+                            if (bounds.second <= fLo || bounds.first >= fHi || peak.db <= g_specDbFloor) continue;
+                            const float a = fx((float)std::max<double>(fLo, bounds.first));
+                            const float b = fx((float)std::min<double>(fHi, bounds.second));
+                            if (b > a) dl->AddRectFilled(ImVec2(a, dy((float)peak.db)), ImVec2(b, py1), peakCol);
+                        }
+                    }
+                } else if (g_specStyle == 3 && !g_columnBands.empty()) {
+                    // STATIC band columns: fixed 1/6-octave slots whose x positions never move. Each
+                    // slot is measured (nothing interpolated) and drawn as a separate column with a
+                    // visible gap and a display smoother (fast attack, release-limited fall) so the
+                    // picture reads like a standard RTA instead of flickering (designer pass).
+                    if (g_columnDisp.size() != g_columnBands.size()) g_columnDisp.assign(g_columnBands.size(), g_specDbFloor);
+                    if (!g_specFreeze) {
+                        const float dt = std::max(0.001f, ImGui::GetIO().DeltaTime);
+                        // Better: the fall takes its time (user request). Realistic: slower in
+                        // general than raw, but responsive.
+                        const float release = g_specBetter ? 35.f : 60.f;   // dB per second
+                        for (size_t i = 0; i < g_columnBands.size(); ++i) {
+                            const float v = (float)g_columnBands[i].db;
+                            float& d = g_columnDisp[i];
+                            d = v > d ? v : std::max(v, d - release * dt);  // attack instant, release smoothed
+                        }
+                    }
+                    for (size_t i = 0; i < g_columnBands.size(); ++i) {
+                        const auto& band = g_columnBands[i];
+                        if (band.hi <= fLo || band.lo >= fHi) continue;
                         const float a = fx((float)std::max<double>(fLo, band.lo));
                         const float b = fx((float)std::min<double>(fHi, band.hi));
-                        if (b <= a) continue;
-                        // Each bar fills its own 1/6-octave interval. Shared
-                        // edges meet, without altering the logarithmic axis.
-                        dl->AddRectFilled(ImVec2(a, dy((float)band.db)),
-                                          ImVec2(b, py1), band.resolved ? IM_COL32(121, 215, 192, 240) : IM_COL32(88, 128, 126, 200));
+                        const float gap = std::min(S(1.5f), (b - a) * 0.12f);   // a visible gap between columns
+                        if (b - a <= gap * 2) continue;
+                        const float db = g_columnDisp[i];
+                        if (db <= g_specDbFloor) continue;
+                        const float top = dy(db);
+                        // One uniform color for every column: the gaps make them noticeable, a
+                        // second shade would read as different data (designer pass).
+                        dl->AddRectFilled(ImVec2(a + gap, top), ImVec2(b - gap, py1), IM_COL32(121, 215, 192, 225));
                     }
-                } else if (g_specStyle == 1 && !g_spectrumBands.empty()) {
-                    // Smoothly connect measured 1/3-octave band powers. The
-                    // cubic interpolation is bounded to avoid invented peaks.
-                    std::vector<float> levels;
-                    for (const auto& band : g_spectrumBands) levels.push_back((float)band.db);
-                    std::vector<ImVec2> outline;
-                    outline.reserve((size_t)samples + 1);
-                    for (int j = 0; j <= samples; ++j) {
-                        const float u = (float)j / samples;
-                        const float freq = monitor_math::frequencyAt(u, fLo, fHi, logarithmic);
-                        const float idx = (float)(3.0 * std::log(freq / g_spectrumBands.front().center) / std::log(2.0));
-                        const float db = monitor_math::sample(levels.data(), (int)levels.size(), idx, true);
-                        const float xx = x0 + u * w, yy = dy(db);
-                        outline.push_back(ImVec2(xx, yy));
-                        if (j < samples && yy < py1)
-                            dl->AddRectFilled(ImVec2(xx, yy), ImVec2(x0 + (float)(j + 1) * w / samples + 0.2f, py1), IM_COL32(121, 215, 192, 170));
-                    }
-                    if (outline.size() > 1) dl->AddPolyline(outline.data(), (int)outline.size(), IM_COL32(160, 235, 213, 245), 0, S(1.f));
                 } else if (curve.size() > 1) {
-                    dl->AddPolyline(curve.data(), (int)curve.size(), IM_COL32(150, 229, 207, 245), 0, S(1.5f));
+                    // Smoothed FFT line: a soft fill under the max-envelope curve. The quads are
+                    // hard-edged and share EXACT edges - neighbors partition the area, so no pixel
+                    // is ever covered twice (an overlap would blend the fill twice and read as a
+                    // lighter band of "different data" - the artifact this replaces). Each segment
+                    // is split into sub-columns with interpolated tops so the staircase never
+                    // visibly pokes above the polyline on descents.
+                    for (size_t i = 0; i + 1 < curve.size(); ++i) {   // fill under the line: one exact trapezoid per segment
+                        const ImVec2& p0 = curve[i];
+                        const ImVec2& p1 = curve[i + 1];
+                        if (std::min(p0.y, p1.y) >= py1) continue;
+                        const ImVec2 quad[4] = {ImVec2(p0.x, py1), p0, p1, ImVec2(p1.x, py1)};
+                        dl->AddConvexPolyFilled(quad, 4, IM_COL32(121, 215, 192, 60));
+                    }
+                    // Modern-style curve (user request): a Catmull-Rom spline through the envelope
+                    // points rendered as one path stroke - smooth joins instead of straight
+                    // segments, and the curve still passes exactly through every measured point.
+                    dl->PathClear();
+                    dl->PathLineTo(curve.front());
+                    for (size_t i = 0; i + 1 < curve.size(); ++i) {
+                        const ImVec2& p1 = curve[i];
+                        const ImVec2& p2 = curve[i + 1];
+                        const ImVec2& p0 = i > 0 ? curve[i - 1] : p1;
+                        const ImVec2& p3 = i + 2 < curve.size() ? curve[i + 2] : p2;
+                        // control points stay inside the plot, so the spline never dips under the floor (or above 0 dB)
+                        const ImVec2 c1(p1.x + (p2.x - p0.x) / 6.f, std::min(py1, std::max(py0, p1.y + (p2.y - p0.y) / 6.f)));
+                        const ImVec2 c2(p2.x - (p3.x - p1.x) / 6.f, std::min(py1, std::max(py0, p2.y - (p3.y - p1.y) / 6.f)));
+                        dl->PathBezierCubicCurveTo(c1, c2, p2);
+                    }
+                    dl->PathStroke(IM_COL32(170, 240, 218, 245), 0, S(1.5f));
                 }
                 const int loBin = std::max(1, (int)std::ceil(fLo * monitor_fft::fftSize / g_rawSampleRate));
                 const int hiBin = std::min(monitor_fft::bins - 2, (int)std::floor(fHi * monitor_fft::fftSize / g_rawSampleRate));
@@ -1350,8 +1627,6 @@ void drawMonitor(float dt) {
                         const float delta = std::abs(denom) > 1e-9f ? std::max(-0.5f, std::min(0.5f, 0.5f * (a - c) / denom)) : 0.f;
                         const float peakHz = (peak + delta) * g_rawSampleRate / monitor_fft::fftSize;
                         const float peakDb = b - 0.25f * (a - c) * delta;
-                        if (g_specStyle == 2)
-                            dl->AddCircleFilled(ImVec2(fx(peakHz), dy(peakDb)), S(2.5f), IM_COL32(192, 243, 227, 255));
                         char readout[80];
                         std::snprintf(readout, sizeof readout, "%s  %.1f Hz   %.1f dBFS", g_fftChannel == 0 ? "L" : g_fftChannel == 1 ? "R" : "MID", peakHz, peakDb);
                         const float tw = ImGui::CalcTextSize(readout).x;
@@ -1424,12 +1699,6 @@ void drawMonitor(float dt) {
                 if (found != g_columnBands.end())
                     ImGui::SetTooltip("%.1f Hz band  |  %.1f dBFS\n%.1f to %.1f Hz; peak-sine reference%s", found->center, found->db, found->lo, found->hi,
                                   found->resolved ? "" : "\nNarrower than the analyzer resolves: level is for the whole window lobe.");
-            } else if (g_specStyle == 1 && !g_spectrumBands.empty()) {
-                std::vector<float> levels;
-                for (const auto& band : g_spectrumBands) levels.push_back((float)band.db);
-                const float idx = (float)(3.0 * std::log(freq / g_spectrumBands.front().center) / std::log(2.0));
-                const float db = monitor_math::sample(levels.data(), (int)levels.size(), idx, true);
-                ImGui::SetTooltip("%.1f Hz   %.1f dBFS\nInterpolated 1/3-octave band-energy shape", freq, db);
             } else {
                 const float bin = freq * monitor_fft::fftSize / g_rawSampleRate;
                 const float db = monitor_math::sample(g_fftDb.data(), monitor_fft::bins, bin, false);
@@ -1439,12 +1708,22 @@ void drawMonitor(float dt) {
         if (ImGui::BeginPopupContextItem("##specmenu_popup")) {
             ImGui::TextDisabled("AUDIO ANALYZER");
             ImGui::Separator();
-            if (g_analyzerMode == 0) {
-                if (ImGui::MenuItem("Tonal peaks (smooth position, estimated)", nullptr, g_specStyle == 0)) { g_specStyle = 0; updateSpectrumDerived(); }
-                if (ImGui::MenuItem("Measured band-energy columns", nullptr, g_specStyle == 3)) { g_specStyle = 3; updateSpectrumDerived(); }
-                if (ImGui::MenuItem("Combined shape", nullptr, g_specStyle == 1)) { g_specStyle = 1; updateSpectrumDerived(); }
-                if (ImGui::MenuItem("Detailed FFT line", nullptr, g_specStyle == 2)) g_specStyle = 2;
+            if (ImGui::BeginMenu("View")) {
+                if (ImGui::MenuItem("Spectrum: Tonal peaks", nullptr, g_analyzerMode == 0 && g_specStyle == 0)) { g_analyzerMode = 0; g_specStyle = 0; updateSpectrumDerived(); }
+                if (ImGui::MenuItem("Spectrum: Static band columns", nullptr, g_analyzerMode == 0 && g_specStyle == 3)) { g_analyzerMode = 0; g_specStyle = 3; updateSpectrumDerived(); }
+                if (ImGui::MenuItem("Spectrum: Smoothed FFT line", nullptr, g_analyzerMode == 0 && g_specStyle == 2)) { g_analyzerMode = 0; g_specStyle = 2; updateSpectrumDerived(); }
                 ImGui::Separator();
+                if (ImGui::MenuItem("Waveform", nullptr, g_analyzerMode == 1)) g_analyzerMode = 1;
+                if (ImGui::MenuItem("Spectrogram", nullptr, g_analyzerMode == 2)) { if (g_analyzerMode != 2) g_fftHistory.clear(); g_analyzerMode = 2; }
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Detail")) {
+                if (ImGui::MenuItem("Better view", "calm, readable", g_specBetter)) { g_specBetter = true; monitor_peaks::resetTracking(); updateSpectrumDerived(); }
+                if (ImGui::MenuItem("Realistic", "raw and fast", !g_specBetter)) { g_specBetter = false; monitor_peaks::resetTracking(); updateSpectrumDerived(); }
+                ImGui::Separator();
+                ImGui::TextDisabled("Better: calm motion, readable amounts of data.");
+                ImGui::TextDisabled("Realistic: every peak, fast fall, short holds.");
+                ImGui::EndMenu();
             }
             bool hold = g_specFreeze;
             if (ImGui::MenuItem("Hold display", nullptr, &hold)) {
@@ -1455,22 +1734,11 @@ void drawMonitor(float dt) {
                 }
                 g_specFreeze = hold;
             }
-            if (ImGui::BeginMenu("View")) {
-                if (ImGui::MenuItem("Spectrum", nullptr, g_analyzerMode == 0)) { g_analyzerMode = 0; updateSpectrumDerived(); }
-                if (ImGui::MenuItem("Waveform", nullptr, g_analyzerMode == 1)) g_analyzerMode = 1;
-                if (ImGui::MenuItem("Spectrogram", nullptr, g_analyzerMode == 2)) { if (g_analyzerMode != 2) g_fftHistory.clear(); g_analyzerMode = 2; }
-                ImGui::EndMenu();
-            }
-            if (ImGui::MenuItem("Fast response (512 samples, coarse)", nullptr, g_specFast)) {
-                g_specFast = !g_specFast;
-                if (g_haveRaw && !g_specFreeze) { analyzeCurrentRaw(); updateSpectrumDerived(); }
-                g_fftHistory.clear();
-            }
             ImGui::BeginDisabled(g_specFreeze);
             if (ImGui::BeginMenu("Input")) {
-                if (ImGui::MenuItem("Left", nullptr, g_fftChannel == 0)) { g_fftChannel = 0; g_fftHistory.clear(); g_fftDb.clear(); g_spectrumBands.clear(); g_columnBands.clear(); g_tonePeaks.clear(); }
-                if (ImGui::MenuItem("Right", nullptr, g_fftChannel == 1)) { g_fftChannel = 1; g_fftHistory.clear(); g_fftDb.clear(); g_spectrumBands.clear(); g_columnBands.clear(); g_tonePeaks.clear(); }
-                if (ImGui::MenuItem("Mid (L + R) / 2", nullptr, g_fftChannel == 2)) { g_fftChannel = 2; g_fftHistory.clear(); g_fftDb.clear(); g_spectrumBands.clear(); g_columnBands.clear(); g_tonePeaks.clear(); }
+                if (ImGui::MenuItem("Left", nullptr, g_fftChannel == 0)) { g_fftChannel = 0; g_fftHistory.clear(); g_fftDb.clear(); g_spectrumBands.clear(); g_columnBands.clear(); g_columnHold.clear(); g_columnDisp.clear(); g_tonePeaks.clear(); monitor_peaks::resetTracking(); }
+                if (ImGui::MenuItem("Right", nullptr, g_fftChannel == 1)) { g_fftChannel = 1; g_fftHistory.clear(); g_fftDb.clear(); g_spectrumBands.clear(); g_columnBands.clear(); g_columnHold.clear(); g_columnDisp.clear(); g_tonePeaks.clear(); monitor_peaks::resetTracking(); }
+                if (ImGui::MenuItem("Mid (L + R) / 2", nullptr, g_fftChannel == 2)) { g_fftChannel = 2; g_fftHistory.clear(); g_fftDb.clear(); g_spectrumBands.clear(); g_columnBands.clear(); g_columnHold.clear(); g_columnDisp.clear(); g_tonePeaks.clear(); monitor_peaks::resetTracking(); }
                 ImGui::EndMenu();
             }
             ImGui::EndDisabled();
@@ -1500,10 +1768,9 @@ void drawMonitor(float dt) {
                 ImGui::EndMenu();
             }
             ImGui::Separator();
-            const int lenShown = g_specFast ? monitor_fft::fastSize : monitor_fft::size;
-            ImGui::TextDisabled("%d-sample Hann, zero padded to %d.", lenShown, monitor_fft::fftSize);
-            ImGui::TextDisabled("Observation spacing %.2f Hz; zero padding does not improve resolution.", (float)g_rawSampleRate / lenShown);
-            ImGui::TextDisabled("A new sound fades in over about %.0f ms; quiet high partials appear later.", 1000.0 * lenShown / g_rawSampleRate * 0.6);
+            ImGui::TextDisabled("%d-sample Hann, zero padded to %d.", monitor_fft::size, monitor_fft::fftSize);
+            ImGui::TextDisabled("Observation spacing %.2f Hz; zero padding does not improve resolution.", (float)g_rawSampleRate / monitor_fft::size);
+            ImGui::TextDisabled("A new sound fades in over about %.0f ms; quiet high partials appear later.", 1000.0 * monitor_fft::size / g_rawSampleRate * 0.6);
             ImGui::TextDisabled("Tonal peaks are estimates; use band energy for unsuppressed data.");
             ImGui::EndPopup();
         }
@@ -1659,7 +1926,9 @@ void drawSettings() {
     if (!g_settingsOpen) return;
     ImGui::SetNextWindowSize(ImVec2(S(600), S(560)), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(S(260), S(90)), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Settings", &g_settingsOpen)) {
+    winMaxPrepareT("Settings");
+    if (ImGui::Begin("Settings", &g_settingsOpen, ImGuiWindowFlags_NoCollapse)) {
+        winMaxTitleButtonT("Settings");
         CsoundSettings& s = g_proj.cs;
         const float labelW = S(170);
         auto row = [&](const char* name) {
@@ -1794,13 +2063,18 @@ void drawSettings() {
                     }
                     if (ImGui::IsItemHovered()) helpTip("Use the sample rate of your sound card / ASIO driver (see its control panel). A different rate makes the system or the driver convert, which can crackle.");
                 }
+                row("Output channels");
+                ImGui::SetNextItemWidth(S(160));
+                if (caw_ui::beginCombo("##nchnls", (std::to_string(s.nchnls) + (s.nchnls == 1 ? " channel (mono)" : " channels")).c_str())) {
+                    static const int chs[] = {1, 2, 3, 4, 5, 6, 7, 8};
+                    for (int c : chs) if (ImGui::Selectable((std::to_string(c) + (c == 1 ? " channel (mono)" : " channels")).c_str(), s.nchnls == c)) s.nchnls = c;
+                    ImGui::EndCombo();
+                }
+                if (ImGui::IsItemHovered()) helpTip("The project's output channels out1..outN - global for every engine, the master meter shows one bar each, and the export carries all of them.\nHearing follows the soundcard: a card with enough outputs plays each channel directly; a smaller card wraps them (out3 -> out1, out4 -> out2, ...), so you still hear everything as the card allows.\nApplies when the engines (re)start.");
                 if (g_langCsound) {
                     row("Control period (ksmps)");
                     ImGui::InputInt("##ksmps", &s.ksmps, 0, 0);
                     s.ksmps = std::min(4096, std::max(1, s.ksmps));
-                    row("Output channels (nchnls)");
-                    ImGui::InputInt("##nchnls", &s.nchnls, 1, 1);
-                    s.nchnls = std::min(64, std::max(1, s.nchnls));
                     ImGui::TextDisabled("kr = sr / ksmps = %.1f Hz", (double)s.sr / std::max(1, s.ksmps));
                 } else if (g_langPd) ImGui::TextDisabled("PD: stereo output, 64-sample DSP ticks.");
 
@@ -1856,6 +2130,20 @@ void drawSettings() {
                     ImGui::Checkbox("Send meter data from Csound (master, scope, spectrum, track meters)", &s.monitorFeed);
                     if (ImGui::IsItemHovered()) helpTip("Adds a small monitor instrument to the engine. Untick it if Csound reports an error about it, or to give a slow computer more room (less crackling). Applies on the next Run.");
                 }
+                ImGui::Spacing();
+                ImGui::TextColored(head, "RENDER (LKD freeze + whole-project export)");
+                row("Render mode");
+                ImGui::SetNextItemWidth(S(240));
+                if (caw_ui::beginCombo("##rendermode", s.renderMode == 0 ? "Offline (faster than real time)" : "Real-time capture")) {
+                    if (ImGui::Selectable("Offline (faster than real time)", s.renderMode == 0)) s.renderMode = 0;
+                    if (ImGui::Selectable("Real-time capture", s.renderMode == 1)) s.renderMode = 1;
+                    ImGui::EndCombo();
+                }
+                if (ImGui::IsItemHovered()) helpTip(s.renderMode == 0
+                    ? "Offline: every engine renders through its own offline pipeline (Csound host, PD C++ host, SC NRT, sample engine) at full CPU speed, silently and faster than the song. SuperCollider tracks need the NRT tools."
+                    : "Real-time: the transport plays once (audibly) and the mix is captured - works for every engine, but takes as long as the song.");
+                if (s.renderMode == 1) ImGui::TextDisabled("Real-time: LKD freezes need the track's engine running; the export plays the whole project once.");
+                else ImGui::TextDisabled("Offline: no live engine needed (a Csound track needs Csound; SC needs the NRT tools).");
                 ImGui::EndTabItem();
             }
 
@@ -2044,6 +2332,16 @@ void drawSettings() {
                 ImGui::TextColored(head, "PROJECT FILES");
                 ImGui::TextWrapped("File stores named references. CAW saves each path but does not copy the file.");
                 ImGui::Spacing();
+                ImGui::TextDisabled("File storage");
+                {   // one combo, the "FX only" style the VSTe audio-out mode uses: where CAW saves the files it creates
+                    static const char* storeModes[] = {"CAW folder (user directory)", "Inside the project folder"};
+                    int storeMode = g_renderInProjectFolder ? 1 : 0;
+                    if (caw_ui::combo("##file_storage", &storeMode, storeModes, 2))
+                        g_renderInProjectFolder = storeMode == 1;
+                    if (ImGui::IsItemHovered())
+                        helpTip("Pick where CAW saves the files it creates (renders and other exports). Each kind gets its own folder inside exports.");
+                }
+                ImGui::Spacing();
                 if (ImGui::Button("Open File pool")) g_audioPoolOpen = true;
                 ImGui::SameLine();
                 if (ImGui::Button("Open Includes")) g_includePoolOpen = true;
@@ -2094,7 +2392,9 @@ void drawUdoPool() {
     ImGui::SetNextWindowSize(ImVec2(S(920), S(600)), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(S(220), S(100)), ImGuiCond_FirstUseEver);
     bool open = g_udoPoolOpen;
-    if (ImGui::Begin("UDO", &open)) {
+    winMaxPrepareT("UDO");
+    if (ImGui::Begin("UDO", &open, ImGuiWindowFlags_NoCollapse)) {
+        winMaxTitleButtonT("UDO");
         if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) g_textEditorFocused = true;
         ImGui::TextDisabled("Project-wide Csound opcodes, available to every instrument.");
         if (ImGui::Button("Add UDO template")) {
@@ -2166,7 +2466,9 @@ void drawInstrPool() {
     ImGui::SetNextWindowSize(ImVec2(S(920), S(600)), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(S(220), S(100)), ImGuiCond_FirstUseEver);
     bool open = g_instrPoolOpen;
-    if (ImGui::Begin("Instrument pool", &open)) {
+    winMaxPrepareT("Instrument pool");
+    if (ImGui::Begin("Instrument pool", &open, ImGuiWindowFlags_NoCollapse)) {
+        winMaxTitleButtonT("Instrument pool");
         if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) g_textEditorFocused = true;
         ImGui::TextDisabled("Project-wide instr definitions. Schedule them from clip code; use names distinct from clips.");
         if (ImGui::Button("Add instrument template")) {
@@ -2226,7 +2528,9 @@ void drawAudioPool() {
     ImGui::SetNextWindowSize(ImVec2(S(820), S(540)), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(S(260), S(120)), ImGuiCond_FirstUseEver);
     bool open = g_audioPoolOpen;
-    if (ImGui::Begin("File pool", &open)) {
+    winMaxPrepareT("File pool");
+    if (ImGui::Begin("File pool", &open, ImGuiWindowFlags_NoCollapse)) {
+        winMaxTitleButtonT("File pool");
         if (ImGui::Button("Add file")) {
             const std::string picked = chooseAudioPath();
             if (!picked.empty()) {
@@ -2313,7 +2617,9 @@ void drawOrchestraPool() {
     if (!g_orchestraOpen) return;
     ImGui::SetNextWindowSize(ImVec2(S(850), S(560)), ImGuiCond_FirstUseEver);
     bool open = g_orchestraOpen;
-    if (ImGui::Begin("Orchestra", &open)) {
+    winMaxPrepareT("Orchestra");
+    if (ImGui::Begin("Orchestra", &open, ImGuiWindowFlags_NoCollapse)) {
+        winMaxTitleButtonT("Orchestra");
         if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) g_textEditorFocused = true;
         ImGui::TextDisabled("PROJECT ORCHESTRA");
         ImGui::TextDisabled("Global variables, tables and orchestra code shared by every clip.");
@@ -2334,7 +2640,9 @@ void drawIncludePool() {
     ImGui::SetNextWindowSize(ImVec2(S(860), S(560)), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(S(280), S(130)), ImGuiCond_FirstUseEver);
     bool open = g_includePoolOpen;
-    if (ImGui::Begin("Includes", &open)) {
+    winMaxPrepareT("Includes");
+    if (ImGui::Begin("Includes", &open, ImGuiWindowFlags_NoCollapse)) {
+        winMaxTitleButtonT("Includes");
         if (ImGui::Button("Add include...")) {
             const std::string picked = chooseIncludePath();
             if (!picked.empty()) {
@@ -2433,7 +2741,9 @@ void drawMasterFxWindow() {
     ImGui::SetNextWindowSize(ImVec2(S(680), S(460)), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(S(320), S(120)), ImGuiCond_FirstUseEver);
     bool open = g_masterFxOpen;
-    if (ImGui::Begin("Master FX###master_fx", &open)) {
+    winMaxPrepareT("Master FX###master_fx");
+    if (ImGui::Begin("Master FX###master_fx", &open, ImGuiWindowFlags_NoCollapse)) {
+        winMaxTitleButtonT("Master FX###master_fx");
         ImGui::TextDisabled("Up to 8 VST effects, processed in order on the master mix (after every engine, before the master gain). Runs on CAW's audio streams; a command-line Csound keeps its own output.");
         if (ImGui::IsItemHovered()) helpTip("Load effects top to bottom: the signal flows 1 -> 2 -> ... -> 8. On/off, the plugin's editor and remove work while the engine plays.");
         const auto snapshot = masterfx::rack().view();
@@ -2480,7 +2790,7 @@ void drawMasterFxWindow() {
             }
             if (sv.loaded) {
                 ImGui::SameLine();
-                if (ImGui::SmallButton(sv.editorVisible ? "Show*" : "Show")) {
+                if (ImGui::SmallButton(sv.editorVisible ? "III*" : "III")) {   // open the effect's editor window (the * marks an editor that is already open)
                     std::string err;
                     if (!masterfx::rack().showEditor(i, sv.name + " (Master FX " + std::to_string(i + 1) + ")", err)) logLine("[caw] Master FX editor: " + err);
                 }

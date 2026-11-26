@@ -38,10 +38,23 @@ if errorlevel 1 (
 )
 
 echo.
+> caw_build.log echo Build did not run because configuration has not completed.
 echo === Configuring (downloads are cached in %USERPROFILE%\.caw_deps, only the very first build downloads) ===
 echo This can take several minutes. Writing caw_configure.log...
 cmake -B build -DCMAKE_POLICY_VERSION_MINIMUM=3.5 > caw_configure.log 2>&1
 set "CAW_CONFIG_RESULT=%ERRORLEVEL%"
+if not "%CAW_CONFIG_RESULT%"=="0" goto :check_stale_cache
+goto :config_done
+
+:check_stale_cache
+findstr /I /C:"CMakeCache.txt directory" /C:"does not match the source" caw_configure.log >nul
+if errorlevel 1 goto :config_done
+echo [WARNING] The build folder contains a CMake cache from another source path.
+echo Reconfiguring it for this folder without deleting the existing build outputs...
+cmake --fresh -B build -DCMAKE_POLICY_VERSION_MINIMUM=3.5 > caw_configure.log 2>&1
+set "CAW_CONFIG_RESULT=%ERRORLEVEL%"
+
+:config_done
 type caw_configure.log
 if not "%CAW_CONFIG_RESULT%"=="0" goto :fail_config
 

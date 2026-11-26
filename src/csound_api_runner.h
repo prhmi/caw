@@ -31,9 +31,18 @@ public:
     bool start(const std::string& csdPath, int sampleRate, int meterCount, bool capture, std::string& error,
                const CawAudioSettings* audio = nullptr);
     // Offline uses the same Csound and VST block pipeline, but writes WAV instead of opening a device.
+    // maxSeconds caps the render length (the freeze renders only its range even if the project
+    // score stretches for hours - one stray timeline event far right would otherwise run the
+    // offline WAV into the 4 GiB RIFF limit). 0 = no cap (the audio export uses that).
     bool startOffline(const std::string& csdPath, int sampleRate, int channels, float fullScale,
                       float gain, int wavFormat, const std::string& wavPath, std::string& error,
-                      int outputChannels = 0);
+                      int outputChannels = 0, double maxSeconds = 0.0);
+    // A frozen track's rendered WAV, fed to the offline render as an engine-4 (sample-ring) input:
+    // a VSTe whose sources are already locked hears their WAV voices in the offline render too
+    // (the live sample engine does not run offline). start = project time where the WAV begins,
+    // gain = the track fader value that rides on top (the volume lane is baked into the WAV).
+    struct OfflineSampleStream { std::string path; double start = 0.0; double gain = 1.0; };
+    void setOfflineSampleStreams(const std::map<int, OfflineSampleStream>& streams);
     void setMasterGain(float linear);
     // true = the CAW master chain applies the master gain on the device buffer (the engine
     // must not apply it again). The offline renderer keeps its own gain.
@@ -48,8 +57,9 @@ public:
     // SEPARATED ENGINES: Csound loads NO VST plugins. It only captures these named clip tap
     // channels (engine 0 sources, cawtap_*) once per ksmps cycle into the vsttaps rings, so the
     // 4th engine's rack can consume Csound clip audio without touching Csound's thread.
-    void setVstTaps(const std::vector<std::string>& channels);    // Live M / S: the set of VST track ids that should keep sounding. Updated by the UI whenever a
-    // track's mute or solo changes; the rack skips every loaded track whose id is not in the set.
+    void setVstTaps(const std::vector<std::string>& channels);
+    // Drop queued tap audio and make the worker zero its named channels on the next block.
+    void silenceVstTaps();
     void setVstActiveTracks(const std::set<int>& ids);
     // Live VSTE input on/off: bit i set = input slot i of that track feeds the plugin. The rack
     // packs the enabled slots from line 1, so toggling never leaves silent gaps. Pushed by the UI
@@ -57,13 +67,13 @@ public:
     void setVstInputMasks(const std::map<int, unsigned>& masks);
     // Manual parameter override: reaches the rack DIRECTLY (no Csound channel involved) and is
     // applied on the same block, so a slider drag is always heard immediately.
-    void pushVstParamOverride(int trackId, int slot, double value);
+    void pushVstParamOverride(int trackId, int stage, int slot, double value);
     // Live re-pick of the P1..P8 mapping (the UI picked / cleared a slot while running): the rack
     // updates its job so the next edit maps to the right parameter without a restart.
     void refreshVstPicks(int trackId, const std::vector<int>& pick);
     // Live parameter edit from the plugin's own GUI for ANY parameter (not just the 8 picked):
     // queued to the rack, applied to the engine instance on the same block.
-    void pushVstParamValue(int trackId, int paramIndex, double value);
+    void pushVstParamValue(int trackId, int stage, int paramIndex, double value);
     // Live code editing: recompile ONE clip's instrument inside the running engine
     // (csoundCompileOrc, applied on the engine thread between two audio blocks). Csound replaces
     // the definition; instances that are already playing keep the old code, so the caller can
@@ -74,8 +84,12 @@ public:
     // sources it consumes and the raw PD / SC mix suppression is updated - no restart. The CSD
     // source-clip gates are written separately by the app (vstGateValues) on the same change.
     void setVstOutModeLive(int trackId, int mode);
+    void setVstOutWideLive(int trackId, int mode);   // 0 = stereo, 1 = as source (the plugin's own channels 1:1)
+    void setVstChannelsLive(int trackId, int channels);   // TRACK CHANNELS (1..8) of a VST track
     // SuperCollider mix capture (filled by CAW's audio callback) for VSTe "SuperCollider" inputs.
     void setScAudioRing(CawScRing* ring);
+    // Per-track rings the rack pops for engine-2 (SC track slot) and engine-4 (sample track) inputs.
+    void setTrackRings(std::function<CawScRing*(int)> sampleRing, std::function<CawScRing*(int)> scTrackRing);
     // Set to true by the engine while an ACTIVE master-mode VSTe consumes the SuperCollider mix
     // (the processed output replaces the raw mix, so CAW's audio callback must not add it too).
     // The Pure Data raw mix is suppressed inside the engine thread itself, no flag needed.
@@ -83,7 +97,7 @@ public:
     // The parameter values the engine is actually using (normalized kP1..kP8, per track id).
     // Returns false when the engine is off or the track has no VST rack entry.
     bool vstEngineParams(int trackId, double out[8]) const;
-    struct VstTrackPeak { int trackId = 0; float l = 0.f, r = 0.f; };
+    struct VstTrackPeak { int trackId = 0; std::array<float, 8> value{}; };   // one peak per plugin output channel
     // Per-track output peaks of the rack (every VST track, instrument or effect), max-held since
     // the last call: the lane meters read them while Csound hosts the plugins.
     std::vector<VstTrackPeak> takeVstPeaks();
@@ -97,6 +111,9 @@ public:
     // "caws/<name>" channels into it and writes changed values back + delivers to PD.
     // `names` = every caws/cawr channel name found in the clip code (without the prefix).
     void setHub(CawHub* hub);
+    // CAW AUDIO BUSES (caw_audio_bus.h): the bus names the Csound code sends to (cawbsend) and
+    // receives from (cawbrecv). Set before start(); the engine thread moves the audio every ksmps.
+    void setBusNames(const std::vector<std::string>& sends, const std::vector<std::string>& recvs);
     void setHubNames(const std::vector<std::string>& names);
     void pdTransport(bool playing, double time, double loopStart, double loopEnd, bool loop, int rate, int commandSerial = 0);
     bool pdReady() const;
@@ -108,7 +125,7 @@ public:
     std::vector<std::string> takePdPlanNotes();
     std::vector<PdControlOutput> takePdControlOutputs();
     unsigned takePdDroppedControls();
-    struct PdTrackPeak {int trackId; std::array<float,2> value;};
+    struct PdTrackPeak {int trackId; std::array<float,8> value;};   // one peak per patch channel (up to 8)
     std::vector<PdTrackPeak> takePdPeaks();
     void stop();
     bool active() const;

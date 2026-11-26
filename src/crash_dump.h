@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <exception>
 #include <string>
+#include <atomic>
+#include <functional>
 
 namespace cawcrash {
 
@@ -59,6 +61,29 @@ inline void writeRecord(EXCEPTION_POINTERS* ep, const char* why) {
 
 inline LONG WINAPI filter(EXCEPTION_POINTERS* ep) {
     writeRecord(ep, "unhandled exception");
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// SEH filter for GUARDED third-party plugin calls (vst3_host.cpp): records the fault
+// (rate-limited: a plugin that faults on every call would otherwise flood caw_crash.txt and
+// write a minidump each time) and lets the caller continue instead of killing CAW.
+inline std::function<void(const std::string&)> sehConsole;   // set by the app: recovered plugin faults surface in the console
+inline LONG WINAPI sehSwallowRecord(EXCEPTION_POINTERS* ep) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        writeRecord(ep, "plugin call (recovered)");
+        if (sehConsole) {
+            void* addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+            char module[MAX_PATH] = "?";
+            if (addr) {
+                HMODULE m = nullptr;
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       reinterpret_cast<LPCSTR>(addr), &m) && m)
+                    GetModuleFileNameA(m, module, MAX_PATH);
+            }
+            sehConsole(std::string("[caw] A plugin faulted inside one of its calls (access violation) - CAW recovered and continued. Module: ") + module);
+        }
+    }
     return EXCEPTION_EXECUTE_HANDLER;
 }
 

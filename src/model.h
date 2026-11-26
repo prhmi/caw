@@ -1,6 +1,9 @@
 #pragma once
+#include "volume_limits.h"
 #include <map>
 #include <set>
+#include <array>
+#include <cctype>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -192,28 +195,131 @@ struct Track {
     //       output is suppressed and their meters are drawn gray.
     //   1 = mix: the VSTe output goes to the master AND the source tracks keep sounding to the
     //       master; every meter keeps its default color.
-    // Default = MIX: a freshly added effect (EQ, compressor ...) must process the source WHILE the
-    // source keeps sounding. "FX only" (replace) is the special mode - on a default replace, a
-    // flat EQ is literally the same sound routed through the tap path, so the effect "does nothing"
-    // and the level shifts by the tap path's gain.
-    int vstOutMode = 1;
+    // Default = "FX only" (replace): a freshly added effect consumes its source, like a DAW's
+    // insert slot. Switch the combo to "FX+Source" for a send-style parallel effect.
+    int vstOutMode = 0;
+    // The plugin's output width on this track (VSTi and VSTe): 0 = stereo (the plugin's channels
+    // are mixed as stereo 1+3 -> L / 2+4 -> R, the same fold the master meter shows; the track has
+    // 2 meters), 1 = as source (the plugin's own channels go 1:1: a 4-output plugin shows 4
+    // meters and each channel folds into the master through the virtual soundcard rule).
+    int vstOutWide = 0;
+    // TRACK CHANNELS (like a DAW track's channel format): how many channels this VSTi / VSTe track
+    // carries - 1, 2, 4, 6 or 8. The plugin is processed at this width, the track shows this many
+    // meters, and its channels fold into the master by the k mod N rule. 0 = old project: use
+    // vstOutWide (0 -> 2, 1 -> the plugin's own width when it is known, else 2).
+    int vstChannels = 0;
+    // Plugin-window sync options (per track, all chain stages). Both OFF by default = zero cost:
+    //   vstParamPoll: the plugin does NOT report its knob moves (performEdit) - sweep its parameters
+    //                 every 60 ms while its window is open (Kilohearts-class editors need this)
+    //   vstWindowFeed: feed the engine's audio / notes into the plugin window (EQ analyzers, meters)
+    bool vstParamPoll = false;
+    bool vstWindowFeed = false;
+    int vstTrackChannels() const { return vstChannels > 0 ? vstChannels : 2; }
+    // VSTe EFFECT CHAIN: effects 2..8 run IN ORDER after the first effect (the input of effect
+    // #k is the output of effect #k-1). Stage 0 is the first effect = the legacy single-plugin
+    // fields above (vstPath / vstClassId / vstParameterState / vstPatchState). A stage that
+    // cannot accept all of the previous stage's channels folds them at its own input width
+    // (channel c plays on input c mod M; a 4-channel stage into a stereo one mixes 1+3 -> L /
+    // 2+4 -> R). Stages are contiguous: removing one pulls the tail up.
+    struct VstStage { std::string path, classId; std::map<uint32_t, double> parameterState; std::string patchState; bool bypass = false; };
+    bool vstBypass0 = false;   // effect 1 (the first plugin) bypassed
+    VstStage vstChain[7];
+    // Which plugin a parameter slot P1..P8 drives: 0 = the first effect, 1..7 = chain stage.
+    // Automation lanes and the P-slider path are keyed by the SLOT, so a slot can sit on any
+    // stage of the chain.
+    int vstSlotStage[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    // OUTPUT ROUTING text (VSTi and VSTe, like a sample clip's routing): out<n> = in<m> says the
+    // plugin's input channel m plays on the track's output line n. Empty = the Out stereo /
+    // Out source combo decides the fold. Unlisted outputs stay silent; the default template is
+    // the identity out1..out8 = in1..in8.
+    std::string vstRouteCode;
+    // Parse the routing text: outMap[k] = the input channel (0-based) that output k+1 plays
+    // (-1 = silent). active = at least one out<n> line exists.
+    static std::array<int, 8> routeOutMap(const std::string& code, bool& active) {
+        std::array<int, 8> outMap{}; for (int k = 0; k < 8; ++k) outMap[(size_t)k] = -1;
+        active = false;
+        size_t pos = 0;
+        while (pos < code.size()) {
+            size_t end = code.find('\n', pos);
+            if (end == std::string::npos) end = code.size();
+            std::string line = code.substr(pos, end - pos);
+            pos = end + 1;
+            const size_t hash = line.find('#');
+            if (hash != std::string::npos) line = line.substr(0, hash);
+            auto issp = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
+            while (!line.empty() && issp(line.back())) line.pop_back();
+            size_t b = 0;
+            while (b < line.size() && issp(line[b])) ++b;
+            if (b >= line.size() || line[b] != 'o' && line[b] != 'O') continue;
+            if (line.compare(b, 3, "out") != 0 && line.compare(b, 3, "Out") != 0) continue;
+            size_t d = b + 3;
+            std::string num;
+            while (d < line.size() && (std::isdigit((unsigned char)line[d]))) num += line[d++];
+            if (num.empty()) continue;
+            while (d < line.size() && issp(line[d])) ++d;
+            if (d >= line.size() || line[d] != '=') continue;
+            ++d;
+            while (d < line.size() && issp(line[d])) ++d;
+            std::string rhs;
+            if (d + 2 < line.size() && (line.compare(d, 2, "in") == 0 || line.compare(d, 2, "In") == 0) && std::isdigit((unsigned char)line[d + 2]))
+                d += 2;   // in<m>: skip the "in"
+            while (d < line.size() && (std::isdigit((unsigned char)line[d]))) rhs += line[d++];
+            if (rhs.empty()) continue;
+            int on = 0, in = 0;
+            try { on = std::stoi(num); in = std::stoi(rhs); } catch (...) { continue; }
+            if (on < 1 || on > 8 || in < 1 || in > 8) continue;
+            outMap[(size_t)on - 1] = in - 1;
+            active = true;
+        }
+        return outMap;
+    }
+    int routeMaxOut() const {
+        bool act = false;
+        const auto m = routeOutMap(vstRouteCode, act);
+        if (!act) return 0;
+        int mx = 0;
+        for (int k = 0; k < 8; ++k) if (m[(size_t)k] >= 0) mx = k + 1;
+        return mx;   // 0 = no routing line produced an output (everything silent)
+    }
+    // How many chain stages this VSTe has (stages are contiguous; 0 = the single-plugin form).
+    int vstChainCount() const {
+        int n = 0;
+        while (n < 7 && !vstChain[n].path.empty()) ++n;
+        return n;
+    }
     // The 8 VSTe input lines. Each line is an independent source with its own on/off switch:
     //   mode 0 = track (name = a track name), 1 = clips (name = a clip name), 2 = master (no name).
     // A source fills as many of the 8 plugin input channels as it has outputs (a stereo source
     // takes two lines), in slot order. Lines past 8 are dropped.
-    struct VstInput { bool on = false; int mode = 0; std::string name; };
+    struct VstInput { bool on = false; int mode = 0; std::string name; bool sidechain = false;
+                     int receive = 0; };   // sidechain: this insert feeds the effect plugin's SIDECHAIN input bus instead of the summed main input.
+                     // receive (wide track sources only): 0 = stereo (the virtual soundcard fold: ch k plays on plugin line k mod 2, so ch1+3 -> L, ch2+4 -> R),
+                     // 1 = multichannel (the source's channels go 1:1 into the plugin's input lines - a stereo plugin then hears ch1 | ch2 un-folded)
     VstInput vstInputs[8];
     // Legacy fields, kept only so older project files (CAW_PROJECT < 53) still load. New code
     // reads vstOutMode / vstInputs instead; these are migrated on load and written back as the
     // same values for backward compatibility with older builds.
     std::string vstOut;                              // legacy: audio out bus name (empty = master)
     bool vstOutMaster = false;                       // legacy: with a bus, also send to master
+    // Freeze (Cubase-style lock): the whole track is rendered ONCE into a WAV file on disk, then
+    // the live engines stop processing it - the frozen WAV plays through the sample engine like a
+    // clip instead (cheap CPU). While frozen the track is locked: clips, automations and the MIDI
+    // lane cannot be edited until it is unfrozen (unfreeze removes the WAV, everything is back).
+    bool frozen = false;                             // frozen: the WAV below is the sound, the live engines skip this track
+    std::string freezePath;                          // absolute path of the rendered WAV (empty when not frozen)
+    double freezeStart = 0.0;                        // timeline position the WAV begins at (the earliest clip start)
+    double freezeEnd = 0.0;                          // timeline position the WAV ends at (the last clip end + a small tail)
     int vstInMode = 0;                               // legacy: 0 = bus sends, 1 = track, 2 = clips
     std::string vstInSource;                         // legacy: the track name (mode 1) or clip name (mode 2)
     int vstOutCh = 2;                                // legacy: output channel count 2 / 4 / 6 / 8 (now always 2)
     std::vector<std::string> vstPickName;            // automation lane name of each picked parameter (the clips of the track get one lane per name)
     int vstMidi = 2;                                 // VSTi: 0 = CAW MIDI clips, 1 = device MIDI, 2 = both
 };
+
+// A frozen track really plays (the WAV exists on disk and the engines skip it). Marker (1),
+// graph (2) and VSTe (4) tracks cannot freeze: they carry no instrument sound of their own.
+inline bool trackFrozen(const Track& t) { return t.frozen && !t.freezePath.empty(); }
+inline bool trackCanFreeze(const Track& t) { return t.kind == 0 || t.kind == 3 || t.kind == 5 || t.kind == 6 || t.kind == 7; }
 
 // General Csound engine settings (written into the generated CSD header / options)
 struct CsoundSettings {
@@ -237,11 +343,21 @@ struct CsoundSettings {
     std::string ffmpegExe;                  // optional path to an ffmpeg executable
     std::string renderFile = "render.wav";
     int renderFormat = 0;                   // 0..2 WAV, 3 FLAC 24-bit, 4 MP3 via ffmpeg
+    int renderMode = 0;                     // 0 = offline (faster than real time), 1 = real-time capture
+    double exportStart = 0.0;               // the export range start (seconds; 0 = project start)
+    double exportEnd = 0.0;                 // the export range end (seconds; 0 = project end, auto)
     double tail = 2.0;                      // seconds of silence added after the last clip (reverb tails)
     bool autosaveEnabled = false;           // separate recovery file, never overwrites the project
     int autosaveMinutes = 5;
     float masterGain = 1.f;                 // linear output gain, shared by live host output and export
     int exportChannels = 2;                // output channels, independent of engine channel count
+    // EXPORT SOURCE: 0 = as virtual (the master mixdown: the exported fold follows exportChannels),
+    // 1 = as real routing (the virtual soundcard bus: the whole project at the audio settings
+    // width N, every track at its routed positions - like the live master).
+    int exportSource = 0;
+    int exportConvert = 0;                 // 0 = off, else the target width the export folds to (1 / 2 / 4 = mono / stereo / quadro)
+    bool exportConvertOn = false;          // the Convert checkbox (exportConvert holds the target width)
+    bool exportSplit = false;              // true = each final channel exports as its own mono file (<name>_1, <name>_2, ...)
     int exportFlacBits = 24;               // lossless FLAC bit depth, not bitrate
     int exportMp3Kbps = 192;               // MP3 constant bitrate
     float programFontSize = 17.f;           // interface font, independent of the code editor

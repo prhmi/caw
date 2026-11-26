@@ -1,9 +1,14 @@
+#include "volume_limits.h"
 #include "csound_api_runner.h"
 #include "vst_rack.h"
 #include "wav_writer.h"
 #include "timeline_edit.h"   // (was audio_channels.h, phase-1 merge)
 #include "platform.h"
 #include "pd_host_mixer.h"
+#include "caw_audio_bus.h"
+#include "caw_audio_in.h"
+#include "pd_live_ring.h"
+#include "branding.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -28,6 +33,71 @@
 #endif
 
 namespace {
+// Minimal WAV reader for the offline sample streams (a frozen track's rendered WAV, exactly the
+// layout CawWavWriter produces: PCM 16 / 24 bit or IEEE float32, any channel count). The offline
+// host has no sample engine, so the frozen WAVs ARE the sound of the locked sources.
+bool loadWavPcm16_24_float(const std::string& path, std::vector<float>& out, int& rate, int& channels, std::string& error) {
+    out.clear();
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { error = "the file does not exist."; return false; }
+    char id[4] = {};
+    in.read(id, 4);
+    if (!in || std::memcmp(id, "RIFF", 4) != 0) { error = "not a RIFF/WAV file."; return false; }
+    in.ignore(4);
+    in.read(id, 4);
+    if (!in || std::memcmp(id, "WAVE", 4) != 0) { error = "not a WAV file."; return false; }
+    unsigned short fmt = 0, chans = 0, bits = 0;
+    long long dataPos = -1; unsigned dataSize = 0;
+    while (in) {
+        in.read(id, 4);
+        unsigned len = 0;
+        in.read(reinterpret_cast<char*>(&len), 4);
+        if (!in) break;
+        if (std::memcmp(id, "fmt ", 4) == 0 && len >= 16) {
+            unsigned char f[16] = {};
+            in.read(reinterpret_cast<char*>(f), 16);
+            if (!in) { error = "truncated fmt chunk."; return false; }
+            fmt = (unsigned short)(f[0] | (f[1] << 8));
+            chans = (unsigned short)(f[2] | (f[3] << 8));
+            rate = int(f[4]) | (int(f[5]) << 8) | (int(f[6]) << 16) | (int(f[7]) << 24);
+            bits = (unsigned short)(f[14] | (f[15] << 8));
+            if (len > 16) in.ignore(long(len) - 16);
+        } else if (std::memcmp(id, "data", 4) == 0) {
+            dataPos = in.tellg(); dataSize = len;
+            in.ignore(len + (len & 1));
+        } else {
+            in.ignore(long(len) + (len & 1));
+        }
+    }
+    if (dataPos < 0 || chans == 0 || rate <= 0) { error = "no audio data chunk."; return false; }
+    if (!((fmt == 1 && (bits == 16 || bits == 24)) || (fmt == 3 && bits == 32))) {
+        error = "unsupported WAV format (PCM 16/24 or float32 expected)."; return false;
+    }
+    channels = (int)chans;
+    in.clear();
+    in.seekg(dataPos);
+    const size_t frames = dataSize / (size_t(chans) * (size_t(bits) / 8));
+    out.resize(frames * (size_t)chans, 0.f);
+    std::vector<unsigned char> raw(dataSize);
+    in.read(reinterpret_cast<char*>(raw.data()), std::streamsize(dataSize));
+    const size_t got = size_t(in.gcount()) / (size_t(chans) * (size_t(bits) / 8)) * (size_t(chans) * (size_t(bits) / 8));
+    for (size_t i = 0; i < got / (size_t(chans) * (size_t(bits) / 8)); ++i)
+        for (unsigned c = 0; c < chans; ++c) {
+            const size_t o = (i * (size_t)chans + c) * (size_t(bits) / 8);
+            float v = 0.f;
+            if (fmt == 3) {
+                std::uint32_t u = (std::uint32_t)raw[o] | ((std::uint32_t)raw[o + 1] << 8) | ((std::uint32_t)raw[o + 2] << 16) | ((std::uint32_t)raw[o + 3] << 24);
+                std::memcpy(&v, &u, 4);
+            } else if (bits == 16) {
+                v = (float)(short)((unsigned short)raw[o] | ((unsigned short)raw[o + 1] << 8)) / 32768.f;
+            } else {
+                v = (float)((int)((unsigned)raw[o] | ((unsigned)raw[o + 1] << 8) | ((unsigned)raw[o + 2] << 16)) << 8) / 2147483648.f;
+            }
+            out[i * (size_t)chans + c] = v;
+        }
+    return true;
+}
+
 #ifdef _WIN32
 using Library = HMODULE;
 Library openLibrary(const std::string& name) {
@@ -105,6 +175,24 @@ public:
 };
 }
 
+// Csound's perform runs third-party opcodes and host callbacks; an access violation inside it
+// kills the process through the unhandled-exception filter. On the worker thread the app can
+// catch it with SEH instead: an offline freeze then FAILS WITH A MESSAGE instead of the whole
+// app vanishing. This function must stay free of C++ objects with unwinding (SEH requirement).
+#ifdef _WIN32
+static int sehPerform(int (*performFn)(void*), void* cs, int* faulted) {
+    __try { return performFn(cs); }
+    __except (GetExceptionCode() == 0xC0000005 || GetExceptionCode() == 0xC0000374 || GetExceptionCode() == 0xC00000FD
+              ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        *faulted = (int)GetExceptionCode();
+        return -1;
+    }
+}
+
+#else
+static int sehPerform(int (*performFn)(void*), void* cs, int* faulted) { *faulted = 0; return performFn(cs); }
+#endif
+
 struct CsoundApiRunner::Impl {
     Library lib = nullptr;
     int version = 0, sampleBytes = 0;
@@ -125,6 +213,7 @@ struct CsoundApiRunner::Impl {
     unsigned (*channels6)(void*) = nullptr;
     unsigned (*channels7)(void*, int) = nullptr;
     const void* (*spout)(void*) = nullptr;
+    void* (*spin)(void*) = nullptr;
     int (*channelPtr)(void*, void**, const char*, int) = nullptr;
     void (*createMessages)(void*, int) = nullptr;
     int (*messageCount)(void*) = nullptr;
@@ -142,6 +231,8 @@ struct CsoundApiRunner::Impl {
     std::vector<std::pair<std::string, std::string>> orcQueue;   // clip name, instrument definition
     std::atomic<int> code{0};
     std::atomic<float> masterGain{1.f};
+    double offlineMaxSeconds = 0.0;   // freeze renders: cap the offline length at the frozen range (set before the worker starts)
+    std::map<int, CsoundApiRunner::OfflineSampleStream> offlineSampleStreams;   // frozen WAVs the offline render feeds as engine-4 inputs (guarded by vstMutex)
     std::atomic<bool> hostGainExternal{false};   // the CAW master chain applies the gain on the device buffer: the engine must not apply it twice
     std::unique_ptr<MonitorCapture> capture;
     std::unique_ptr<MonitorCapture> outputCapture;
@@ -164,6 +255,8 @@ struct CsoundApiRunner::Impl {
     std::map<std::string, void*> hubChans;
     std::atomic<std::uint64_t> hubSeen{0};
     unsigned hubResolveCountdown = 0;
+    // CAW AUDIO BUSES: the cawbsend / cawbrecv names of this Run (set before start, read by the engine thread)
+    std::vector<std::string> busSends, busRecvs;
     // Live VSTE state, all guarded by vstMutex and read once per render block.
     // vstActive / vstActiveSet: which loaded VST tracks still sound (live M / S).
     // vstParamOverrides: one-shot writes into named Csound control channels (the VSTE panel sliders,
@@ -176,8 +269,9 @@ struct CsoundApiRunner::Impl {
     std::map<std::string, double> vstParamOverrides;
     std::map<std::string, void*> vstParamChans;
     std::vector<std::string> vstTaps;             // SEPARATED ENGINES: clip taps captured per cycle
-    std::map<std::string, void*> vstTapChans;     // resolved tap channel pointers (render thread)
+    std::map<std::string, void*> vstTapChans;     // resolved tap channel pointers (vstMutex)
     std::vector<float> vstTapCopy;                // ksmps scratch for one tap channel (render thread)
+    std::atomic<bool> vstTapClearRequested{false};   // transport / routing changes drop queued tap audio
     VstParamMirror vstMirror;                // engine -> UI: the kP1..kP8 values the rack is using
     VstRack* vstRackPtr = nullptr;           // valid only while the worker's render loop runs (vstMutex)
     VstEngineAudio vstEa;                    // realtime mixes the rack can consume (PD / SC)
@@ -187,6 +281,10 @@ struct CsoundApiRunner::Impl {
     std::atomic<bool> vstInChDirty{false};   // a live graph push: create channels for any new VSTe before the next compile
     CawScRing* scRing = nullptr;             // CAW's audio callback fills this (set by the app)
     std::atomic<bool>* scRawSuppress = nullptr;   // true while a master-mode VSTe replaces the SC mix
+    std::vector<float> hostFoldF;            // the spout fold scratch: renderN channels -> the soundcard's width
+    std::vector<double> hostFoldD;
+    std::vector<float> capFoldF;             // the capture fold scratch: the rendered mix -> the scope's stereo pair
+    std::vector<double> capFoldD;
 
     // Which master-mode VSTe tracks consume the Pure Data / SuperCollider mix? Their processed
     // output REPLACES the raw mix in the master, so the raw mixes are suppressed while they run.
@@ -238,10 +336,36 @@ struct CsoundApiRunner::Impl {
     }
     void run(std::string path, int meterCount, bool captureEnabled, bool hostOutput, CawAudioSettings audioSettings,
              bool offline, std::string offlinePath, int wavFormat, int outputChannels) {
+        // The worker is a raw std::thread: an exception escaping it calls std::terminate and the
+        // process dies SILENTLY (no crash log). Every failure lands in the engine log instead and
+        // the offline pass reports it.
+        try {
+            runInner(std::move(path), meterCount, captureEnabled, hostOutput, audioSettings, offline,
+                     std::move(offlinePath), wavFormat, outputChannels);
+        } catch (const std::exception& e) {
+            logs.push((std::string("[caw] The engine worker failed with an error: ") + e.what() + "\n").c_str());
+            if (code == 0) code = -1;
+        } catch (...) {
+            logs.push("[caw] The engine worker failed with an unknown error (out of memory?).\n");
+            if (code == 0) code = -1;
+        }
+        live = false;
+        done = true;
+    }
+    void runInner(std::string path, int meterCount, bool captureEnabled, bool hostOutput, CawAudioSettings audioSettings,
+             bool offline, std::string offlinePath, int wavFormat, int outputChannels) {
 #ifdef _WIN32
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 #endif
         drainedText.clear();
+        {   // every cached pointer belongs to the previous Csound instance
+            std::lock_guard<std::mutex> lock(vstMutex);
+            vstParamChans.clear();
+            vstTapChans.clear();
+            vstTapClearRequested.store(false, std::memory_order_release);
+            vsttaps::clear();
+        }
+        { std::lock_guard<std::mutex> lock(hubMutex); hubChans.clear(); hubResolveCountdown = 0; }
         void* cs = version == 6 ? create6(nullptr) : create7(nullptr, nullptr);
         if (!cs) { logs.push("[caw] Could not create the Csound API engine.\n"); code = -1; live = false; done = true; return; }
         createMessages(cs, 0);
@@ -320,7 +444,7 @@ struct CsoundApiRunner::Impl {
                 }
             }
         }
-        if (status == 0 && !stopRequested.load() && pd && hostOutput && !offline) {
+        if (status == 0 && !stopRequested.load() && pd && (hostOutput || offline)) {
             std::string error;
             bool prepared=false;
             try {prepared=pd->prepare(pdLibrary,pdPlan,audioSettings.sampleRate,(int)nchan,blockSize,error);}
@@ -331,14 +455,15 @@ struct CsoundApiRunner::Impl {
                 status=-1;
             } else {
                 pdPrepared.store(true,std::memory_order_release);
-                logs.push("[caw] PD and Csound share CAW's audio stream.\n");
+                logs.push(hostOutput ? "[caw] PD and Csound share CAW's audio stream.\n"
+                                     : "[caw] PD renders inside the offline host (sample-frame scheduling, silent).\n");
             }
         }
         CawAudioOutput output;
         CawWavWriter wav;
         if (status == 0 && !stopRequested.load() && offline) {
             std::string error;
-            if (nchan != (unsigned)audioSettings.channels ||
+            if (nchan < (unsigned)audioSettings.channels ||
                 !wav.open(offlinePath, audioSettings.sampleRate, outputChannels, wavFormat, error)) {
                 logs.push(("[caw] Offline WAV output failed: " + error + "\n").c_str());
                 status = -1;
@@ -346,10 +471,13 @@ struct CsoundApiRunner::Impl {
         }
         if (status == 0 && !stopRequested.load() && hostOutput) {
             if (outputCapture) output.setMonitorCapture(outputCapture.get());
-            if (nchan != (unsigned)audioSettings.channels) {
-                logs.push("[caw] Csound output channel count differs from the CAW soundcard setup.\n");
+            if (nchan < (unsigned)audioSettings.channels) {
+                logs.push("[caw] Csound renders fewer channels than the CAW soundcard setup.\n");
                 status = -1;
             } else {
+                if (nchan > (unsigned)audioSettings.channels)
+                    logs.push(("[caw] Csound renders " + std::to_string(nchan) + " channels; the soundcard setup is " +
+                              std::to_string(audioSettings.channels) + " - the extra channels fold into the master (channel k plays on k mod N).\n").c_str());
                 std::string outputError;
                 if (!output.open(audioSettings, outputError)) {
                     logs.push(("[caw] Audio output failed: " + outputError + "\n").c_str());
@@ -371,7 +499,40 @@ struct CsoundApiRunner::Impl {
         };
         VstRack vstRack;
         vstEa.pdMix = &pdMixPtr;   // the rack reads the latest PD render through this (set below)
-        vstEa.pdMixChannels = (int)nchan;   // the PD mixer renders interleaved at the engine channel count (prepare above)
+        vstEa.pdMixChannels = pd ? pd->channels() : (int)nchan;   // the PD mixer's real render width (the widest [dac~], at least the engine's)
+        // The dedicated PD engine (not mixed mode) renders into its own device: its live mix
+        // reaches the rack through the shared ring (pd_live_ring.h) instead of pdMixPtr.
+        vstEa.pdRing = pdLibrary.empty() ? &pdlivering::ring : nullptr;
+        // The offline sample streams: the FROZEN sources' rendered WAVs. The live sample engine
+        // does not run offline, so the host decodes the WAVs and feeds them per block into its own
+        // rings - the rack's engine-4 inputs (a VSTe whose sources are locked) hear them exactly
+        // like the live WAV voices.
+        std::map<int, CawScRing> offlineSampleRings;
+        std::map<int, std::vector<float>> offlineSampleData;
+        std::map<int, int> offlineSampleChans, offlineSampleRate;
+        if (offline) {
+            std::map<int, CsoundApiRunner::OfflineSampleStream> streams;
+            { std::lock_guard<std::mutex> lock(vstMutex); streams = offlineSampleStreams; }
+            for (const auto& kv : streams) {
+                int rate = 0, ch = 0; std::string werr;
+                std::vector<float> data;
+                if (loadWavPcm16_24_float(kv.second.path, data, rate, ch, werr) && !data.empty()) {
+                    offlineSampleData[kv.first] = std::move(data);
+                    offlineSampleChans[kv.first] = std::max(1, ch);
+                    offlineSampleRate[kv.first] = rate > 0 ? rate : audioSettings.sampleRate;
+                    offlineSampleRings[kv.first];
+                    logs.push(("[caw] Offline render: the frozen source \"" + std::filesystem::path(kv.second.path).filename().string() + "\" feeds the VSTe inputs (" +
+                               std::to_string(offlineSampleData[kv.first].size() / (size_t)std::max(1, ch) / (unsigned)audioSettings.sampleRate) + " s).\n").c_str());
+                } else {
+                    logs.push(("[caw] Offline render: the frozen WAV could not be read (" + werr + ") - its VSTe inputs stay silent.\n").c_str());
+                }
+            }
+            if (!offlineSampleRings.empty())
+                vstEa.sampleRing = [&offlineSampleRings](int trackId) -> CawScRing* {
+                    auto it = offlineSampleRings.find(trackId);
+                    return it == offlineSampleRings.end() ? nullptr : &it->second;
+                };
+        }
         std::vector<VstJob> rackJobs;
         { std::lock_guard<std::mutex> lock(vstMutex); rackJobs = vstJobs; }
         // The rack exists even with no VST track: a track added while the engine runs is loaded
@@ -389,6 +550,13 @@ struct CsoundApiRunner::Impl {
                     offline, &vstMirror, &vstEa);
             } catch (...) { logs.push("[caw] VST initialization threw an exception.\n"); }
             drainRackLog();
+            if (ok) {
+                // Resolve every Csound channel pointer BEFORE the perform loop: the offline rack
+                // bounce used to call csoundGetChannelPtr from INSIDE the perform callback (the
+                // access violation inside csound7_64.dll). After this the audio path only reads
+                // cached pointers - the same pointer-free audio path the live 4th engine uses.
+                try { vstRack.preResolve(); } catch (...) { logs.push("[caw] VST channel pre-resolution failed.\n"); }
+            }
             if (!ok) { logs.push("[caw] VST initialization failed; export stopped.\n"); status = -1; }
         }
         {   // the UI can push manual parameter overrides from now until the worker ends
@@ -409,14 +577,42 @@ struct CsoundApiRunner::Impl {
                 }
             }
 #endif
-            logs.push("[caw] CAW engine build: 42_vste_nocsd_35 (changing the plugin never carries the previous plugin's parameter values over: plugins from one vendor share their parameter ids, so a switch kept the old settings on screen and often silenced the new instrument; a plugin is identified by its VST3 class id; the editor opens size-then-scale as in the known-good build and can be reopened from its window).\n");
+            logs.push(("[caw] CAW engine build: " + std::string(caw_brand::buildTag) + ".\n").c_str());
             if (compileOrcSym) logs.push("[caw] Live code: VSTi / VSTe / Csound clip code is recompiled into this engine while it runs.\n");
 #ifndef CAW_VST3
             logs.push("[caw] NOTE: this build has NO VST3 host (CAW_VST3 undefined) - VST / VSTe tracks cannot load, run or edit live.\n");
 #endif
             logs.push("[caw] Csound API engine started.\n");
+            // CAW AUDIO BUSES: one port per named bus; the Csound side is a pair of audio channels.
+            struct CsBusChan { cawbus::Port port; void* l = nullptr; void* r = nullptr; std::vector<float> lr; };
+            std::vector<CsBusChan> busOut, busIn;
+            auto openBusChans = [&](const std::vector<std::string>& names, const char* prefix, std::vector<CsBusChan>& dst) {
+                for (const std::string& n : names) {
+                    CsBusChan bc; bc.port.busName = n;
+                    const std::string base = std::string(prefix) + n;
+                    if (channelPtr(cs, &bc.l, (base + "_L").c_str(), 2 | 16 | 32) != 0) bc.l = nullptr;   // audio | input | output
+                    if (channelPtr(cs, &bc.r, (base + "_R").c_str(), 2 | 16 | 32) != 0) bc.r = nullptr;
+                    if (!bc.l || !bc.r) { logs.push(("[caw] audio bus \"" + n + "\": the Csound channel could not be opened.\n").c_str()); continue; }
+                    bc.lr.assign((size_t)std::max(1, (int)blockSize) * 2, 0.f);
+                    dst.push_back(std::move(bc));
+                }
+            };
+            if (!offline) {
+                openBusChans(busSends, "cawbo_", busOut);
+                openBusChans(busRecvs, "cawbi_", busIn);
+                if (!busOut.empty() || !busIn.empty())
+                    logs.push(("[caw] audio buses: Csound sends " + std::to_string(busOut.size()) + ", receives " + std::to_string(busIn.size()) + ".\n").c_str());
+            }
+            // THE SOUNDCARD INPUT (microphone): CAW owns one capture stream (caw_audio_in.h) and feeds
+            // Csound's spin every ksmps, so inch / ins / in work in every clip.
+            void* micIn = (spin && cawin::isOpen()) ? spin(cs) : nullptr;
+            const unsigned micCh = version == 6 ? nchan : (channels7 ? std::max(1u, channels7(cs, 1)) : nchan);
+            cawin::Reader micReader;
+            std::vector<float> micBlock;
+            if (micIn) logs.push(("[caw] Csound input: the soundcard input (" + std::to_string(cawin::channels()) + " ch) feeds inch / ins.\n").c_str());
             unsigned logFrames = 0;
             bool firstBlockDone = false;
+            unsigned long long offlineFrames = 0;   // the freeze render counts its written frames against offlineMaxSeconds
             std::vector<double> convertedD;
             std::vector<float> convertedF;
             while (!stopRequested.load(std::memory_order_relaxed)) {
@@ -459,15 +655,49 @@ struct CsoundApiRunner::Impl {
                     if (sampleBytes == 8) *static_cast<double*>(serialPtr) = static_cast<double>(serial);
                     else *static_cast<float*>(serialPtr) = static_cast<float>(serial);
                 }
-                status = perform(cs);
+                if (micIn && hostOutput && !offline) {   // the soundcard input -> Csound's spin (inch / ins)
+                    if (micBlock.size() < (size_t)blockSize * (size_t)micCh) micBlock.resize((size_t)blockSize * (size_t)micCh);
+                    micReader.read(micBlock.data(), (size_t)blockSize, (int)micCh);
+                    const double fs = audioSettings.fullScale;
+                    for (size_t i2 = 0; i2 < (size_t)blockSize * (size_t)micCh; ++i2) {
+                        if (sampleBytes == 8) static_cast<double*>(micIn)[i2] = (double)micBlock[i2] * fs;
+                        else static_cast<float*>(micIn)[i2] = (float)(micBlock[i2] * fs);
+                    }
+                }
+                for (CsBusChan& bc : busIn) {   // bus -> cawbi_<name>_L/R, read by cawbrecv in this ksmps
+                    cawbus::read(bc.port, bc.lr.data(), (size_t)blockSize);
+                    for (int n = 0; n < (int)blockSize; ++n) {
+                        if (sampleBytes == 8) { static_cast<double*>(bc.l)[n] = bc.lr[(size_t)n * 2]; static_cast<double*>(bc.r)[n] = bc.lr[(size_t)n * 2 + 1]; }
+                        else { static_cast<float*>(bc.l)[n] = bc.lr[(size_t)n * 2]; static_cast<float*>(bc.r)[n] = bc.lr[(size_t)n * 2 + 1]; }
+                    }
+                }
+                int faulted = 0;
+                status = sehPerform(perform, cs, &faulted);
+                if (faulted) {
+                    char b[16]; std::snprintf(b, sizeof(b), "%x", faulted);
+                    logs.push((std::string("[caw] Csound faulted inside the Csound library (code 0x") + b
+                              + ") while performing " + (offline ? "the freeze CSD" : "the engine CSD")
+                              + " at " + std::to_string((double)offlineFrames / (double)std::max(1, audioSettings.sampleRate))
+                              + " s of the range - the render stops here (the app stays up).\n").c_str());
+                    status = -1;
+                    break;
+                }
                 if (status != 0) break;
+                for (CsBusChan& bc : busOut) {   // cawbo_<name>_L/R (what cawbsend added this ksmps) -> bus, then zero for the next pass
+                    for (int n = 0; n < (int)blockSize; ++n) {
+                        bc.lr[(size_t)n * 2]     = sampleBytes == 8 ? (float)static_cast<const double*>(bc.l)[n] : static_cast<const float*>(bc.l)[n];
+                        bc.lr[(size_t)n * 2 + 1] = sampleBytes == 8 ? (float)static_cast<const double*>(bc.r)[n] : static_cast<const float*>(bc.r)[n];
+                    }
+                    cawbus::send(bc.port, bc.lr.data(), (size_t)blockSize);
+                    if (sampleBytes == 8) { std::fill_n(static_cast<double*>(bc.l), blockSize, 0.0); std::fill_n(static_cast<double*>(bc.r), blockSize, 0.0); }
+                    else { std::fill_n(static_cast<float*>(bc.l), blockSize, 0.f); std::fill_n(static_cast<float*>(bc.r), blockSize, 0.f); }
+                }
                 // Live VSTE parameter edits: one-shot writes into the named control channels. The
                 // clip code reads them (cawget) on the next block, so a slider drag reaches the
                 // running plugin without restarting Csound. Resolved channel pointers are cached.
                 std::set<int> vstActiveNow; bool vstActiveValid = false;
                 std::map<int, unsigned> vstMasksNow;
                 std::set<int> vstPdMasterNow, vstScMasterNow;
-                std::vector<std::string> vstTapsNow;
                 bool pdRawSuppressed = false;
                 {
                     std::vector<std::pair<std::string, double>> overrides;
@@ -476,7 +706,6 @@ struct CsoundApiRunner::Impl {
                       vstParamOverrides.clear();
                       vstActiveNow = vstActive; vstActiveValid = vstActiveSet;
                       vstMasksNow = vstInputMasks;
-                      vstTapsNow = vstTaps;
                       vstPdMasterNow = vstPdMaster; vstScMasterNow = vstScMaster; }
                     // An ACTIVE master-mode VSTe replaces the raw PD / SC mix with its processed
                     // output: suppress the raw mixes while it runs (SC needs the flag because the
@@ -490,6 +719,7 @@ struct CsoundApiRunner::Impl {
                     pdRawSuppressed = consumed(vstPdMasterNow);
                     const bool scRaw = consumed(vstScMasterNow);
                     if (scRawSuppress) scRawSuppress->store(scRaw, std::memory_order_release);
+                    std::lock_guard<std::mutex> lock(vstMutex);
                     for (const auto& ov : overrides) {
                         auto it = vstParamChans.find(ov.first);
                         if (it == vstParamChans.end() || !it->second) {
@@ -505,21 +735,30 @@ struct CsoundApiRunner::Impl {
                 // SEPARATED ENGINES: Csound clip taps for the 4th engine's rack. Captured once per
                 // ksmps cycle into the vsttaps rings, so the VST rack (outside this thread) can
                 // consume Csound clip audio - and a VST-side stall can never reach this thread.
-                if (!vstTapsNow.empty() && blockSize > 0) {
-                    for (const std::string& name : vstTapsNow) {
+                // The named channels are additive: zero them after publishing so a stopped clip
+                // cannot leave a constant input feeding a delay / feedback effect.
+                if (blockSize > 0) {
+                    std::lock_guard<std::mutex> lock(vstMutex);
+                    const bool silent = vstTapClearRequested.exchange(false, std::memory_order_acq_rel);
+                    for (const std::string& name : vstTaps) {
                         auto itc = vstTapChans.find(name);
                         if (itc == vstTapChans.end() || !itc->second) {
                             void* p = nullptr;
                             if (channelPtr(cs, &p, name.c_str(), 2 | 16 | 32) == 0 && p) { vstTapChans[name] = p; itc = vstTapChans.find(name); }
                         }
                         if (itc == vstTapChans.end() || !itc->second) continue;
-                        const void* chp = itc->second;
-                        if (vstTapCopy.size() < (size_t)blockSize) vstTapCopy.resize((size_t)blockSize);
-                        for (int n = 0; n < blockSize; ++n)
-                            vstTapCopy[(size_t)n] = sampleBytes == 8 ? (float)static_cast<const double*>(chp)[n]
-                                                                     : static_cast<const float*>(chp)[n];
-                        vsttaps::push(name, vstTapCopy.data(), blockSize);
+                        void* chp = itc->second;
+                        if (!silent) {
+                            if (vstTapCopy.size() < (size_t)blockSize) vstTapCopy.resize((size_t)blockSize);
+                            for (int n = 0; n < blockSize; ++n)
+                                vstTapCopy[(size_t)n] = sampleBytes == 8 ? (float)static_cast<const double*>(chp)[n]
+                                                                         : static_cast<const float*>(chp)[n];
+                            vsttaps::push(name, vstTapCopy.data(), blockSize);
+                        }
+                        if (sampleBytes == 8) std::fill_n(static_cast<double*>(chp), blockSize, 0.0);
+                        else std::fill_n(static_cast<float*>(chp), blockSize, 0.f);
                     }
+                    if (silent) vsttaps::clear();
                 }
                 const void* buffer = (hostOutput || captureEnabled || offline) ? spout(cs) : nullptr;
                 if ((hostOutput || captureEnabled || offline) && !buffer) {
@@ -530,12 +769,15 @@ struct CsoundApiRunner::Impl {
                 // Pure Data renders BEFORE the rack: a VSTe wired to "PureData" hears the mix of the
                 // very same block, and the raw mix is added to the master right here (suppressed
                 // while a master-mode VSTe replaces it with its processed output).
-                if (pd && hostOutput) {
+                if (pd && (hostOutput || offline)) {
                     const float* pdAudio=nullptr;
                     std::string error;
-                    const double ack=sampleBytes==8 ? *static_cast<const double*>(pdAckPtr) :
-                                                     *static_cast<const float*>(pdAckPtr);
-                    const int ackSerial=std::isfinite(ack) ? (int)std::max(0.0,std::min(ack,static_cast<double>(INT32_MAX))) : 0;
+                    int ackSerial=INT32_MAX;   // offline: no Csound ack channel - apply transport commands immediately
+                    if (hostOutput) {
+                        const double ack=sampleBytes==8 ? *static_cast<const double*>(pdAckPtr) :
+                                                         *static_cast<const float*>(pdAckPtr);
+                        ackSerial=std::isfinite(ack) ? (int)std::max(0.0,std::min(ack,static_cast<double>(INT32_MAX))) : 0;
+                    }
                     bool rendered=false;
                     try {rendered=pd->render(blockSize,pdAudio,error,ackSerial);}
                     catch(const std::exception& e){error=e.what();}
@@ -550,13 +792,34 @@ struct CsoundApiRunner::Impl {
                         logs.push(("[caw] "+warning+"\n").c_str());
                     pdMixPtr.store(pdAudio, std::memory_order_release);   // VSTe "PureData" inputs read this (this block)
                     if (!pdRawSuppressed) {   // a master-mode VSTe consuming the PD mix replaces it instead
-                        const size_t count=(size_t)blockSize*nchan;
-                        if(sampleBytes==8) {
-                            auto* data=static_cast<double*>(const_cast<void*>(buffer));
-                            for(size_t i=0;i<count;++i)data[i]+=static_cast<double>(pdAudio[i])*audioSettings.fullScale;
+                        // The virtual soundcard fold: PD renders pdCh channels (the widest [dac~]);
+                        // csound's spout carries nchan. Channel k plays on spout channel k mod N.
+                        const int pdCh = pd ? pd->channels() : (int)nchan;
+                        if (pdCh == (int)nchan) {
+                            const size_t count=(size_t)blockSize*nchan;
+                            if(sampleBytes==8) {
+                                auto* data=static_cast<double*>(const_cast<void*>(buffer));
+                                for(size_t i=0;i<count;++i)data[i]+=static_cast<double>(pdAudio[i])*audioSettings.fullScale;
+                            } else {
+                                auto* data=static_cast<float*>(const_cast<void*>(buffer));
+                                for(size_t i=0;i<count;++i)data[i]+=pdAudio[i]*audioSettings.fullScale;
+                            }
                         } else {
-                            auto* data=static_cast<float*>(const_cast<void*>(buffer));
-                            for(size_t i=0;i<count;++i)data[i]+=pdAudio[i]*audioSettings.fullScale;
+                            if(sampleBytes==8) {
+                                auto* data=static_cast<double*>(const_cast<void*>(buffer));
+                                for(int f=0;f<blockSize;++f) {
+                                    const float* in=pdAudio+(size_t)f*pdCh;
+                                    double* dst=data+(size_t)f*nchan;
+                                    for(int c=0;c<pdCh;++c)dst[c%nchan]+=static_cast<double>(in[c])*audioSettings.fullScale;
+                                }
+                            } else {
+                                auto* data=static_cast<float*>(const_cast<void*>(buffer));
+                                for(int f=0;f<blockSize;++f) {
+                                    const float* in=pdAudio+(size_t)f*pdCh;
+                                    float* dst=data+(size_t)f*nchan;
+                                    for(int c=0;c<pdCh;++c)dst[c%nchan]+=in[c]*audioSettings.fullScale;
+                                }
+                            }
                         }
                     }
                 }
@@ -566,6 +829,31 @@ struct CsoundApiRunner::Impl {
                 // the same transport the Csound clips use; a VSTi feeds a VSTe in the same block,
                 // and a master-mode VSTe replaces its source right here - no second rack, no rings
                 // between engines.
+                if (offline && !offlineSampleRings.empty()) {
+                    // The offline sample streams: the frozen sources' WAV voices. The render's block
+                    // [T, T+block) sits at project time T = offlineFrames / sampleRate; the WAV plays
+                    // its slice from stream.start on (silence before it and after it ends).
+                    const double blockStart = (double)offlineFrames / (double)audioSettings.sampleRate;
+                    for (auto& kv : offlineSampleRings) {
+                        std::vector<float> blk((size_t)blockSize * 2, 0.f);
+                        const auto dit = offlineSampleData.find(kv.first);
+                        if (dit != offlineSampleData.end() && !dit->second.empty()) {
+                            const auto& st = offlineSampleStreams.at(kv.first);
+                            const int ch = offlineSampleChans[kv.first];
+                            const size_t total = dit->second.size() / (size_t)std::max(1, ch);
+                            const double fileRate = (double)offlineSampleRate[kv.first];
+                            for (int n = 0; n < blockSize; ++n) {
+                                const double srcFrame = (blockStart - st.start + (double)n / (double)audioSettings.sampleRate) * fileRate;
+                                if (srcFrame < 0.0) continue;
+                                const size_t frame = (size_t)srcFrame;
+                                if (frame >= total) break;
+                                blk[(size_t)n * 2] += dit->second[frame * (size_t)ch] * (float)st.gain;
+                                blk[(size_t)n * 2 + 1] += dit->second[frame * (size_t)ch + (ch > 1 ? 1 : 0)] * (float)st.gain;
+                            }
+                        }
+                        kv.second.push(blk.data(), (size_t)blockSize);
+                    }
+                }
                 if (buffer) {
                     try { vstRack.process(const_cast<void*>(buffer), captureEnabled ? capture.get() : nullptr, audioSettings.fullScale, vstActiveValid ? &vstActiveNow : nullptr, vstActiveValid, &vstMasksNow); }
                     catch (...) { logs.push("[caw] VST processing failed.\n"); status = -1; break; }
@@ -628,9 +916,35 @@ struct CsoundApiRunner::Impl {
                         float* data = static_cast<float*>(const_cast<void*>(buffer));
                         for (size_t i = 0; i < sampleCount; ++i) data[i] *= hostGain;
                     }
-                    const bool ok = sampleBytes == 8
-                        ? output.push(static_cast<const double*>(buffer), blockSize, stopRequested)
-                        : output.push(static_cast<const float*>(buffer), blockSize, stopRequested);
+                    // The virtual soundcard fold: Csound renders nchan channels (the widest out
+                    // opcode); the soundcard stream takes audioSettings.channels. Channel k plays
+                    // on stream channel k mod N - the same rule every engine follows.
+                    const unsigned streamCh = (unsigned)std::max(1, audioSettings.channels);
+                    const bool ok = [&]() -> bool {
+                        if (nchan == streamCh) {
+                            return sampleBytes == 8
+                                ? output.push(static_cast<const double*>(buffer), blockSize, stopRequested)
+                                : output.push(static_cast<const float*>(buffer), blockSize, stopRequested);
+                        }
+                        if (sampleBytes == 8) {
+                            hostFoldD.assign((size_t)blockSize * streamCh, 0.0);
+                            const double* src = static_cast<const double*>(buffer);
+                            for (unsigned f = 0; f < blockSize; ++f) {
+                                const double* in = src + (size_t)f * nchan;
+                                double* dst = hostFoldD.data() + (size_t)f * streamCh;
+                                for (unsigned c = 0; c < nchan; ++c) dst[c % streamCh] += in[c];
+                            }
+                            return output.push(hostFoldD.data(), blockSize, stopRequested);
+                        }
+                        hostFoldF.assign((size_t)blockSize * streamCh, 0.f);
+                        const float* src = static_cast<const float*>(buffer);
+                        for (unsigned f = 0; f < blockSize; ++f) {
+                            const float* in = src + (size_t)f * nchan;
+                            float* dst = hostFoldF.data() + (size_t)f * streamCh;
+                            for (unsigned c = 0; c < nchan; ++c) dst[c % streamCh] += in[c];
+                        }
+                        return output.push(hostFoldF.data(), blockSize, stopRequested);
+                    }();
                     if (!ok) {
                         if (!stopRequested.load()) { logs.push("[caw] Soundcard output stopped unexpectedly.\n"); status = -1; }
                         break;
@@ -647,32 +961,67 @@ struct CsoundApiRunner::Impl {
                         ok = wav.write(convertedF.data(), blockSize, audioSettings.fullScale, gain, error);
                     }
                     if (!ok) { logs.push(("[caw] Offline output failed: " + error + "\n").c_str()); status = -1; break; }
+                    offlineFrames += (unsigned long long)blockSize;
+                    if (offlineMaxSeconds > 0.0 && (double)offlineFrames >= offlineMaxSeconds * (double)audioSettings.sampleRate) {
+                        // The freeze range is fully rendered: stop even if the score stretches on
+                        // (stray events far right) - report it like a normal score completion.
+                        logs.push("[caw] Offline render reached its capped length (the freeze range).\n");
+                        status = 1;   // a positive perform status = normal completion
+                        break;
+                    }
                 }
                 if (!firstBlockDone) {   // the first block really went through Csound and out to the soundcard: only now is the engine live
                     firstBlockDone = true;
                     logs.push("[caw] Csound is running: first audio block delivered.\n");
                 }
                 if (captureEnabled && capture) {
+                    // The virtual soundcard: the master meter and the scope fold the rendered
+                    // channels (k mod N, N = the soundcard setup's width) - they show what the
+                    // soundcard gets. The LANE indices (masterChannels..) must never be touched
+                    // here: the render can be wider than the setup, and the raw overwrite used
+                    // to trample the first lane bars (a track bar lit with another channel's
+                    // signal). The lane taps themselves are per channel and stay exact.
+                    const unsigned masterN = (unsigned)std::max(1, audioSettings.channels);
                     for (int i = 0; i < meterCount; ++i) {
                         const void* ptr = meterPtrs[(size_t)i];
                         float value = sampleBytes == 8 ? (float)*static_cast<const double*>(ptr)
                                                        : *static_cast<const float*>(ptr);
-                        if (hostOutput && i < (int)nchan) {
+                        if (hostOutput && i < (int)masterN) {
                             value = 0.f;
-                            for (unsigned frame = 0; frame < blockSize; ++frame) {
-                                const size_t ix = (size_t)frame * nchan + (size_t)i;
-                                const float sample = sampleBytes == 8 ? (float)static_cast<const double*>(buffer)[ix] : static_cast<const float*>(buffer)[ix];
-                                if (std::isfinite(sample)) value = std::max(value, std::fabs(sample) / audioSettings.fullScale);
-                            }
+                            for (unsigned frame = 0; frame < blockSize; ++frame)
+                                for (unsigned c = (unsigned)i; c < nchan; c += masterN) {
+                                    const size_t ix = (size_t)frame * nchan + c;
+                                    const float sample = sampleBytes == 8 ? (float)static_cast<const double*>(buffer)[ix] : static_cast<const float*>(buffer)[ix];
+                                    if (std::isfinite(sample)) value = std::max(value, std::fabs(sample) / audioSettings.fullScale);
+                                }
                         }
                         capture->addMeter(i, value);
                     }
                     const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch()).count();
-                    if (sampleBytes == 8)
-                        capture->pushInterleaved(static_cast<const double*>(buffer), (int)blockSize, (int)nchan, now);
-                    else
-                        capture->pushInterleaved(static_cast<const float*>(buffer), (int)blockSize, (int)nchan, now);
+                    if (nchan <= 2) {
+                        if (sampleBytes == 8)
+                            capture->pushInterleaved(static_cast<const double*>(buffer), (int)blockSize, (int)nchan, now);
+                        else
+                            capture->pushInterleaved(static_cast<const float*>(buffer), (int)blockSize, (int)nchan, now);
+                    } else {
+                        // the folded stereo pair for the scope (L = even channels, R = odd)
+                        if (sampleBytes == 8) {
+                            capFoldD.assign((size_t)blockSize * 2, 0.0);
+                            const double* src = static_cast<const double*>(buffer);
+                            for (unsigned f = 0; f < blockSize; ++f)
+                                for (unsigned c = 0; c < nchan; ++c)
+                                    capFoldD[(size_t)f * 2 + (c % 2)] += src[(size_t)f * nchan + c];
+                            capture->pushInterleaved(capFoldD.data(), (int)blockSize, 2, now);
+                        } else {
+                            capFoldF.assign((size_t)blockSize * 2, 0.f);
+                            const float* src = static_cast<const float*>(buffer);
+                            for (unsigned f = 0; f < blockSize; ++f)
+                                for (unsigned c = 0; c < nchan; ++c)
+                                    capFoldF[(size_t)f * 2 + (c % 2)] += src[(size_t)f * nchan + c];
+                            capture->pushInterleaved(capFoldF.data(), (int)blockSize, 2, now);
+                        }
+                    }
                 }
                 logFrames += blockSize;
                 if (logFrames >= 1024) { drain(cs); logFrames = 0; }
@@ -695,11 +1044,16 @@ struct CsoundApiRunner::Impl {
         {   // the rack object is about to go out of scope: no more UI overrides can reach it
             std::lock_guard<std::mutex> lock(vstMutex);
             vstRackPtr = nullptr;
+            vstParamChans.clear();
             vstTapChans.clear();
-            vsttaps::clear();   // SEPARATED ENGINES: no worker pushing - the 4th engine holds last / warns
+            vstTapClearRequested.store(false, std::memory_order_release);
+            vsttaps::clear();
             pdMixPtr.store(nullptr, std::memory_order_release);
+            vstEa.sampleRing = nullptr;
             if (scRawSuppress) scRawSuppress->store(false, std::memory_order_release);
         }
+        { std::lock_guard<std::mutex> lock(hubMutex); hubChans.clear(); hubResolveCountdown = 0; }
+        vstInChMade.clear();
         pdPrepared.store(false,std::memory_order_release);
         if(pd && hostOutput && !offline)pd->shutdown();
         // A positive perform status means normal score completion, but a
@@ -770,6 +1124,7 @@ bool CsoundApiRunner::prepare(const std::string& executable, std::string& error)
     ok = d->get(d->perform, "csoundPerformKsmps") && ok;
     ok = d->get(d->ksmps, "csoundGetKsmps") && ok;
     ok = d->get(d->spout, "csoundGetSpout") && ok;
+    d->get(d->spin, "csoundGetSpin");   // optional: the soundcard input (CAW feeds it from the shared capture stream)
     ok = d->get(d->channelPtr, "csoundGetChannelPtr") && ok;
     d->get(d->getTable, "csoundGetTable");   // optional: only the VST tracks need it
     d->compileOrcSym = symbol(d->lib, "csoundCompileOrc");   // optional: live code editing (Csound 6.18 / 7)
@@ -897,7 +1252,7 @@ bool CsoundApiRunner::start(const std::string& path, int sampleRate, int meterCo
 }
 bool CsoundApiRunner::startOffline(const std::string& path, int sampleRate, int channels, float fullScale,
                                    float gain, int wavFormat, const std::string& wavPath, std::string& error,
-                                   int outputChannels) {
+                                   int outputChannels, double maxSeconds) {
     error.clear();
     if (!d->lib || d->worker.joinable() || ((d->version == 6 && !d->hostAudio6) || (d->version == 7 && !d->hostAudio7))) {
         error = "Csound host audio is unavailable."; return false;
@@ -909,12 +1264,13 @@ bool CsoundApiRunner::startOffline(const std::string& path, int sampleRate, int 
     audio.sampleRate = sampleRate; audio.channels = channels; audio.fullScale = fullScale;
     if (outputChannels == 0) outputChannels = channels;
     if (outputChannels < 1 || outputChannels > 64) { error = "Unsupported export channel count."; return false; }
+    d->offlineMaxSeconds = std::max(0.0, maxSeconds);
     try {
         d->vstSampleRate = sampleRate;
         d->capture.reset();
         d->outputCapture.reset();
         d->outputMonitorChannels = 0;
-        d->masterGain = std::max(0.f, std::min(2.f, gain));
+        d->masterGain = std::max(0.f, std::min(kMaxVolumeGain, gain));
         d->stopRequested = false; d->code = 0; d->done = false; d->live = true;
         d->worker = std::thread(&Impl::run, d.get(), path, 0, false, false, audio, true, wavPath, wavFormat, outputChannels);
     } catch (...) {
@@ -923,7 +1279,7 @@ bool CsoundApiRunner::startOffline(const std::string& path, int sampleRate, int 
     return true;
 }
 void CsoundApiRunner::setMasterGain(float linear) {
-    if (std::isfinite(linear)) d->masterGain.store(std::max(0.f, std::min(2.f, linear)), std::memory_order_relaxed);
+    if (std::isfinite(linear)) d->masterGain.store(std::max(0.f, std::min(kMaxVolumeGain, linear)), std::memory_order_relaxed);
 }
 void CsoundApiRunner::setHostGainExternal(bool external) {
     d->hostGainExternal.store(external, std::memory_order_relaxed);
@@ -956,6 +1312,12 @@ void CsoundApiRunner::setVstTaps(const std::vector<std::string>& channels) {
     if (d->vstTaps == channels) return;
     d->vstTaps = channels;
     d->vstTapChans.clear();   // re-resolve the changed channel set on the next cycle
+    vsttaps::clear();
+}
+void CsoundApiRunner::silenceVstTaps() {
+    std::lock_guard<std::mutex> lock(d->vstMutex);
+    d->vstTapClearRequested.store(true, std::memory_order_release);
+    vsttaps::clear();
 }
 void CsoundApiRunner::setVstActiveTracks(const std::set<int>& ids) {
     std::lock_guard<std::mutex> lock(d->vstMutex);
@@ -966,17 +1328,17 @@ void CsoundApiRunner::setVstInputMasks(const std::map<int, unsigned>& masks) {
     std::lock_guard<std::mutex> lock(d->vstMutex);
     d->vstInputMasks = masks;
 }
-void CsoundApiRunner::pushVstParamOverride(int trackId, int slot, double value) {
+void CsoundApiRunner::pushVstParamOverride(int trackId, int stage, int slot, double value) {
     std::lock_guard<std::mutex> lock(d->vstMutex);
-    if (d->vstRackPtr) d->vstRackPtr->pushParamOverride(trackId, slot, value);
+    if (d->vstRackPtr) d->vstRackPtr->pushParamOverride(trackId, slot, value, stage);
 }
 void CsoundApiRunner::refreshVstPicks(int trackId, const std::vector<int>& pick) {
     std::lock_guard<std::mutex> lock(d->vstMutex);
     if (d->vstRackPtr) d->vstRackPtr->pushPickUpdate(trackId, pick);
 }
-void CsoundApiRunner::pushVstParamValue(int trackId, int paramIndex, double value) {
+void CsoundApiRunner::pushVstParamValue(int trackId, int stage, int paramIndex, double value) {
     std::lock_guard<std::mutex> lock(d->vstMutex);
-    if (d->vstRackPtr) d->vstRackPtr->pushParamValue(trackId, paramIndex, value);
+    if (d->vstRackPtr) d->vstRackPtr->pushParamValue(trackId, paramIndex, value, stage);
 }
 void CsoundApiRunner::pushLiveInstrument(const std::string& label, std::string code) {
     if (code.empty()) return;
@@ -996,10 +1358,31 @@ void CsoundApiRunner::setVstOutModeLive(int trackId, int mode) {
     // The raw PD / SC mix is only suppressed while a MASTER-mode VSTe consumes it.
     d->rebuildVstMasters();
 }
+void CsoundApiRunner::setVstOutWideLive(int trackId, int mode) {
+    std::lock_guard<std::mutex> lock(d->vstMutex);
+    // Out stereo / Out source: the rack folds the plugin's channels at its meters and master join
+    // on the next block; the jobs carry the mode for the next graph rebuild.
+    if (d->vstRackPtr) d->vstRackPtr->setOutWide(trackId, mode);
+    for (VstJob& j : d->vstJobs) {
+        if (j.id != trackId) continue;
+        j.outWide = mode == 1 ? 1 : 0;
+        break;
+    }
+}
+void CsoundApiRunner::setVstChannelsLive(int trackId, int channels) {
+    std::lock_guard<std::mutex> lock(d->vstMutex);
+    for (VstJob& j : d->vstJobs) if (j.id == trackId) { j.channels = std::max(1, std::min(8, channels)); break; }
+    if (d->vstRackPtr) d->vstRackPtr->setWiring(d->vstJobs);
+}
 void CsoundApiRunner::setScAudioRing(CawScRing* ring) {
     std::lock_guard<std::mutex> lock(d->vstMutex);
     d->scRing = ring;
     d->vstEa.scRing = ring;
+}
+void CsoundApiRunner::setTrackRings(std::function<CawScRing*(int)> sampleRing, std::function<CawScRing*(int)> scTrackRing) {
+    std::lock_guard<std::mutex> lock(d->vstMutex);
+    d->vstEa.sampleRing = std::move(sampleRing);   // the sample engine's per-track rings (engine 4)
+    d->vstEa.scTrackRing = std::move(scTrackRing); // the SC engine's per-track-slot rings (engine 2)
 }
 void CsoundApiRunner::setScRawSuppress(std::atomic<bool>* flag) {
     std::lock_guard<std::mutex> lock(d->vstMutex);
@@ -1019,7 +1402,11 @@ std::vector<CsoundApiRunner::VstTrackPeak> CsoundApiRunner::takeVstPeaks() {
     std::vector<VstRack::SoloPeak> peaks;
     d->vstRackPtr->takeSoloPeaks(peaks);
     result.reserve(peaks.size());
-    for (const auto& p : peaks) result.push_back({p.trackId, p.l, p.r});
+    for (const auto& p : peaks) {
+        VstTrackPeak vp; vp.trackId = p.trackId;
+        for (int c = 0; c < 8; ++c) vp.value[(size_t)c] = p.value[(size_t)c];
+        result.push_back(vp);
+    }
     return result;
 }
 void CsoundApiRunner::setControlChannels(const std::vector<std::pair<std::string, double>>& values) {
@@ -1034,7 +1421,15 @@ void CsoundApiRunner::setPdSource(const std::string& library, const std::vector<
     d->pdPrepared.store(false,std::memory_order_release);
     d->pd=library.empty()?nullptr:std::make_unique<PdHostMixer>();
 }
+void CsoundApiRunner::setOfflineSampleStreams(const std::map<int, OfflineSampleStream>& streams) {
+    std::lock_guard<std::mutex> lock(d->vstMutex);
+    d->offlineSampleStreams = streams;
+}
 void CsoundApiRunner::setHub(CawHub* hub) { d->hub = hub; }
+void CsoundApiRunner::setBusNames(const std::vector<std::string>& sends, const std::vector<std::string>& recvs) {
+    if (d->worker.joinable()) return;   // read once by the engine thread at start
+    d->busSends = sends; d->busRecvs = recvs;
+}
 void CsoundApiRunner::setHubNames(const std::vector<std::string>& names) {
     std::lock_guard<std::mutex> lock(d->hubMutex);
     d->hubNames.clear();
@@ -1083,6 +1478,9 @@ void CsoundApiRunner::stop() {
     d->outputCapture.reset();
     d->outputMonitorChannels = 0;
     d->workerMonitorSequence = 0;
+    { std::lock_guard<std::mutex> lock(d->vstMutex); d->vstParamChans.clear(); d->vstTapChans.clear(); d->vstTapClearRequested.store(false); vsttaps::clear(); }
+    { std::lock_guard<std::mutex> lock(d->hubMutex); d->hubChans.clear(); d->hubResolveCountdown = 0; }
+    d->vstInChMade.clear();
 }
 bool CsoundApiRunner::active() const { return d->worker.joinable(); }
 bool CsoundApiRunner::running() const { return d->live.load(); }

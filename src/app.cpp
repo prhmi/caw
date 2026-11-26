@@ -1,4 +1,5 @@
 #include "app.h"
+#include "caw_audio_bus.h"
 #include "caw_toggles.h"
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -47,6 +48,7 @@ using SOCKET = int;
 #include "pd_graph_edit.h"
 #include "selected_test_sound.h"
 #include "project_io.h"
+#include "undo_files.h"
 #include "score_svg.h"
 #include "TextEditor.h"
 #include "csound_opcodes.h"
@@ -106,11 +108,21 @@ using SOCKET = int;
 // and reads back with a lag (the consuming VSTe's reported latency). Only touched by the audio thread.
 void scRealtimeSource(void* context, float* output, unsigned long frames, int channels) noexcept {
     if (context) static_cast<ScEngine*>(context)->process(output, frames, channels);
-    if (output && frames > 0 && channels >= 2) {
-        g_scRing.push(output, frames);            // capture for the VST rack (engine thread pops it)
-        if (g_scRawSuppress.load(std::memory_order_acquire))
-            std::fill(output, output + (size_t)frames * (size_t)channels, 0.f);   // a master-mode VSTe replaces the raw mix
+    {
+        // Play diagnostics: the SuperCollider engine's own level at this point (after its process,
+        // before the sample engine adds anything). While a SuperCollider track is frozen its clips
+        // do not run, so this must be silence - a non-zero value names the SC engine as the noise.
+        static unsigned s_diagScN = 0;
+        if ((++s_diagScN & 31) == 0) {
+            const size_t n = (size_t)frames * (size_t)channels;
+            double acc = 0.0;
+            for (size_t i = 0; i < n; ++i) { const double v = output[i]; acc += v * v; }
+            g_diagScRms.store((float)std::sqrt(n ? acc / (double)n : 0.0), std::memory_order_relaxed);
+        }
     }
+    // The per-track FX-only suppression happens inside ScEngine::process (the slot suppress mask:
+    // a consumed slot never mixes into the device output), so no whole-mix zeroing here - with two
+    // SuperCollider tracks, an FX-only VSTe consuming one of them must not silence the other.
     // The sample engine renders BEFORE the rack mixes: the VSTe input ring then holds THIS block
     // when the effect pops it (insert mode stays phase-tight; FX-only hears no extra latency).
     // NO g_sampleOutput guard here: every CAW stream carries this hook now (one stream at a
@@ -139,6 +151,13 @@ void scRealtimeSource(void* context, float* output, unsigned long frames, int ch
             cawaudio::engine().render(output, (int)frames, channels);   // sample tracks mix here (unless the sample engine runs its own stream)
             if (g_sampleRawSuppress.load(std::memory_order_acquire))
                 std::fill(output, output + (size_t)frames * (size_t)channels, 0.f);   // a master-mode ("FX only") VSTe consumes this sample track: the effect's output replaces the raw mix
+            static unsigned s_diagCawN = 0;
+            if ((++s_diagCawN & 31) == 0) {
+                const size_t n = (size_t)frames * (size_t)channels;
+                double acc = 0.0;
+                for (size_t i = 0; i < n; ++i) { const double v = output[i]; acc += v * v; }
+                g_diagCawRms.store((float)std::sqrt(n ? acc / (double)n : 0.0), std::memory_order_relaxed);
+            }
         }
     }
     if (g_vstEngineOn) {
@@ -479,10 +498,8 @@ int addLangTrack(int /*lang*/) {
 
 int addNonCsoundTrack(bool superCollider) {
     const std::string scTemplate =
-        "// Automate input1: ~cawget.(\"input1\") is live inside a synth - CAW streams the lane into a control bus\n"
-        "// outside a synth it returns the lane value once; draw dots on the input1 lane and press play\n"
         "(\n"
-        "{ SinOsc.ar(~cawget.(\"input1\") * 660 + 110, 0, 0.1) ! 2 }.play(target: ~cawgroup);\n"
+        "{ SinOsc.ar(~cawget.(\"input1\"), 0, 0.1) ! 2 }.play(target: ~cawgroup);\n"
         ")\n";
     const int idx = addTrack(std::string(superCollider ? "SuperCollider" : "PureData") + std::to_string(++g_trackCounter),
                              superCollider ? scTemplate : "");
@@ -533,13 +550,13 @@ std::string chooseAudioPath();
 
 
 
-// An audio track (kind 7, the "sample" tracks): its clips hold an audio file. The lane is taller
-// than the code lanes so the waveshape / spectrogram can be seen, and it can be resized by dragging
-// its bottom edge. The engine is started by the Run sample button (like Run VST).
+// An audio track (kind 7, the "sample" tracks): its clips hold an audio file. The lane has the same
+// fixed height as every other track; the big waveshape / spectrogram is the sound editor window
+// (right-click the clip). The engine is started by the Run sample button (like Run VST).
 int addAudioTrack() {
     const int idx = addTrack("Sample" + std::to_string(++g_trackCounter), "");
     g_proj.tracks[(size_t)idx].kind = 7;
-    g_proj.tracks[(size_t)idx].height = 96.f;
+    g_proj.tracks[(size_t)idx].height = kFixedTrackH;
     return idx;
 }
 
@@ -580,7 +597,9 @@ bool initAudioClip(Clip& c, const std::string& presetPath )
         "# normalize = 0   # 1 = scale the file to full level before the gain\n"
         "# reverse = 0     # 1 = the clip plays backwards (read when the clip starts)\n"
         "# routing: out1 = in1    # out<n> = in<m>: output n plays input m; a mono file on both outputs:  out1 = in1  out2 = in1\n"
-        "# granular: every 0.5 {  play: 1, 0.2, 1  }   # play: startpoint (s), duration (s), pitch/speed (negative = reverse)\n";
+        "# granular: every 0.5 {  play: rnd(10), 0.2, 1  }   # play: startpoint (s), duration (s), pitch/speed (negative = reverse)\n"
+        "#                                            # a 4th value chooses the grain's OUTPUT channel (1..8): every 0.5 { play: rnd(10), 0.2, 1, rnd(7) + 1 } throws every grain to a random channel\n"
+        "# seed 0   -> rnd() gives new numbers every run (like Csound); seed 5 -> the same sequence every run\n";
     logLine("[caw] Sample clip: " + path + " (" + std::to_string(data->duration()) + " s)");
     // live-coding: the fresh template is the clip's applied state - compile it now
     {
@@ -1308,7 +1327,7 @@ std::string scSynthLibraryPath() {
 int scTrackSlot(int trackId) {
     int slot = 0;
     for (const Track& track : g_proj.tracks) if (track.kind == 5) {
-        if (track.id == trackId) return slot < ScEngine::maxTrackSlots ? slot : -1;
+        if (track.id == trackId) return slot < ScEngine::kFirstBusSlot ? slot : -1;   // the last slots carry the audio-bus sends
         ++slot;
     }
     return -1;
@@ -1393,6 +1412,7 @@ void historyCommit(std::string now) {
 
 // Called once per frame: a finished edit (mouse released, field left, typing paused) becomes one undo step.
 void historyTick(float dt) {
+    if (freezeActive()) return;   // a freeze render mutates mute / solo temporarily: never an undo step, never a snapshot
     if (!cawEnv("CAW_HIST_EVERY_FRAME")) {
         static float acc = 0.f;
         static float interactionGrace = 0.f;
@@ -1461,6 +1481,9 @@ void restoreSnapshot(const std::string& data) {
         }
     }
     for (Track& t : g_proj.tracks) for (MidiClip& mc : t.midiClips) mc.editorOpen = clipMidi.count(mc.id) > 0;
+    // File safety: a restored snapshot may reference a frozen WAV that an unfreeze moved aside.
+    for (const Track& t : g_proj.tracks)
+        if (t.frozen && !t.freezePath.empty()) cawUndoRestoreFile(t.freezePath);
     g_selMidiClips.clear();
     g_mcDragId = -1;
     g_codeEditors.clear();
@@ -1769,12 +1792,28 @@ using SockLen = socklen_t;
 
 void updateSpectrumDerived() {
     if (g_fftDb.size() != (size_t)monitor_fft::bins) return;
-    if (g_specStyle == 1)
-        g_spectrumBands = monitor_bands::analyze(g_fftDb, g_rawSampleRate, 3, g_specFast ? monitor_fft::fastSize : monitor_fft::size);
+    // The real time between two analyzer updates (the pipeline is throttled): the peak glide
+    // speed limit is applied against it, so the marker's on-screen speed is exact.
+    static std::chrono::steady_clock::time_point lastDeriv{};
+    const auto nowDeriv = std::chrono::steady_clock::now();
+    double dt = 0.033;
+    if (lastDeriv.time_since_epoch().count() != 0)
+        dt = std::min(0.25, std::max(0.005, std::chrono::duration<double>(nowDeriv - lastDeriv).count()));
+    lastDeriv = nowDeriv;
     if (g_specStyle == 3)
-        g_columnBands = monitor_bands::analyze(g_fftDb, g_rawSampleRate, monitor_bands::kColumnBandsPerOctave, g_specFast ? monitor_fft::fastSize : monitor_fft::size);
+        g_columnBands = monitor_bands::analyze(g_fftDb, g_rawSampleRate, monitor_bands::kColumnBandsPerOctave, monitor_fft::size);
     if (g_specStyle == 0) {
-        g_tonePeaks = monitor_peaks::find(g_fftDb, g_rawSampleRate, g_specFast ? monitor_fft::fastSize : monitor_fft::size);
+        // The SAME data in both views (user correction): every detected peak is shown. Only the
+        // motion differs - Better glides calmly, Realistic follows as fast as the raw display.
+        // Switching between the modes restarts the tracker: markers carrying positions (and
+        // momentum) from the other mode would glide slowly toward the current tones after the
+        // switch, which reads as a portamento sweep across the whole spectrum.
+        static double lastGlideLimit = -1.0;
+        const double glideLimit = g_specBetter ? 1000.0 : 12000.0;
+        if (lastGlideLimit >= 0.0 && glideLimit != lastGlideLimit) monitor_peaks::resetTracking();
+        lastGlideLimit = glideLimit;
+        g_tonePeaks = monitor_peaks::findTracked(g_fftDb, g_rawSampleRate, monitor_fft::size,
+                                                 glideLimit, dt, 1000000);
     }
 }
 
@@ -1963,11 +2002,16 @@ std::vector<std::pair<std::string, double>> vstGateValues() {
     for (const Track& vt : g_proj.tracks) {
         if (vt.kind != 4 || vt.vstPath.empty()) continue;
         const bool vtActive = !vt.muted && !(anySolo && !vt.solo);
+        // FX only: the consumed sources' ONLY path is through the effect. The master send of every
+        // clip the enabled inputs name is replaced whenever the rack is in the signal path - also
+        // while the VSTe is explicitly muted (muting the VSTe then silences the whole chain: the
+        // raw source must not leak back to the master, and its meter stays gray).
+        const bool consumeSources = vt.vstOutMode == 0 && (vtActive || (vt.muted && !anySolo));
         for (const Track& t : g_proj.tracks) {
             if (t.kind == 5 || t.kind == 6) continue;
             for (const Clip& c : t.clips) {
                 bool mute = false;
-                if (vtActive && vt.vstOutMode == 0)
+                if (consumeSources)
                     for (const auto& in : vt.vstInputs) {
                         if (!in.on) continue;
                         if ((in.mode == 0 && in.name == t.name) || (in.mode == 1 && in.name == c.name)) { mute = true; break; }
@@ -2008,39 +2052,80 @@ void wireVstUiHooks() {
         if (g_vstEngineOn) vstSolo().setActive(ids);
         if (g_liveCsound && g_useCsoundApi) g_apiProc.setControlChannels(vstGateValues());   // an inactive effect no longer replaces its source
     };
-    vstui::pushVstParamOverride = [](int trackId, int slot, double value) {
-        g_apiProc.pushVstParamOverride(trackId, slot, value);
-        if (g_vstEngineOn && trackIsVst(trackId)) vstSolo().pushParamOverride(trackId, slot, value);   // the 4th engine's own copy: instrument OR effect
+    vstui::pushVstParamOverride = [](int trackId, int stage, int slot, double value) {
+        g_apiProc.pushVstParamOverride(trackId, stage, slot, value);
+        if (g_vstEngineOn && trackIsVst(trackId)) vstSolo().pushParamOverride(trackId, slot, value, stage);   // the 4th engine's own copy: instrument OR effect
     };
     vstui::pushVstPickRefresh = [](int trackId, const std::vector<int>& pick) {
         g_apiProc.refreshVstPicks(trackId, pick);
         if (g_vstEngineOn && trackIsVst(trackId)) vstSolo().pushPickUpdate(trackId, pick);
     };
-    vstui::pushVstParamLive = [](int trackId, int paramIndex, double value) {
-        g_apiProc.pushVstParamValue(trackId, paramIndex, value);
-        if (g_vstEngineOn && trackIsVst(trackId)) vstSolo().pushParamValue(trackId, paramIndex, value);
+    vstui::pushVstParamLive = [](int trackId, int stage, int paramIndex, double value) {
+        g_apiProc.pushVstParamValue(trackId, stage, paramIndex, value);
+        if (g_vstEngineOn && trackIsVst(trackId)) vstSolo().pushParamValue(trackId, stage, paramIndex, value);
     };
-    vstui::pushVstStateLive = [](int trackId, const std::string& blob, const std::string& originPath, const std::string& originClassId) {
+    vstui::pushVstStateLive = [](int trackId, int stage, const std::string& blob, const std::string& originPath, const std::string& originClassId) {
         // SEPARATED ENGINES: the editor instance's full state (Kontakt's loaded .nki) reaches the
         // 4th engine's instance through the STATE WORKER (vst_solo.h): setState runs neither on
         // the audio thread nor on the UI thread - a sampler loading a patch must not deadlock
         // either. The offline render gets the blob through collectVstJobs, so exports carry it too.
-        if (g_vstEngineOn) vstSolo().pushState(trackId, blob, originPath, originClassId);
+        if (g_vstEngineOn) vstSolo().pushState(trackId, stage, blob, originPath, originClassId);
     };
 #ifdef CAW_VST3
-    vstui::editorFeedSource = [](int trackId) -> std::shared_ptr<caw::IPlugin> {
+    // ONE INSTANCE PER PLUGIN: the live VST engine renders the plugin object loaded in the panel.
+    // Called on the rack's init / loader thread; slots() is UI-owned, so the lookup is guarded.
+    vstSharedProvider() = [](int key, const std::string& path, const std::string& classId) -> std::shared_ptr<caw::IPlugin> {
+        std::lock_guard<std::mutex> lock(vstui::slotsMutex());
+        const auto it = vstui::slots().find(key);
+        if (it == vstui::slots().end() || !it->second.plugin) return {};
+        if (it->second.loadedPath != path) return {};
+        if (!classId.empty() && !it->second.loadedClassId.empty() && it->second.loadedClassId != classId) return {};
+        return it->second.plugin;
+    };
+    vstui::editorFeedSource = [](int key) -> std::shared_ptr<caw::IPlugin> {
+        const int trackId = key / 8, stage = key % 8;
         // SEPARATED ENGINES: the 4th engine always hosts the VST graph, so its instances hear the
         // real audio and the real notes. The editor tick replays the engine ring (processIdle) so
         // the plugin's own GUI runs at realtime speed instead of looking dead. Called from the
         // editor worker thread: the rack lookup is shared_ptr-safe; an engine that is off has no
         // graph and simply returns nothing.
-        return vstSolo().pluginOfTrack(trackId);
+        // The key decodes to (trackId, stage): each stage's editor window is fed from ITS stage's
+        // engine instance, so a chain stage's EQ analyzer draws what that stage really processes.
+        return vstSolo().pluginOfTrackStage(trackId, stage % 8);
+    };
+    // The meter lane layout asks the loaded plugin how many outputs it really has: a 4-channel
+    // instrument gets 4 meters on its track (the master fold follows the audio setting).
+    vstTrackOutputChannels = [](int trackId) -> int {
+        // The routing text wins: one meter per OUTPUT line the text uses (max out index).
+        for (const Track& t : g_proj.tracks) if (t.id == trackId && !t.vstRouteCode.empty()) {
+            const int mx = t.routeMaxOut();
+            return mx > 0 ? mx : 2;
+        }
+        // One meter per TRACK channel: the track's channel format (the user sets it in the VST panel,
+        // like a DAW track). Never guessed from the plugin - plugins that follow the host report the
+        // host's width, which made the meters and the master join flip.
+        for (const Track& t : g_proj.tracks) if (t.id == trackId) return std::max(1, std::min(8, t.vstTrackChannels()));
+        return 2;
     };
 #endif
     vstui::pushVstOutModeLive = [](int trackId, int mode) {
         g_apiProc.setVstOutModeLive(trackId, mode);
         if (g_vstEngineOn) vstSolo().setOutMode(trackId, mode);   // the effect may run in the VST engine
         if (g_liveCsound && g_useCsoundApi) g_apiProc.setControlChannels(vstGateValues());   // replace <-> mix, now
+        updateScSlotSuppress();   // replace <-> mix changes which SC track slots are consumed
+        ensureSampleEngineForVstInputs();   // a sample or locked source may feed the effect now
+    };
+    vstui::pushVstOutWideLive = [](int trackId, int channels) {
+        // TRACK CHANNELS changed: the running engines take the new width with the wiring push, the
+        // meter layouts are rebuilt now (the idle one at once, the live one on its next refresh).
+        g_apiProc.setVstOutWideLive(trackId, channels > 2 ? 1 : 0);
+        g_apiProc.setVstChannelsLive(trackId, channels);
+        if (g_vstEngineOn) { vstSolo().setOutWide(trackId, channels > 2 ? 1 : 0); vstSolo().setWiring(collectVstEngineJobs()); }
+        // The meter SLOTS are positions in one list the running Csound monitor writes (fixed at Run).
+        // Rebuilding the live list here shifted every later track onto the wrong slots: a Csound
+        // source after (or before) this VSTe went dark. Only the idle layout follows; VST meters
+        // are read by track id (g_vstMeterDb), so their bar count changes without touching the list.
+        if (!g_liveCsound) g_idleMeters = meterLayout(g_proj, g_projectPath);
     };
     vstui::pushVstInputMasks = [](const std::map<int, unsigned>& masks) {
         g_apiProc.setVstInputMasks(masks);
@@ -2050,11 +2135,15 @@ void wireVstUiHooks() {
         if (g_langVst && g_liveCsound && g_useCsoundApi) pushVstTapsToCsound();   // SEPARATED: taps only - the VST graph lives in the 4th engine
         if (g_vstEngineOn) vstSolo().setWiring(collectVstEngineJobs());
         if (g_liveCsound && g_useCsoundApi) g_apiProc.setControlChannels(vstGateValues());   // an input switched off stops replacing
+        updateScSlotSuppress();   // an input switched on / off changes the consumed SC track slots
+        ensureSampleEngineForVstInputs();   // the input may name a sample or locked source now
     };
     vstui::pushVstWiring = []() {   // an input mode / name changed: re-route the effect now, no Run
         if (g_langVst && g_liveCsound && g_useCsoundApi) pushVstTapsToCsound();   // SEPARATED: taps only - the VST graph lives in the 4th engine
         if (g_vstEngineOn) vstSolo().setWiring(collectVstEngineJobs());
         if (g_liveCsound && g_useCsoundApi) g_apiProc.setControlChannels(vstGateValues());
+        updateScSlotSuppress();   // the input names changed: recompute the consumed SC track slots
+        ensureSampleEngineForVstInputs();   // the new input may name a sample or locked source
     };
     // A .vst3 finished loading into the editor: the engine applies it NOW (not up to 0.5 s later)
     // while it runs. The engine itself is only started by its own button (Run VST / the combined
@@ -2078,7 +2167,8 @@ void wireVstUiHooks() {
         if (g_langVst && g_liveCsound && g_useCsoundApi)
             pushVstTapsToCsound();   // SEPARATED: Csound never reloads plugins - the 4th engine loads the new .vst3 by itself
         if (!g_vstEngineOn) return;   // the engine is off: the plugin waits for Run VST
-        vstui::prepareEditorPlugin(trackId, pdAudioSettings().sampleRate, 512);   // SEPARATED: the editor format follows the audio device (the VST engine's own format) - never Csound's ksmps. Both VSTi and VSTe: an unprepared editor instance never processes, so its GUI (EQ waves, meters) stays dead.
+        for (int st = 0; st <= t->vstChainCount(); ++st)   // every chain stage's editor instance is prepared too
+            vstui::prepareEditorPlugin(vstui::slotKey(trackId, st), pdAudioSettings().sampleRate, 512);   // SEPARATED: the editor format follows the audio device (the VST engine's own format) - never Csound's ksmps. Both VSTi and VSTe: an unprepared editor instance never processes, so its GUI (EQ waves, meters) stays dead.
         vstEngineCheckJobs(10.0f);   // past the 0.5 s gate: the changed plugin set is applied on this frame
     };
     // Values the engine's plugins are actually using: the Csound rack first, then the 4th engine
@@ -2088,6 +2178,9 @@ void wireVstUiHooks() {
         return g_vstEngineOn && vstSolo().params(trackId, out);
     };
     g_apiProc.setScAudioRing(&g_scRing);            // VSTe "SuperCollider" inputs read this
+    g_apiProc.setTrackRings(
+        [](int trackId) -> CawScRing* { return sampleRingOf(trackId); },        // engine 4: sample tracks
+        [](int slot) -> CawScRing* { return scTrackRingOf(slot); });            // engine 2: one ring per SC track slot
     g_apiProc.setScRawSuppress(&g_scRawSuppress);   // master-mode VSTe replaces the raw SC mix
 }
 
@@ -2555,6 +2648,16 @@ void winMaxPrepare(int key) {   // call right before ImGui::Begin
 }
 
 
+// Every window without its own numeric id still gets the maximize box + double-click: a stable key
+// is derived from the window title (the same string must be passed to both helpers).
+static int winKeyOf(const char* title) {
+    uint32_t h = 2166136261u;
+    for (const char* p = title; *p; ++p) { h ^= (uint32_t)(unsigned char)*p; h *= 16777619u; }
+    return 700000000 + (int)(h % 100000000u);
+}
+void winMaxPrepareT(const char* title) { winMaxPrepare(winKeyOf(title)); }
+void winMaxTitleButtonT(const char* title) { winMaxTitleButton(winKeyOf(title)); }
+
 // A maximize / restore box in the title bar, right next to the close button (like a normal window).
 // Call it first inside the window (before the font scale is changed).
 void winMaxTitleButton(int key) {
@@ -2580,6 +2683,13 @@ void winMaxTitleButton(int key) {
     ImGui::PopClipRect();
     if (hovered) helpTip(w.maxed ? "Restore" : "Maximize");
     if (hovered && ImGui::IsMouseClicked(0)) {
+        if (w.maxed) { w.maxed = false; w.restore = true; }
+        else { w.pos = pos; w.size = size; w.maxed = true; }
+    }
+    // double-click on the title bar = maximize / restore (like every OS window). The chrome on the
+    // right (the maximize box and the close button) is excluded so clicks there stay single actions.
+    if (ImGui::IsWindowHovered() && ImGui::IsMouseDoubleClicked(0) && ImGui::GetIO().MousePos.x < x0
+        && ImGui::GetIO().MousePos.y >= pos.y && ImGui::GetIO().MousePos.y <= pos.y + ImGui::GetFrameHeight()) {
         if (w.maxed) { w.maxed = false; w.restore = true; }
         else { w.pos = pos; w.size = size; w.maxed = true; }
     }
@@ -2895,15 +3005,56 @@ bool isSystemSuperColliderPath(const std::string& path) {
 
 void appInit() {
     const auto began = std::chrono::steady_clock::now();
+    logLine("[caw] CAW build: " + std::string(caw_brand::buildTag) +
+            " (normal sample-to-VSTe input, arbitrary callback blocks, direct source-through-effect lock).");
     // the master chain (master FX + master gain) sits on the final device mix of every CAW stream
     g_masterChainFn = &masterChainRender;
     g_masterChainEnabled.store(true, std::memory_order_relaxed);
     g_apiProc.setHostGainExternal(true);   // the engine must not apply the master gain twice
     // VSTe "track/clips" inputs can name a sample track: the sample engine hands each track's
-    // post-track-gain stereo mix to a per-track ring the rack pops (engine 4).
+    // post-track-gain mix (up to 8 channels: a 4ch file or the code's out1..out8 routing) to a
+    // per-track ring the rack pops (engine 4). The rack folds it (RX stereo) or takes it 1:1 (RX multi).
     cawaudio::engine().setFeed([](int trackId, const float* interleaved, int frames, int channels) {
-        if (trackId <= 0 || !interleaved || frames <= 0 || channels < 2) return;
-        sampleRingOf(trackId)->push(interleaved, (size_t)frames);   // lock-free ring push (render lock is held)
+        if (trackId <= 0 || !interleaved || frames <= 0 || channels < 1) return;
+        sampleRingOf(trackId)->pushStride2(interleaved, (size_t)frames, std::min(8, channels));   // lock-free ring push (render lock is held)
+        // CAW AUDIO BUSES: every sample track also streams its stereo mix into the bus "smp_<track name>"
+        // (an audio file as a modulator / an analysis source for Csound, PD or SuperCollider).
+        static std::map<int, std::unique_ptr<cawbus::Port>> ports;   // audio thread only
+        std::string name;
+        { std::unique_lock<std::mutex> l(cawbus::sampleTrackNames().m, std::try_to_lock);
+          if (!l.owns_lock()) return;
+          const auto it = cawbus::sampleTrackNames().byKey.find(trackId);
+          if (it == cawbus::sampleTrackNames().byKey.end()) return;
+          name = it->second; }
+        auto& p = ports[trackId];
+        if (!p) p = std::make_unique<cawbus::Port>();
+        p->rename(name);
+        static std::vector<float> lr;
+        if (lr.size() < (size_t)frames * 2) lr.resize((size_t)frames * 2);
+        for (int i = 0; i < frames; ++i) { lr[(size_t)i * 2] = interleaved[(size_t)i * channels]; lr[(size_t)i * 2 + 1] = interleaved[(size_t)i * channels + (channels > 1 ? 1 : 0)]; }
+        cawbus::send(*p, lr.data(), (size_t)frames);
+    });
+    // VSTe "SuperCollider" inputs: the embedded SC engine hands each TRACK SLOT's raw stereo mix to
+    // a per-slot ring the rack pops (engine 2). Every SuperCollider track has its own stream now -
+    // a VSTe hears its own track, not the whole SC mix.
+    g_scEngine.setTrackFeed([](int slot, const float* interleaved, int frames, int stride) {
+        if (!interleaved || frames <= 0) return;
+        if (slot >= 0 && slot < ScEngine::kFirstBusSlot) {   // CAW AUDIO BUSES: each SuperCollider track's raw mix as "sc_<track name>"
+            static std::array<std::unique_ptr<cawbus::Port>, ScEngine::maxTrackSlots> ports;   // audio thread only
+            std::string name;
+            { std::unique_lock<std::mutex> l(cawbus::scSlotNames().m, std::try_to_lock);
+              if (l.owns_lock()) { const auto it = cawbus::scSlotNames().byKey.find(slot); if (it != cawbus::scSlotNames().byKey.end()) name = it->second; } }
+            if (!name.empty()) {
+                auto& p = ports[(size_t)slot];
+                if (!p) p = std::make_unique<cawbus::Port>();
+                p->rename(name);
+                static std::vector<float> lr;
+                if (lr.size() < (size_t)frames * 2) lr.resize((size_t)frames * 2);
+                for (int i = 0; i < frames; ++i) { lr[(size_t)i * 2] = interleaved[(size_t)i * stride]; lr[(size_t)i * 2 + 1] = interleaved[(size_t)i * stride + (stride > 1 ? 1 : 0)]; }
+                cawbus::send(*p, lr.data(), (size_t)frames);
+            }
+        }
+        if (CawScRing* ring = scTrackRingOf(slot)) ring->pushStride2(interleaved, (size_t)frames, stride);   // the ring is stereo: channels 0/1 of the widened slot
     });
     g_pdLibraryPath = plat::bundledLibpd();
     g_scLangPath = plat::superColliderSclang();
@@ -2969,6 +3120,7 @@ void appFrame(float dt, bool visible) {
         // learning and the VST editor instances alive without rebuilding an
         // invisible arrangement.
         updateMeters(dt);
+        freezeTick();   // the freeze render pass keeps running while the window is minimized
         updateRecording();
         vstui::serviceLearn(g_proj);
         vstui::captureParameters(g_proj);   // the editor idle tick + state poll keep running while minimized
@@ -2980,13 +3132,19 @@ void appFrame(float dt, bool visible) {
     }
     const bool globalKeys = !io.WantTextInput && !g_textEditorFocused;  // code editors keep their own Ctrl+Z
     if (io.KeyCtrl && !io.KeyShift && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_Q, false)) appRequestClose();
-    if (!io.WantTextInput && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) saveProject(false);
+    if (!io.WantTextInput && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false) && !freezeActive()) saveProject(false);   // a freeze render holds temporary mutes: no save while it runs
     if (!io.WantTextInput && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) openProject();
     if (!io.WantTextInput && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N, false)) newProject();
-    if (globalKeys && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+    if (globalKeys && !soundEditorFocused() && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {   // a focused sound editor undoes itself
         if (io.KeyShift) redo(); else undo();
     }
-    if (globalKeys && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y, false)) redo();
+    if (globalKeys && !soundEditorFocused() && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y, false)) redo();
+    if (globalKeys && io.KeyAlt && !io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false)) seekTimeline(0.0);   // Alt+Left = go to the beginning
+    if (globalKeys && !io.KeyCtrl && !io.KeyShift && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_F, false)) {   // F: follow the playhead on / off
+        if (g_tlFollow == 0) g_tlFollow = g_tlFollowLast > 0 ? g_tlFollowLast : 2;
+        else { g_tlFollowLast = g_tlFollow; g_tlFollow = 0; }
+        logLine("[caw] Timeline follow: " + std::string(g_tlFollow == 0 ? "off" : g_tlFollow == 1 ? "page" : "timeline (playhead centered)") + ".");
+    }
     // Space = play / stop the timeline. Never while a code editor window has the keyboard focus: a click on
     // Space play / stop: works whenever the user is NOT typing (io.WantTextInput covers active
     // text widgets; g_codeTyping covers the code editors' own text areas). A clip window that is
@@ -2998,11 +3156,12 @@ void appFrame(float dt, bool visible) {
         if (plain || withCtrl) toggleTimelinePlay();
     }
     updateMeters(dt);
+    freezeTick();   // the freeze render pass (a modal dialog shows its progress while it runs)
     if (g_scEngineOn) g_scEngine.setGain(1.f);   // the master chain applies the master gain on the device buffer (no double gain)
     updateRecording();
     {   // idle layout (meters of the current project while Csound is off)
         static int tick = 0;
-        if (!g_liveCsound && (tick++ % 30) == 0) g_idleMeters = meterLayout(g_proj);
+        if (!g_liveCsound && (tick++ % 30) == 0) g_idleMeters = meterLayout(g_proj, g_projectPath);
     }
 
     const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -3038,7 +3197,6 @@ void appFrame(float dt, bool visible) {
         g_confirmRenderOverwrite = false;
     }
     if (ImGui::BeginPopupModal("Confirm audio export", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        if (g_renderWarnVst) ImGui::TextWrapped("CAW saves exposed writable VST parameter values, including unmapped ones. Plugin-specific state, samples and preset data may not be restored. Check your export.");
         if (g_renderWillOverwrite) {
             ImGui::TextWrapped("This file already exists: %s", renderFilePath().string().c_str());
             ImGui::TextUnformatted("Replace it after the new export succeeds?");
@@ -3046,6 +3204,56 @@ void appFrame(float dt, bool visible) {
         if (ImGui::Button(g_renderWillOverwrite ? "Replace" : "Export anyway")) { ImGui::CloseCurrentPopup(); startRenderNow(); }
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    // The DSP-switch asks (user request): offline rendering wants the DSP off, real-time wants it
+    // on. One modal serves all three cases; the action button performs the switch and continues.
+    if (g_askDspOffExport || g_askDspOnExport || g_askDspOffLock) ImGui::OpenPopup("##dsp_switch_ask");
+    if (ImGui::BeginPopupModal("##dsp_switch_ask", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (g_askDspOnExport) {
+            ImGui::TextUnformatted("Real-time rendering needs the DSP on.");
+            ImGui::TextWrapped("Real-time export captures the LIVE mix, so the checked engines (DSP) must be running.");
+            ImGui::Spacing();
+            if (ImGui::Button("Turn DSP on and export", ImVec2(S(200), 0))) {
+                ImGui::CloseCurrentPopup(); g_askDspOnExport = false;
+                // The full DSP start (what the DSP button does when it is off): the button then reads on.
+                if (g_langCsound) startEngine();
+                if (g_langSc && !g_scEngineOn) startScEngine();
+                if (g_langVst && !g_vstEngineOn) startVstEngine();
+                if (g_langAudio && !g_sampleEngineOn) { g_sampleEngineOn = true; ensureSampleOutput(); logLine("[caw] Sample engine running: the sample clips play with Play."); }
+                startRenderNow();
+            }
+        } else if (g_askDspOffLock) {
+            ImGui::TextUnformatted("Offline locking wants the DSP off.");
+            ImGui::TextWrapped("Locking a VST track renders it offline without the live engine. Turn the DSP off first - a live plugin instance is what has been faulting.");
+            ImGui::Spacing();
+            if (ImGui::Button("Turn DSP off and lock", ImVec2(S(200), 0))) {
+                ImGui::CloseCurrentPopup();
+                const int track = g_askDspOffLockTrack;
+                g_askDspOffLock = false; g_askDspOffLockTrack = -1;
+                // The full DSP stop (what the DSP button does when everything runs): the button then reads off.
+                stopScEngine();
+                stopVstEngine();
+                if (g_sampleEngineOn) { g_sampleEngineOn = false; cawaudio::engine().clearAll(); g_audioVoiceSig.clear(); closeSampleOutput(); logLine("[caw] Sample engine stopped."); }
+                stopPlayback();
+                if (track >= 0 && track < (int)g_proj.tracks.size()) freezeTrackBegin(track);
+            }
+        } else {
+            ImGui::TextUnformatted("Offline rendering wants the DSP off.");
+            ImGui::TextWrapped("Offline export renders outside the live engine. Turn the DSP off first - a live plugin instance is what has been faulting.");
+            ImGui::Spacing();
+            if (ImGui::Button("Turn DSP off and export", ImVec2(S(200), 0))) {
+                ImGui::CloseCurrentPopup(); g_askDspOffExport = false;
+                stopScEngine();
+                stopVstEngine();
+                if (g_sampleEngineOn) { g_sampleEngineOn = false; cawaudio::engine().clearAll(); g_audioVoiceSig.clear(); closeSampleOutput(); logLine("[caw] Sample engine stopped."); }
+                stopPlayback();
+                startRenderNow();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(S(110), 0))) { ImGui::CloseCurrentPopup(); g_askDspOffExport = g_askDspOnExport = g_askDspOffLock = false; g_askDspOffLockTrack = -1; }
         ImGui::EndPopup();
     }
 
@@ -3087,6 +3295,7 @@ void appFrame(float dt, bool visible) {
     drawIncludePool();
     drawMidiEditor();
     drawMultiMidiEditor();
+    drawSoundEditors();
     vstui::drawWindows(g_proj);
     if (g_playing && g_useCsoundApi) g_apiProc.setMasterGain(g_proj.cs.masterGain);
     historyTick(dt);
@@ -3109,6 +3318,7 @@ void appRequestClose() {
 // True after Ctrl+Q / File > Exit: stops the engine and the renderers, then the main loop ends.
 bool appQuitRequested() {
     if (!g_quitRequested) return false;
+    cancelRender();   // a running (offline or real-time) export joins its writer thread and restores the transport
     g_pdTimelineEngine.stop();
     g_pdPreview.stop();
     stopScEngine();

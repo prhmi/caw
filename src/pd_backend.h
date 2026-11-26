@@ -16,13 +16,26 @@ public:
     bool open(const std::string& libraryPath, const std::string& patchPath,
               int sampleRate, int outputChannels, std::string& error);
     bool openEngine(const std::string& libraryPath, int sampleRate, int outputChannels, std::string& error);
-    bool processTick(float* output, std::string& error);
+    // PD's audio inputs: [adc~ 1..8] = the soundcard inputs (the microphone), [adc~ 9..24] = 8
+    // stereo CAW CABLES (written by [cawr~ name], an abstraction CAW provides). The patch's
+    // outputs: [dac~ 1..N] = the track's sound, then 16 more channels that [caws~ name] writes
+    // to send a stereo pair into a cable (never heard on the master).
+    static constexpr int kMicChannels = 8;
+    static constexpr int kCablePairs = 8;
+    static constexpr int kInputChannels = kMicChannels + kCablePairs * 2;
+    static constexpr int kCableOutChannels = kCablePairs * 2;
+    static constexpr int kTrackSlots = 8;   // [dac~ 1..8] = the track; [dac~ 9..24] = the 8 cable sends (fixed numbers)
+    // input: 64 * kInputChannels interleaved frames, or nullptr = silence.
+    // output: 64 * (outputChannels + kCableOutChannels) frames: the first outputChannels are the
+    // track, the rest the cable sends (cableOut, may be null to discard them).
+    bool processTick(float* output, std::string& error, const float* input = nullptr, float* cableOut = nullptr);
     std::vector<std::string> takeDiagnostics();
     bool bang(const std::string& receiver, std::string& error);
     bool number(const std::string& receiver, float value, std::string& error);
     bool numberLocal(const std::string& receiver, float value, std::string& error);
     bool bangLocal(const std::string& receiver, std::string& error);
     bool noteOn(int channel, int pitch, int velocity, std::string& error);
+    bool openBridge(const std::string& bridgePath, std::string& error);   // CAW cables: see pd_backend.cpp
     bool bindOutputs(const std::vector<pd_control_syntax::Output>& outputs,std::string& error);
     // Live coding: load the (re-saved or different) patch into the SAME running
     // libpd instance, without stopping DSP. The new patch is opened before the
@@ -41,7 +54,9 @@ public:
 private:
     void* library_ = nullptr;
     void* patch_ = nullptr;
+    void* bridge_ = nullptr;   // the CAW cable bridge patch (cawr~ / caws~ channel map)
     int channels_ = 0;
+    std::vector<float> wideOut_;   // libpd's full output block: track channels + cable sends
     bool dsp_ = false;
     int dollarZero_ = 0;
     struct Binding {std::string receiver,kind,name;void* handle=nullptr;};

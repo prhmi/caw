@@ -12,6 +12,7 @@
 struct VstJob {
     int id = 0;                    // Track::id: the Csound channels are cawvst_<id>_...
     int meterFirst = -1;           // stereo indices in the monitor snapshot, -1 disables metering
+    int meterCount = 0;            // how many monitor slots the layout gave this track (the rack never writes past them)
     std::string name;              // track name = the audio bus name used by cawsa "name", aL, aR
     std::string path;              // .vst3 file
     std::string classId;           // the class inside the file (a bundle can hold several); empty = first
@@ -20,6 +21,7 @@ struct VstJob {
                                    // .nki etc. - binary state, not a parameter). The rack applies it to the engine
                                    // instance at creation; a live change arrives via VstRack::pushState instead.
     bool instrument = true;        // true = VSTi (MIDI in), false = VSTe (audio in)
+    float trackVolume = 1.f;       // the track volume fader (linear 0..2): applied where the track's output joins the master
     std::vector<int> pick;         // plugin parameter index of kP1..kP8
     std::vector<double> init;      // start value of kP1..kP8 (normalized)
     // The 8 VSTe input slots, mirroring Track::vstInputs. The rack copies every ENABLED slot's
@@ -36,13 +38,28 @@ struct VstJob {
     //                 sends to the master - a VST track's audio never runs through Csound.
     //             PD / SC / VST sources cannot be split per clip: the whole source mix feeds the slot.
     struct Input {
-        bool on = false; int mode = 0; std::string name; int lineStart = 0; int lineCount = 0;
+        bool on = false; int mode = 0; std::string name; bool sidechain = false; int lineStart = 0; int lineCount = 0;
+        int receive = 0;   // 0 = stereo fold (ch k -> line k mod 2), 1 = multichannel (ch k -> line k) - wide track sources only
         int engine = 0; int srcId = 0;
         std::vector<std::string> csChans;   // engine 0 only: the tap channel of every line
     };
     Input inputs[8];
     bool routedIn = false;         // true if any input is configured (the 8-line buffer is used instead of silence)
+    // VSTe EFFECT CHAIN: stages 2..8 IN ORDER (the input of stage k is the output of stage k-1).
+    // Stage 0 = this job's own plugin (path / classId above). Empty = the single-plugin VSTe.
+    struct ChainStage {
+        std::string path, classId;
+        std::map<uint32_t, double> parameterState;
+        std::string stateBlob;         // SEPARATED ENGINES: the editor instance's patch state for this stage
+    };
+    std::vector<ChainStage> chain;
+    std::array<int, 8> slotStage{};    // which stage each P slot drives: 0 = the job's plugin, 1..7 = chain[k-1]
+    bool outMapOn = false;             // the track's routing text is active: outMap replaces the Out stereo / Out source fold
+    std::array<int, 8> outMap{};       // per OUTPUT line (0-based): the chain-end input channel it plays, -1 = silent
     int outMode = 0;               // 0 = master (replace source), 1 = mix (source + VSTe to master)
+    int outWide = 0;               // 0 = stereo fold at the meters / master join, 1 = the plugin's own channels 1:1
+    int channels = 2;              // TRACK CHANNELS (1..8): the width the plugin is processed at, the meters and the master join
+    unsigned bypass = 0;           // bit k = effect k+1 is bypassed (its input passes straight through; it is not processed)
 };
 // Engine thread -> UI thread mirror of the parameter values the rack is actually using. The UI
 // reflects them into the plugin editor GUI (so automation moves the knobs) without touching the
@@ -56,31 +73,47 @@ struct VstParamMirror {
 // clip overwrites the channel, while no clip runs at all, or while automation moves the lane.
 struct VstParamOverride {
     int trackId = 0; int slot = 0; double value = 0;   // slot = 0..7 (kP1..kP8), value normalized 0..1
+    int stage = 0;                                     // the chain stage the slot's plugin sits on (0 = the first effect)
 };
-// PortAudio callback -> engine thread ring with the SuperCollider mix (interleaved stereo). The
+// PortAudio callback -> engine thread ring with a source's channels (interleaved, up to 8). The
 // callback produces at device rate, the engine consumes one Csound block per block; the ring
 // absorbs the clock drift (oldest frames are dropped on overrun, underruns read as silence).
+// Wide sources (a SuperCollider track slot, a wide sample voice) store ALL their channels: the
+// consumer folds them to stereo (the virtual soundcard rule) or takes them 1:1 (multi receive).
 struct CawScRing {
-    static constexpr size_t CAP = 1u << 16;            // frames of stereo
-    std::array<float, CAP * 2> buf{};
+    static constexpr int CH = 8;                       // channels stored per frame
+    static constexpr size_t CAP = 1u << 16;            // frames of audio
+    std::array<float, CAP * CH> buf{};
     std::atomic<size_t> r{0}, w{0};                    // frame positions, wrapping
     void push(const float* interleaved, size_t frames) {   // callback thread: device-scale samples
+        pushStride2(interleaved, frames, 2);
+    }
+    void pushStride2(const float* interleaved, size_t frames, int stride) {   // wide-slot source: every channel up to 8
+        if (!interleaved || stride < 1) return;
         for (size_t i = 0; i < frames; ++i) {
             const size_t wpos = w.load(std::memory_order_relaxed);
             if ((wpos + 1) % CAP == r.load(std::memory_order_acquire))
                 r.store((r.load(std::memory_order_relaxed) + 1) % CAP, std::memory_order_release);   // full: drop the oldest
-            buf[(size_t)wpos * 2] = interleaved[i * 2];
-            buf[(size_t)wpos * 2 + 1] = (i * 2 + 1 < frames * 2) ? interleaved[i * 2 + 1] : 0.f;
+            float* dst = &buf[(size_t)wpos * CH];
+            for (int c = 0; c < CH; ++c)
+                dst[c] = c < stride ? interleaved[i * (size_t)stride + c] : 0.f;
             w.store((wpos + 1) % CAP, std::memory_order_release);
         }
     }
-    void pop(float* out, size_t frames) {                  // engine thread: fills exactly frames*2 floats
-        for (size_t i = 0; i < frames; ++i) {
+    size_t popSome(float* out, size_t frames) {            // engine thread: consumes only available frames (frames*CH floats)
+        size_t got = 0;
+        for (; got < frames; ++got) {
             const size_t rpos = r.load(std::memory_order_relaxed);
-            if (rpos == w.load(std::memory_order_acquire)) { out[i * 2] = out[i * 2 + 1] = 0.f; continue; }   // underrun: silence
-            out[i * 2] = buf[(size_t)rpos * 2]; out[i * 2 + 1] = buf[(size_t)rpos * 2 + 1];
+            if (rpos == w.load(std::memory_order_acquire)) break;
+            std::copy_n(&buf[(size_t)rpos * CH], CH, out + got * CH);
             r.store((rpos + 1) % CAP, std::memory_order_release);
         }
+        return got;
+    }
+    void pop(float* out, size_t frames) {                  // engine thread: fills exactly frames*CH floats
+        const size_t got = popSome(out, frames);
+        for (size_t i = got; i < frames; ++i)
+            for (int c = 0; c < CH; ++c) out[i * CH + c] = 0.f;
     }
     // Drops the buffered audio (a consumer that starts late would otherwise stay a whole ring
     // behind forever: the backlog never drains once both sides run at the same rate).
@@ -99,7 +132,9 @@ struct CawScRing {
 struct VstEngineAudio {
     const std::atomic<const float*>* pdMix = nullptr;  // the latest Pure Data render (interleaved, pdMixChannels)
     int pdMixChannels = 2;
-    CawScRing* scRing = nullptr;                       // the SuperCollider mix (stereo, device scale)
+    CawScRing* pdRing = nullptr;                       // the dedicated PD engine's live stereo mix ring (engine 1, preferred over pdMix)
+    CawScRing* scRing = nullptr;                       // the whole SuperCollider device mix (fallback / mode-2 "master")
+    std::function<CawScRing*(int)> scTrackRing;        // one SuperCollider ring per TRACK SLOT (engine 2): the SC callback pushes, the rack pops
     std::function<CawScRing*(int)> sampleRing;         // a sample track's stereo mix ring (engine 4): the callback pushes, the rack pops
 };
 // One note of the MIDI clips of the VSTi tracks, as the app hands them to CAW's own VST engine

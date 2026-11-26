@@ -12,6 +12,9 @@
 // Formats 0,1,2 are PCM16, PCM24, and IEEE float32. Files >4 GiB fail
 // rather than silently wrap their RIFF length.
 class CawWavWriter {
+public:
+    uint64_t dataBytes() const { return dataBytes_; }   // 0 = nothing was written (an empty capture)
+private:
     std::ofstream out_;
     int channels_ = 0, bytes_ = 0, format_ = 0;
     uint64_t dataBytes_ = 0;
@@ -32,6 +35,8 @@ public:
         if (!out_) { error = "Could not write WAV header."; return false; }
         return true;
     }
+    // Closes without finishing (a discarded pass). open() on the same writer must work afterwards.
+    void close() { if (out_.is_open()) out_.close(); }
     template<class T>
     bool write(const T* samples, size_t frames, double fullScale, float gain, std::string& error) {
         if (!samples || !out_ || !std::isfinite(fullScale) || fullScale <= 0 || !std::isfinite(gain)) {

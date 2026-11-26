@@ -1,5 +1,46 @@
 #include "app_shared.h"
 
+// ---- engine identity of a track: one color + a short tag per track type, so the type is readable at a glance
+static uint32_t engineRgb(int kind) {
+    switch (kind) {
+        case 0: return 0xEB8C3Cu;   // Csound            - orange
+        case 1: return 0x8C96AAu;   // marker            - gray
+        case 2: return 0x5A96F0u;   // graph             - blue
+        case 3: return 0x9A6EE6u;   // VST instrument    - violet
+        case 4: return 0x3CBEC8u;   // VST effect        - cyan
+        case 5: return 0x5AC86Eu;   // SuperCollider     - green
+        case 6: return 0xE15A6Eu;   // Pure Data         - red
+        case 7: return 0xE6C846u;   // sample            - yellow
+        default: return 0x8C96AAu;
+    }
+}
+static const char* engineTag(int kind) {
+    switch (kind) {
+        case 0: return "CSD";
+        case 1: return "MRK";
+        case 2: return "GRF";
+        case 3: return "VSTi";
+        case 4: return "VSTe";
+        case 5: return "SC";
+        case 6: return "PD";
+        case 7: return "SMP";
+        default: return "?";
+    }
+}
+static const char* engineName(int kind) {
+    switch (kind) {
+        case 0: return "Csound track";
+        case 1: return "Marker track";
+        case 2: return "Graph track";
+        case 3: return "VST instrument (VSTi) track";
+        case 4: return "VST effect (VSTe) track";
+        case 5: return "SuperCollider track";
+        case 6: return "Pure Data track";
+        case 7: return "Sample (audio file) track";
+        default: return "Track";
+    }
+}
+
 // src/ui_timeline.cpp (phase 2: extracted from app.cpp; the shared state is app_state.h, the
 //  internal declarations are app_internal.h - all included through app_shared.h.)
 
@@ -189,12 +230,22 @@ void duplicateClipAsNew(int laneIndex, int clipIndex) {
     g_selClips.insert(copy.id);
 }
 #include "app.h"
+// TRACK FREEZE helper: is this clip's lane frozen (the clip cannot be edited or deleted)?
+inline bool clipFrozenById(int clipId) {
+    for (const Track& t : g_proj.tracks) {
+        if (!trackFrozen(t)) continue;
+        for (const Clip& c : t.clips) if (c.id == clipId) return true;
+    }
+    return false;
+}
+
 void duplicateSelectedClips() {
     std::vector<std::pair<int, Clip>> made;
     double lo = 1e300, hi = 0.0;
     for (int ti = 0; ti < (int)g_proj.tracks.size(); ++ti)
         for (const Clip& c : g_proj.tracks[(size_t)ti].clips)
             if (g_selClips.count(c.id)) {
+                if (trackFrozen(g_proj.tracks[(size_t)ti])) continue;   // frozen: the lane is locked, its clips are not copied
                 lo = std::min(lo, c.start);
                 hi = std::max(hi, c.start + c.dur);
                 made.push_back({ti, c});
@@ -223,10 +274,13 @@ void deleteSelectedMidiClips() {
 }
 #include "app.h"
 void deleteSelectedClips() {
-    for (const int id : g_selClips) { audioKillClipVoices(id); removeMidiClipsOf(id); }   // audio: the voice stops with the clip
+    for (const int id : g_selClips) {
+        if (clipFrozenById(id)) continue;   // frozen: the lane is locked, its clips cannot be deleted
+        audioKillClipVoices(id); removeMidiClipsOf(id);   // audio: the voice stops with the clip
+    }
     for (Track& t : g_proj.tracks)
         t.clips.erase(std::remove_if(t.clips.begin(), t.clips.end(),
-                                     [](const Clip& c) { return g_selClips.count(c.id) > 0; }), t.clips.end());
+                                     [](const Clip& c) { return g_selClips.count(c.id) > 0 && !clipFrozenById(c.id); }), t.clips.end());
     g_selClips.clear();
     g_selClip = -1;
 }
@@ -235,6 +289,7 @@ void addClip(int laneIndex, double start, double dur, const std::string& code, c
 {
     Track& lane = g_proj.tracks[(size_t)laneIndex];
     if (!hasClips(lane)) return;   // graph and marker tracks take no clips
+    if (trackFrozen(lane)) { logLine("[caw] The track \"" + lane.name + "\" is frozen - unfreeze it to edit it."); return; }   // frozen: the lane is locked
     Clip c = makeClip(lane, start, dur, code);
     if (!name.empty()) { c.name = name; ensureUniqueClipName(c); }
     lane.clips.push_back(c);
@@ -379,13 +434,17 @@ bool autoSelBounds(const std::vector<AutoPoint>& lane, const std::set<int>& sel,
 }
 #include "app.h"
 void reshapeDots(std::vector<AutoPoint>& lane, const std::vector<int>& idx, const std::vector<AutoPoint>& orig,
-                 double dStart, double dEnd, double stretch, double morph, double lo, double hi) {
+                 double dStart, double dEnd, double stretch, double morph, double lo, double hi,
+                 double anchorT, double anchorSpan) {
     if (orig.empty() || orig.size() != idx.size()) return;
     const double kPi = 3.14159265358979323846;
     double vMin = orig[0].v, vMax = orig[0].v;
     for (const AutoPoint& q : orig) { vMin = std::min(vMin, q.v); vMax = std::max(vMax, q.v); }
     const double center = (vMin + vMax) * 0.5, half = (vMax - vMin) * 0.5;
-    const double t0 = orig.front().t, span = orig.back().t - t0;
+    // anchorT / anchorSpan >= 0: several lanes are reshaped together - they share one time origin and one
+    // depth ramp, so the lines stay aligned with each other. Otherwise the lane's own first / last dot.
+    const double t0 = anchorT >= 0.0 ? anchorT : orig.front().t;
+    const double span = anchorSpan >= 0.0 ? anchorSpan : orig.back().t - t0;
     const double amt = std::fabs(morph);
     for (size_t k = 0; k < idx.size(); ++k) {
         if (idx[k] < 0 || idx[k] >= (int)lane.size()) continue;
@@ -426,6 +485,23 @@ bool hasAutoSelection() {
     if (!g_autoSel.empty()) return true;
     for (const auto& kv : g_autoSelMulti) if (!kv.second.empty()) return true;
     return false;
+}
+#include "app.h"
+// Every selected dot in every lane: the primary lane (g_autoSel) and the other lanes (g_autoSelMulti).
+std::map<std::pair<int, std::string>, std::set<int>> allSelectedDots() {
+    std::map<std::pair<int, std::string>, std::set<int>> all;
+    for (const auto& [key, idx] : g_autoSelMulti) if (!idx.empty()) all[key].insert(idx.begin(), idx.end());
+    if (!g_autoSel.empty() && g_autoSelTrackId >= 0) all[{g_autoSelTrackId, g_autoSelChannel}].insert(g_autoSel.begin(), g_autoSel.end());
+    return all;
+}
+#include "app.h"
+// Put a whole dot selection back: the given primary lane (if it has dots) becomes g_autoSel, the rest g_autoSelMulti.
+void setAllSelectedDots(const std::map<std::pair<int, std::string>, std::set<int>>& all, int primaryTrack, const std::string& primaryChannel) {
+    g_autoSel.clear(); g_autoSelMulti.clear();
+    auto primary = all.find({primaryTrack, primaryChannel});
+    if (primary == all.end() && !all.empty()) primary = all.begin();
+    if (primary != all.end()) { g_autoSelTrackId = primary->first.first; g_autoSelChannel = primary->first.second; g_autoSel = primary->second; }
+    for (const auto& [key, idx] : all) if (primary == all.end() || key != primary->first) if (!idx.empty()) g_autoSelMulti[key] = idx;
 }
 #include "app.h"
 void deleteSelectedAutoPoints() {
@@ -603,7 +679,9 @@ void drawScoreEditor() {
     if (!g_scoreOpen) return;
     ImGui::SetNextWindowSize(ImVec2(S(680), S(720)), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(S(200), S(70)), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Score", &g_scoreOpen)) {
+    winMaxPrepareT("Score");
+    if (ImGui::Begin("Score", &g_scoreOpen, ImGuiWindowFlags_NoCollapse)) {
+        winMaxTitleButtonT("Score");
         ScoreInfo& sc = g_proj.score;
         const float labelW = S(120);
         auto row = [&](const char* name) { ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(name); ImGui::SameLine(labelW); ImGui::SetNextItemWidth(S(400)); };
@@ -973,9 +1051,11 @@ void toggleTimelinePlay() {
             pdTransport(false);g_pdPlayingClip = 0; g_pdTimelineMode = false;
         }
         if (engineIsUp()) commandStopAll();
+        if (g_liveCsound && g_useCsoundApi) g_apiProc.silenceVstTaps();
         if (g_scReady) stopAllScClips();
         if (g_vstEngineOn) vstSolo().halt();   // the VST engine stops scheduling and releases its notes
         cawaudio::engine().clearAll();   // audio track voices stop with the transport
+        clearSampleRings();
         g_audioVoiceSig.clear();
         g_scTimelineSig = 0; g_scPlanT = 0.0; g_scLastPDTimelineTime = -1.0;
         mixedPdTransport(false);
@@ -1010,12 +1090,16 @@ void toggleTimelinePlay() {
             // transport whenever SuperCollider was the selected language but its engine was off.
         }
         {
-            // Sample tracks: the same rule - Play moves the playhead, the Run sample button starts the engine.
+            // Sample tracks AND locked tracks: the same rule - Play moves the playhead, the Run sample button starts the engine.
             bool hasSampleClip = false;
             for (const Track& track : g_proj.tracks) {
                 if (track.kind != 7 || track.muted || (anyTrackSolo && !track.solo)) continue;
                 for (const Clip& clip : track.clips) if (!clip.muted && !clip.audioFile.empty()) hasSampleClip = true;
             }
+            // A locked (LKD) track plays its rendered WAV without any engine now - only the real sample clips need the sample engine.
+            bool hasFrozenAudible = false;
+            for (const Track& track : g_proj.tracks)
+                if (trackFrozen(track) && !track.muted && !(anyTrackSolo && !track.solo)) { hasFrozenAudible = true; break; }
             if (hasSampleClip && !g_sampleEngineOn)
                 playNotice("Press DSP to hear the sample clips. The timeline plays either way.", "Sample engine is off");
         }
@@ -1192,29 +1276,20 @@ void drawTransport() {
         statusCol = ImVec4(0.95f, 0.60f, 0.20f, 1.f);
     }
     char engineText[96];
-    if (g_langCsound) std::snprintf(engineText, sizeof engineText, "%d Hz | ksmps %d | %d ch", cs.sr, cs.ksmps, cs.nchnls);
-    else {
-        std::string eng;
-        if (g_langPd) eng = "Pure Data";
-        if (g_langSc) { if (!eng.empty()) eng += " + "; eng += "SuperCollider"; }
-        if (g_langVst) { if (!eng.empty()) eng += " + "; eng += "VST"; }
-        if (anySampleTrack) { if (!eng.empty()) eng += " + "; eng += "Sample"; }
-        if (eng.empty()) eng = "score only";
-        std::snprintf(engineText, sizeof engineText, "%d Hz | %s", cs.sr, eng.c_str());
-    }
+    // the sampling rate and the project's channel count sit left of the status pill (user request)
+    std::snprintf(engineText, sizeof engineText, "%d Hz  |  %d ch", cs.sr, masterChannels(cs));
     const float dotW = S(14);
     const float statusW = dotW + ImGui::CalcTextSize(statusText).x + S(12);
     const float engineW = ImGui::CalcTextSize(engineText).x + S(16);
-    const bool showEngine = totalW > S(1550);
-    const float rightW = statusW + (showEngine ? engineW : 0.f) + S(12);
-    if (totalW > S(1050)) {
+    const float rightW = statusW + engineW + S(12);
+    if (totalW > S(640)) {
         const ImVec2 base = ImGui::GetWindowPos();
         ImDrawList* dl = ImGui::GetWindowDrawList();
         float x = base.x + totalW - rightW + S(4);
         const float yMid = base.y + S(26);
-        if (showEngine) {
+        {
             const ImVec2 sz = ImGui::CalcTextSize(engineText);
-            dl->AddText(ImVec2(x, yMid - sz.y * 0.5f), IM_COL32(120, 120, 130, 255), engineText);
+            dl->AddText(ImVec2(x, yMid - sz.y * 0.5f), IM_COL32(150, 150, 158, 255), engineText);
             x += engineW;
         }
         const ImVec2 sz = ImGui::CalcTextSize(statusText);
@@ -1223,43 +1298,8 @@ void drawTransport() {
         dl->AddText(ImVec2(x + dotW, yMid - sz.y * 0.5f), ImGui::ColorConvertFloat4ToU32(statusCol), statusText);
     }
 
-    // ---- always visible: go to start, Play, Run, time
+    // ---- always visible: go to start, DSP, Play, Loop, M, S, follow, time (user order)
     if (ImGui::Button("|<")) seekTimeline(0.0);
-    ImGui::SameLine();
-    const bool tlPlaying = timelinePlaying();
-    if (tlPlaying) pushBtnOn(ImVec4(0.85f, 0.35f, 0.10f, 1.f));
-    if (ImGui::Button(tlPlaying ? " Stop " : " Play ")) toggleTimelinePlay();
-    if (tlPlaying) ImGui::PopStyleColor(3);
-    if (ImGui::IsItemHovered())
-        helpTip("Play the timeline. Start the engines for the enabled languages with the combined Run button, or with the single-language Run button.");
-    ImGui::SameLine();
-    const bool hasLoop = g_proj.loopEnd - g_proj.loopStart >= 0.01;
-    const bool loopOn = g_proj.loopEnabled && hasLoop;
-    if (!hasLoop) ImGui::BeginDisabled();
-    if (loopOn) pushBtnOn(ImVec4(0.20f, 0.42f, 0.24f, 1.f));
-    if (ImGui::Button("Loop")) {
-        g_proj.loopEnabled = !g_proj.loopEnabled;
-        if (g_timelineRun) g_resync = 2;
-        if (g_timelineRun && g_pdTimelineMode) pdTransport(true);
-    }
-    if (loopOn) ImGui::PopStyleColor(3);
-    if (!hasLoop) ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        helpTip("Right-click the timeline ruler twice to set loop start and end. Toggle Loop here.");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("M##global_unmute")) {
-        const int count = unmuteAllTracks();
-        logLine("[caw] Unmuted all tracks" + std::string(count ? " (" + std::to_string(count) + (count == 1 ? " track)" : " tracks)") : " (none were muted)") + ".");
-    }
-    if (ImGui::IsItemHovered())
-        helpTip("Global mute: unmute EVERY muted track (Alt+M). Only the track mutes are cleared - clips and automation lanes keep their own mute. Solo stays.");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("S##global_unsolo")) {
-        const int count = unsoloAllTracks();
-        logLine("[caw] Cleared solo on all tracks" + std::string(count ? " (" + std::to_string(count) + (count == 1 ? " track)" : " tracks)") : " (none were solo)") + ".");
-    }
-    if (ImGui::IsItemHovered())
-        helpTip("Global solo off: clear solo on EVERY track (Alt+S). Mutes stay as they are.");
     ImGui::SameLine();
     // ONE Run button for everything: every enabled engine's button also starts/stops the sample
     // engine, so a session with sample tracks shows a single Run button (the status pill's SMP
@@ -1276,11 +1316,15 @@ void drawTransport() {
     };
     auto sampleRunStop = [&]() {
         if (g_sampleEngineOn) {
+            int frozenCount = 0;
+            for (const Track& t : g_proj.tracks) if (trackFrozen(t)) ++frozenCount;
             g_sampleEngineOn = false;
             cawaudio::engine().clearAll();
             g_audioVoiceSig.clear();
             closeSampleOutput();
             logLine("[caw] Sample engine stopped.");
+            if (frozenCount > 0)
+                logLine("[caw] Note: " + std::to_string(frozenCount) + " frozen track(s) play their rendered WAV through the sample engine - they are silent until you run Sample again (mute / fader still apply once it runs).");
         }
     };
     if (g_langCsound || g_liveCsound) {
@@ -1368,7 +1412,7 @@ void drawTransport() {
                         } else {
                             g_pdTimelineEvents=std::move(plan);g_pdNeedsReload=false;
                             g_pdPlanUpdateFailed=false;
-                            g_idleMeters=meterLayout(g_proj);
+                            g_idleMeters=meterLayout(g_proj,g_projectPath);
                             g_pdSnapshotSeq=0;
                             g_peakIn.assign((size_t)std::max(1, g_proj.cs.nchnls), 0.f);
                             g_meterClipHold.assign(g_peakIn.size(), 0.f);
@@ -1397,10 +1441,8 @@ void drawTransport() {
         const bool on = g_scEngineOn;
         const bool vstOn = g_vstEngineOn;
         const bool vstWanted = g_langVst;   // checked = the VST engine runs, even with no .vst3 picked yet
-        std::string label;
-        if (!on) label = "DSP";
-        else if (vstWanted && !vstOn) label = "Add VST";
-        else label = vstOn ? "Stop engines" : "Stop SuperCollider";
+        // Always reads DSP like the other engine buttons; what runs shows in the status pill and the green state.
+        std::string label = "DSP";
         if (on || vstOn) pushBtnOn(ImVec4(0.20f, 0.42f, 0.24f, 1.f));
         if (ImGui::Button(label.c_str())) {
             if (!on) {
@@ -1429,7 +1471,7 @@ void drawTransport() {
         }
         if (on) ImGui::PopStyleColor(3);
         if (ImGui::IsItemHovered())
-            helpTip("DSP runs the VSTi (instrument) tracks. Starts CAW's own VST engine: it loads the instrument plugins and plays the MIDI clips and the notes from clip code. It does not need Csound. Press Play afterwards.");
+            helpTip("DSP runs CAW's VST engine without Csound. Sample or locked sources feeding a VSTe start the sample engine automatically when Audio is enabled. Press Play afterwards.");
         ImGui::SameLine();
     }
     // The sample engine (audio tracks, kind 7): every other Run button starts/stops it too, so its
@@ -1450,9 +1492,59 @@ void drawTransport() {
             ImGui::SameLine();
         }
     }
+    const bool tlPlaying = timelinePlaying();
+    if (tlPlaying) pushBtnOn(ImVec4(0.85f, 0.35f, 0.10f, 1.f));
+    if (ImGui::Button(tlPlaying ? " Stop " : " Play ")) toggleTimelinePlay();
+    if (tlPlaying) ImGui::PopStyleColor(3);
+    if (ImGui::IsItemHovered())
+        helpTip("Play the timeline. Start the engines for the enabled languages with the combined Run button, or with the single-language Run button.");
+    ImGui::SameLine();
+    const bool hasLoop = g_proj.loopEnd - g_proj.loopStart >= 0.01;
+    const bool loopOn = g_proj.loopEnabled && hasLoop;
+    if (!hasLoop) ImGui::BeginDisabled();
+    if (loopOn) pushBtnOn(ImVec4(0.20f, 0.42f, 0.24f, 1.f));
+    if (ImGui::Button("Loop")) {
+        g_proj.loopEnabled = !g_proj.loopEnabled;
+        if (g_timelineRun) g_resync = 2;
+        if (g_timelineRun && g_pdTimelineMode) pdTransport(true);
+    }
+    if (loopOn) ImGui::PopStyleColor(3);
+    if (!hasLoop) ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        helpTip("Right-click the timeline ruler twice to set loop start and end. Toggle Loop here.");
+    ImGui::SameLine();
+    ImGui::SameLine();
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ImGui::GetStyle().FramePadding.x, std::max(0.f, (ImGui::GetFrameHeight() - ImGui::GetFontSize()) * 0.5f)));   // Button (not SmallButton): the label centers vertically, same height as the other transport buttons
+    if (ImGui::Button("M##global_unmute")) {
+        const int count = unmuteAllTracks();
+        logLine("[caw] Unmuted all tracks" + std::string(count ? " (" + std::to_string(count) + (count == 1 ? " track)" : " tracks)") : " (none were muted)") + ".");
+    }
+    ImGui::PopStyleVar();
+    if (ImGui::IsItemHovered())
+        helpTip("Global mute: unmute EVERY muted track (Alt+M). Only the track mutes are cleared - clips and automation lanes keep their own mute. Solo stays.");
+    ImGui::SameLine();
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ImGui::GetStyle().FramePadding.x, std::max(0.f, (ImGui::GetFrameHeight() - ImGui::GetFontSize()) * 0.5f)));   // Button (not SmallButton): the label centers vertically, same height as the other transport buttons
+    if (ImGui::Button("S##global_unsolo")) {
+        const int count = unsoloAllTracks();
+        logLine("[caw] Cleared solo on all tracks" + std::string(count ? " (" + std::to_string(count) + (count == 1 ? " track)" : " tracks)") : " (none were solo)") + ".");
+    }
+    ImGui::PopStyleVar();
+    if (ImGui::IsItemHovered())
+        helpTip("Global solo off: clear solo on EVERY track (Alt+S). Mutes stay as they are.");
+    ImGui::SameLine();
+    {
+        static const char* followNames[] = {"None", "Page scroll", "Follow"};
+        ImGui::SetNextItemWidth(S(104));
+        int fv = g_tlFollow;
+        if (caw_ui::combo("##tl_follow", &fv, followNames, 3)) g_tlFollow = fv;
+        if (ImGui::IsItemHovered()) helpTip("Follow the playhead while the timeline plays (Cubase's auto-scroll): \"page\" jumps a whole page each time the playhead leaves the view; \"timeline\" keeps the playhead at the middle of the view and the content moves under it, frame by frame. Shortcut: F.");
+    }
+    ImGui::SameLine();   // the follow combo stays on the transport row (the tools follow here too)
     int ms = (int)(g_play * 1000.0);
     ImGui::AlignTextToFramePadding();
-    ImGui::TextColored(ImVec4(0.95f, 0.60f, 0.20f, 1.f), "%02d:%02d.%03d", ms / 60000, (ms / 1000) % 60, ms % 1000);
+    ImGui::SetWindowFontScale(1.3f);   // the timer reads big (user request)
+    ImGui::TextColored(ImVec4(1.f, 1.f, 1.f, 1.f), "%02d:%02d.%03d", ms / 60000, (ms / 1000) % 60, ms % 1000);
+    ImGui::SetWindowFontScale(1.f);
     ImGui::SameLine(0, S(18));
 
     auto toolButton = [&](const char* label, Tool tool, const char* tip, bool join = false) {
@@ -1482,9 +1574,6 @@ void drawTransport() {
     toolButton("Cut", Tool::Cut, "Cut MIDI clips (3).");
     ImGui::SameLine(0, S(3));
     toolButton("Join", Tool::Join, "Join MIDI clips (4).", true);
-    ImGui::SameLine(0, S(10));
-    if (ImGui::Button("Score")) g_scoreOpen = true;
-    if (ImGui::IsItemHovered()) helpTip("Edit and export the score.");
     endChildTight();
     ImGui::PopStyleColor();
 }
@@ -1555,6 +1644,11 @@ void drawChevron(ImDrawList* dl, float x, float y, float radius, bool right, ImU
     caw_ui::disclosure(dl, ImVec2(x, y), radius, color, !right);
 }
 #include "app.h"
+// Track lock dialogs (drawArrange): the engine-down warning and the VSTe render-and-lock planner.
+static int g_freezeWarnTrack = -1;    // the track whose engine is down
+static bool g_freezeWarnOpen = false; // p_open of the warning modal (syncs with click-outside closes)
+static int g_freezeVsteAsk = -1;      // the rack track the dialog plans the render-and-lock for
+static bool g_freezeVsteOpen = false; // p_open of the rack modal
 void drawArrange(float belowH, float rightW) {
     ImGuiIO& io = ImGui::GetIO();
     ImGui::BeginChild("arrange", ImVec2(-rightW, -belowH), false,
@@ -1572,7 +1666,7 @@ void drawArrange(float belowH, float rightW) {
     const ImVec2 rulerMin(bodyMin.x, org.y), rulerMax(bodyMax.x, bodyMin.y);
     const ImVec2 hdrMin(org.x, bodyMin.y), hdrMax(bodyMin.x, bodyMax.y);
     const ImVec2 m = io.MousePos;
-    for (Track& tr : g_proj.tracks) tr.height = tr.kind == 2 ? 58.f : (tr.kind == 7 ? tr.height : kFixedTrackH);  // audio lanes keep their (resizable) height
+    for (Track& tr : g_proj.tracks) tr.height = kFixedTrackH;   // every lane has the same fixed height (sample lanes too: the big shape lives in the sound editor)
     const int nT = (int)g_proj.tracks.size();
 
     {   // keep the multi-selection consistent with the primary selection and the existing clips
@@ -1653,6 +1747,18 @@ void drawArrange(float belowH, float rightW) {
     const double viewSec = std::max(0.001, (double)(bodyMax.x - bodyMin.x) / g_pps);
     const double minX = 0.0;
     g_scrollX = (float)std::max(minX, (double)g_scrollX);
+    // follow the playhead while the timeline plays (Cubase's auto-scroll modes):
+    // page = the view jumps one whole page each time the playhead leaves it; timeline = the playhead
+    // stays pinned at ~1/3 of the view and the content slides under it.
+    if (g_timelineRun && g_tlFollow > 0) {
+        if (g_tlFollow == 1) {
+            if ((double)g_play >= (double)g_scrollX + viewSec) g_scrollX = (float)g_play;
+            else if ((double)g_play < (double)g_scrollX) g_scrollX = (float)std::max(minX, g_play - viewSec * 0.05);
+        } else {
+            // move by timeline: the playhead IS the middle of the view, moved frame by frame
+            g_scrollX = (float)std::max(minX, g_play - viewSec * 0.5);
+        }
+    }
     float contentH = S(kDefaultTrackH);
     for (int i = 0; i < nT; ++i) contentH += th(i) + folderHdrH[(size_t)i];
     const float viewH = std::max(1.f, bodyMax.y - bodyMin.y);
@@ -1685,10 +1791,6 @@ void drawArrange(float belowH, float rightW) {
             if (hiddenTrack(i)) continue;
             const Track& track = g_proj.tracks[(size_t)i];
             const float baseEdge = baseBottom[(size_t)i];
-            if (track.kind == 7 && std::fabs(m.y - baseEdge) <= S(4)) {   // audio lanes resize like the automation lanes
-                edgeTrack = i;
-                break;
-            }
             float laneTop = baseEdge;
             for (const auto& [channel, points] : track.automation) {
             if (!autoShown(track, channel)) continue;
@@ -1793,13 +1895,19 @@ void drawArrange(float belowH, float rightW) {
             auto whLane = whTrack ? whTrack->automation.find(g_wh.channel) : std::map<std::string, std::vector<AutoPoint>>::iterator();
             if (!whTrack || whLane == whTrack->automation.end() || !ImGui::IsMouseDown(0)) {
                 if (whTrack && whLane != whTrack->automation.end()) sortLaneKeepSelection(whLane->second, g_autoSel);
+                for (auto& [key, sel] : g_autoSelMulti) {
+                    Track* ot = findTrackById(key.first);
+                    if (!ot) continue;
+                    auto ol = ot->automation.find(key.second);
+                    if (ol != ot->automation.end()) sortLaneKeepSelection(ol->second, sel);
+                }
                 g_wh.active = false;
             } else {
                 consumed = true;
                 float ly0 = 0.f, ly1 = 0.f;
                 autoLaneGeometry(*whTrack, whTi, g_wh.channel, ly0, ly1);
                 const float yC = yOfValue(g_wh.center, ly0, ly1, g_wh.lo, g_wh.hi);
-                const float x0px = tx(g_wh.orig.front().t), x1px = tx(g_wh.orig.back().t);
+                const float x0px = tx(g_wh.t0), x1px = tx(g_wh.t0 + g_wh.span);
                 double dS = 1.0, dE = 1.0, st = 1.0, mo = 0.0;
                 if (g_wh.kind == 1) {
                     const float denom = std::max(S(12), yC - g_wh.handleY);
@@ -1814,12 +1922,23 @@ void drawArrange(float belowH, float rightW) {
                     if (std::fabs(mo) < 0.02) ImGui::SetTooltip("Wave as drawn");
                     else ImGui::SetTooltip(mo > 0 ? "Towards square %.0f %%" : "Towards triangle %.0f %%", std::fabs(mo) * 100.0);
                 }
-                reshapeDots(whLane->second, g_wh.idx, g_wh.orig, dS, dE, st, mo, g_wh.lo, g_wh.hi);
+                const double aT = g_wh.others.empty() ? -1.0 : g_wh.t0, aS = g_wh.others.empty() ? -1.0 : g_wh.span;
+                reshapeDots(whLane->second, g_wh.idx, g_wh.orig, dS, dE, st, mo, g_wh.lo, g_wh.hi, aT, aS);
                 const ParsedTrack whParsed = pdParsedForUi(*whTrack);
                 const CawParam* whParam = hasClips(*whTrack) ? laneParameter(whParsed, g_wh.channel) : nullptr;
                 if (whParam) for (int index : g_wh.idx)
                     if (index >= 0 && index < (int)whLane->second.size())
                         whLane->second[(size_t)index].v = quantizeAutomation(whLane->second[(size_t)index].v, *whParam);
+                for (const auto& ol : g_wh.others) {   // every other selected lane: the same depth / stretch / shape
+                    Track* ot = findTrackById(ol.trackId);
+                    if (!ot || trackFrozen(*ot)) continue;
+                    auto lane = ot->automation.find(ol.channel);
+                    if (lane == ot->automation.end()) continue;
+                    reshapeDots(lane->second, ol.idx, ol.orig, dS, dE, st, mo, ol.lo, ol.hi, g_wh.t0, g_wh.span);
+                    for (int index : ol.idx)
+                        if (index >= 0 && index < (int)lane->second.size())
+                            lane->second[(size_t)index].v = laneQuantizeValue(*ot, ol.channel, lane->second[(size_t)index].v);
+                }
             }
         } else if (inBody && !consumed && ImGui::IsMouseClicked(0) && g_autoSel.size() >= 2 && g_autoMode == AutoMode::None) {
             int whTi = -1;
@@ -1840,6 +1959,24 @@ void drawArrange(float belowH, float rightW) {
                     g_wh.active = true; g_wh.kind = kind; g_wh.trackId = whTrack->id; g_wh.channel = g_autoSelChannel;
                     for (int idx : g_autoSel) if (idx >= 0 && idx < (int)whLane->second.size()) { g_wh.idx.push_back(idx); g_wh.orig.push_back(whLane->second[(size_t)idx]); }
                     g_wh.center = (vMin + vMax) * 0.5; g_wh.lo = lo; g_wh.hi = hi;
+                    g_wh.t0 = tMin; g_wh.span = tMax - tMin;
+                    for (const auto& [key, sel] : g_autoSelMulti) {   // the other selected lanes join the reshape
+                        if (sel.empty()) continue;
+                        const Track* ot = findTrackById(key.first);
+                        if (!ot || trackFrozen(*ot) || !autoShown(*ot, key.second)) continue;
+                        const auto lane = ot->automation.find(key.second);
+                        if (lane == ot->automation.end()) continue;
+                        WaveHandleDrag::Lane ol;
+                        ol.trackId = key.first; ol.channel = key.second;
+                        for (int idx : sel) if (idx >= 0 && idx < (int)lane->second.size()) { ol.idx.push_back(idx); ol.orig.push_back(lane->second[(size_t)idx]); }
+                        if (ol.idx.empty()) continue;
+                        double l2, h2, i2; laneValueRange(*ot, key.second, l2, h2, i2);
+                        ol.lo = l2; ol.hi = h2;
+                        for (const AutoPoint& q : ol.orig) { g_wh.t0 = std::min(g_wh.t0, q.t); }
+                        g_wh.others.push_back(std::move(ol));
+                    }
+                    for (const auto& ol : g_wh.others) for (const AutoPoint& q : ol.orig) g_wh.span = std::max(g_wh.span, q.t - g_wh.t0);
+                    g_wh.span = std::max(g_wh.span, tMax - g_wh.t0);
                     g_wh.handleY = kind == 1 ? wh.depth.y : wh.morph.y; g_wh.startY = m.y;
                     consumed = true;
                 }
@@ -1847,10 +1984,10 @@ void drawArrange(float belowH, float rightW) {
         }
     }
     if (inBody && !consumed && (ImGui::IsMouseClicked(0) || ImGui::IsMouseClicked(1))) {
-        g_autoSelMulti.clear();
         for (int ti = 0; ti < nT && !consumed; ++ti) {
             if (hiddenTrack(ti)) continue;
             Track& track = g_proj.tracks[(size_t)ti];
+            if (trackFrozen(track)) continue;   // frozen: the lane is locked, its automation cannot be edited
             for (auto& [channel, points] : track.automation) {
             if (!autoShown(track, channel)) continue;
                 float laneY0 = 0.f, laneY1 = 0.f;
@@ -1867,11 +2004,45 @@ void drawArrange(float belowH, float rightW) {
                     if (dist < hitDist) { hitDist = dist; hit = pi; }
                 }
                 const bool sameLane = g_autoSelTrackId == track.id && g_autoSelChannel == channel;
-                if (!sameLane) { g_autoSel.clear(); g_autoSelMulti.clear(); g_autoSelTrackId = track.id; g_autoSelChannel = channel; }
+                // Is the pressed dot already part of the (possibly multi-lane) selection? Then the press moves
+                // everything that is selected - the dots of every lane and the selected clips with them.
+                bool grabSelected = false;
+                if (hit >= 0) {
+                    if (sameLane) grabSelected = g_autoSel.count(hit) > 0;
+                    else { const auto mi = g_autoSelMulti.find({track.id, channel}); grabSelected = mi != g_autoSelMulti.end() && mi->second.count(hit) > 0; }
+                }
+                if (!sameLane) {
+                    if (io.KeyCtrl || io.KeyShift || grabSelected) {   // additive / grab: this lane becomes the primary one, nothing is lost
+                        const auto all = allSelectedDots();
+                        g_autoSelMulti.clear();
+                        for (const auto& [key, idx] : all) g_autoSelMulti[key] = idx;
+                        g_autoSelTrackId = track.id; g_autoSelChannel = channel;
+                        const auto own = all.find({track.id, channel});
+                        g_autoSel = own == all.end() ? std::set<int>() : own->second;
+                        g_autoSelMulti.erase({track.id, channel});
+                    } else { g_autoSel.clear(); g_autoSelMulti.clear(); g_autoSelTrackId = track.id; g_autoSelChannel = channel; }
+                }
                 g_selTrack = ti;
                 g_selClip = -1;
                 consumed = true;
-                if (!io.KeyCtrl && !io.KeyShift) { g_selClips.clear(); g_selMidiClips.clear(); }
+                if (!io.KeyCtrl && !io.KeyShift && !grabSelected) { g_selClips.clear(); g_selMidiClips.clear(); }
+                if (grabSelected && !isPenTool() && ImGui::IsMouseClicked(0) && !ImGui::IsMouseDoubleClicked(0) &&
+                    (!g_selClips.empty() || !g_selMidiClips.empty())) {
+                    // dots AND clips are selected: drag them all together in time (the clip move carries the dots)
+                    g_drag = Drag::Move;
+                    g_dragAnchorT = xt(m.x);
+                    g_dragOrig.clear();
+                    for (const Track& tr : g_proj.tracks)
+                        for (const Clip& sc : tr.clips)
+                            if (g_selClips.count(sc.id)) g_dragOrig.push_back({sc.id, sc.start});
+                    g_dragDots = allSelectedDots();
+                    g_clipAutomationMove.capture(g_proj, g_selClips, &g_dragDots);
+                    g_dragMidiOrig.clear();
+                    for (const Track& tr : g_proj.tracks)
+                        for (const MidiClip& mc2 : tr.midiClips)
+                            if (g_selMidiClips.count(mc2.id)) g_dragMidiOrig.push_back({mc2.id, mc2.start});
+                    break;
+                }
 
                 if (ImGui::IsMouseClicked(1)) {  // right-click a dot: edit its value
                     if (hit >= 0) {
@@ -1936,6 +2107,8 @@ void drawArrange(float belowH, float rightW) {
                 } else if (hit >= 0) {
                     if (io.KeyCtrl) {
                         if (g_autoSel.count(hit)) g_autoSel.erase(hit); else g_autoSel.insert(hit);
+                    } else if (io.KeyShift) {
+                        g_autoSel.insert(hit);   // Shift adds the dot (and keeps every other lane), then it can be dragged with the rest
                     } else if (!g_autoSel.count(hit)) {
                         g_autoSel.clear(); g_autoSelMulti.clear();
                         g_autoSel.insert(hit);
@@ -1999,9 +2172,35 @@ void drawArrange(float belowH, float rightW) {
             const bool down = ImGui::IsMouseDown(0);
             consumed = true;
             if (g_autoMode == AutoMode::Move) {
+                if (!g_autoDragMoved) {   // until the mouse really moves: snapshot the other selected lanes
+                    g_autoDragOrigMulti.clear();
+                    for (const auto& [key, idx] : g_autoSelMulti) {
+                        if (idx.empty()) continue;
+                        const Track* ot = findTrackById(key.first);
+                        if (!ot) continue;
+                        const auto ol = ot->automation.find(key.second);
+                        if (ol != ot->automation.end()) g_autoDragOrigMulti[key] = ol->second;
+                    }
+                }
                 if (down && g_autoDragMoved && g_autoDragOrig.size() == points.size()) {
                     const double dt = io.KeyShift ? 0.0 : xt(m.x) - g_autoDragStartT;  // Shift = value only
                     const double dv = valueAtY(m.y, laneY0, laneY1, lo, hi) - g_autoDragStartV;
+                    const double dvNorm = hi > lo ? dv / (hi - lo) : 0.0;   // other lanes move by the same share of their own range
+                    for (const auto& [key, orig] : g_autoDragOrigMulti) {
+                        Track* ot = findTrackById(key.first);
+                        if (!ot || trackFrozen(*ot)) continue;
+                        auto ol = ot->automation.find(key.second);
+                        const auto sel = g_autoSelMulti.find(key);
+                        if (ol == ot->automation.end() || sel == g_autoSelMulti.end() || ol->second.size() != orig.size()) continue;
+                        double lo2, hi2, init2;
+                        laneValueRange(*ot, key.second, lo2, hi2, init2);
+                        for (int idx : sel->second) {
+                            if (idx < 0 || idx >= (int)orig.size()) continue;
+                            ol->second[(size_t)idx].t = clampTimelineTime(orig[(size_t)idx].t + dt);
+                            ol->second[(size_t)idx].v = laneQuantizeValue(*ot, key.second,
+                                std::min(hi2, std::max(lo2, orig[(size_t)idx].v + dvNorm * (hi2 - lo2))));
+                        }
+                    }
                     for (int idx : g_autoSel) {
                         if (idx < 0 || idx >= (int)points.size()) continue;
                         points[(size_t)idx].t = clampTimelineTime(g_autoDragOrig[(size_t)idx].t + dt);
@@ -2011,6 +2210,13 @@ void drawArrange(float belowH, float rightW) {
                 }
                 if (!down) {
                     sortLaneKeepSelection(points, g_autoSel);
+                    for (auto& [key, sel] : g_autoSelMulti) {
+                        Track* ot = findTrackById(key.first);
+                        if (!ot) continue;
+                        auto ol = ot->automation.find(key.second);
+                        if (ol != ot->automation.end()) sortLaneKeepSelection(ol->second, sel);
+                    }
+                    g_autoDragOrigMulti.clear();
                     g_autoMode = AutoMode::None;
                 }
             } else if (g_autoMode == AutoMode::Marquee) {
@@ -2031,13 +2237,29 @@ void drawArrange(float belowH, float rightW) {
                                               valueAtY(g_autoDragStartMouse.y, laneY0, laneY1, lo, hi))});
                         g_autoSel.insert((int)points.size() - 1);
                     } else {
+                        // the box may cover several lanes (of one track or of several tracks): every dot inside is picked
                         const float x0 = std::min(m.x, g_autoDragStartMouse.x), x1 = std::max(m.x, g_autoDragStartMouse.x);
                         const float y0 = std::min(m.y, g_autoDragStartMouse.y), y1 = std::max(m.y, g_autoDragStartMouse.y);
-                        for (int pi = 0; pi < (int)points.size(); ++pi) {
-                            const float px = tx(points[(size_t)pi].t);
-                            const float py = yOfValue(points[(size_t)pi].v, laneY0, laneY1, lo, hi);
-                            if (px >= x0 && px <= x1 && py >= y0 - S(4) && py <= y1 + S(4)) g_autoSel.insert(pi);
+                        auto all = allSelectedDots();
+                        for (int ti2 = 0; ti2 < nT; ++ti2) {
+                            if (hiddenTrack(ti2)) continue;
+                            const Track& tr2 = g_proj.tracks[(size_t)ti2];
+                            if (trackFrozen(tr2)) continue;
+                            for (const auto& [ch2, pts2] : tr2.automation) {
+                                if (!autoShown(tr2, ch2)) continue;
+                                float ly0 = 0.f, ly1 = 0.f;
+                                autoLaneGeometry(tr2, ti2, ch2, ly0, ly1);
+                                if (ly1 < y0 || ly0 > y1) continue;
+                                double lo2, hi2, init2;
+                                laneValueRange(tr2, ch2, lo2, hi2, init2);
+                                for (int pi = 0; pi < (int)pts2.size(); ++pi) {
+                                    const float px = tx(pts2[(size_t)pi].t);
+                                    const float py = yOfValue(pts2[(size_t)pi].v, ly0, ly1, lo2, hi2);
+                                    if (px >= x0 && px <= x1 && py >= y0 - S(4) && py <= y1 + S(4)) all[{tr2.id, ch2}].insert(pi);
+                                }
+                            }
                         }
+                        setAllSelectedDots(all, track->id, g_autoDragChannel);
                     }
                     sortLaneKeepSelection(points, g_autoSel);
                     g_autoMode = AutoMode::None;
@@ -2179,6 +2401,7 @@ void drawArrange(float belowH, float rightW) {
         for (int ti = 0; ti < nT; ++ti) {
             Track& track = g_proj.tracks[(size_t)ti];
             if (!midiShown(track)) continue;
+            if (trackFrozen(track)) continue;   // frozen: the lane is locked, the MIDI regions cannot be edited
             const float laneTop = midiLaneTop(track, baseBottom[(size_t)ti]);
             const float laneBottom = laneTop + S(kMidiLaneH);
             if (m.y >= laneTop && m.y < laneBottom) {
@@ -2244,7 +2467,8 @@ void drawArrange(float belowH, float rightW) {
                                     for (const Track& tr : g_proj.tracks)
                                         for (const Clip& sc : tr.clips)
                                             if (g_selClips.count(sc.id)) g_dragOrig.push_back({sc.id, sc.start});
-                                g_clipAutomationMove.capture(g_proj, g_selClips);
+                                g_dragDots = allSelectedDots();
+                                g_clipAutomationMove.capture(g_proj, g_selClips, &g_dragDots);
                                 g_mcOrig.clear();
                                 for (const Track& tr : g_proj.tracks)
                                     for (const MidiClip& mc : tr.midiClips)
@@ -2273,6 +2497,7 @@ void drawArrange(float belowH, float rightW) {
         MidiClip* dragged = findMidiClip(g_mcDragId);
         if (!dragged || !ImGui::IsMouseDown(0)) {
             g_mcDragId = -1;
+            g_dragDots.clear();
         } else if (g_mcDragMode == 1) {
             double dt = xt(m.x) - g_mcAnchorT;
             double minStart = 1e300;
@@ -2285,7 +2510,12 @@ void drawArrange(float belowH, float rightW) {
                 for (Clip& c : tr.clips)
                     for (const auto& o : g_dragOrig)
                         if (o.first == c.id) c.start = o.second + dt;
-            if (!g_dragOrig.empty()) g_clipAutomationMove.apply(g_proj, dt);
+            if (!g_dragOrig.empty() || !g_dragDots.empty()) {
+                ClipAutomationMove::DotSelection moved;
+                const int primaryTrack = g_autoSelTrackId; const std::string primaryChannel = g_autoSelChannel;
+                g_clipAutomationMove.apply(g_proj, dt, nullptr, &moved);
+                if (!g_dragDots.empty()) setAllSelectedDots(moved, primaryTrack, primaryChannel);
+            }
         } else if (g_mcDragMode == 2) {
             dragged->dur = std::max(0.01, clampTimelineTime(xt(m.x) - dragged->start));
         } else if (g_mcDragMode == 3) {
@@ -2450,7 +2680,7 @@ void drawArrange(float belowH, float rightW) {
         std::string dPath; int dx = 0, dy = 0;
         if (appTakeQueuedFileDrop(dPath, dx, dy)) {
             const int dti = laneOf((float)dy);
-            if (dti >= 0 && g_proj.tracks[(size_t)dti].kind == 7) {
+            if (dti >= 0 && g_proj.tracks[(size_t)dti].kind == 7 && !trackFrozen(g_proj.tracks[(size_t)dti])) {
                 Track& dt = g_proj.tracks[(size_t)dti];
                 Clip dc = makeClip(dt, clampTimelineTime(xt((float)dx)), 2.0, "");
                 if (initAudioClip(dc, dPath)) {
@@ -2538,6 +2768,10 @@ void drawArrange(float belowH, float rightW) {
     if (inBody && !consumed && !markerHandled && !audioClipHandled) {
         int ti = laneOf(m.y);
         int ci = clipAt(ti, m.x);
+        if (ti >= 0 && trackFrozen(g_proj.tracks[(size_t)ti])) {   // frozen: the lane is untouchable (no drag, no editor, no new clips)
+            ti = -1;
+            ci = -1;
+        }
         if (ci >= 0 && g_drag == Drag::None) {
             const Clip& hc = g_proj.tracks[(size_t)ti].clips[(size_t)ci];
             if (tx(hc.start + hc.dur) - m.x < S(8) || m.x - tx(hc.start) < S(8))
@@ -2575,7 +2809,10 @@ void drawArrange(float belowH, float rightW) {
             Clip& mc = g_proj.tracks[(size_t)ti].clips[(size_t)ci];
             mc.muted = !mc.muted;
         } else if (ImGui::IsMouseClicked(0)) {
-            g_autoSel.clear(); g_autoSelMulti.clear();
+            // Ctrl/Shift-click or grabbing an already selected clip keeps the selected automation dots, so clips and
+            // dots move together; a plain click elsewhere starts a new selection.
+            const bool keepDots = ci >= 0 && ((io.KeyCtrl || io.KeyShift) || g_selClips.count(g_proj.tracks[(size_t)ti].clips[(size_t)ci].id));
+            if (!keepDots) { g_autoSel.clear(); g_autoSelMulti.clear(); }
             if (!(io.KeyCtrl || io.KeyShift) && !(ci >= 0 && g_selClips.count(g_proj.tracks[(size_t)ti].clips[(size_t)ci].id)))
                 g_selMidiClips.clear();   // grabbing an already selected clip keeps the MIDI selection so both move together
             g_marqDblKind = 0;
@@ -2610,7 +2847,8 @@ void drawArrange(float belowH, float rightW) {
                     for (const Track& tr : g_proj.tracks)
                         for (const Clip& sc : tr.clips)
                             if (g_selClips.count(sc.id)) g_dragOrig.push_back({sc.id, sc.start});
-                    g_clipAutomationMove.capture(g_proj, g_selClips);
+                    g_dragDots = allSelectedDots();
+                    g_clipAutomationMove.capture(g_proj, g_selClips, &g_dragDots);
                     g_dragMidiOrig.clear();
                     for (const Track& tr : g_proj.tracks)
                         for (const MidiClip& mc2 : tr.midiClips)
@@ -2708,7 +2946,9 @@ void drawArrange(float belowH, float rightW) {
                 setPrimaryFromSet();
             } else if (g_drag == Drag::Marquee && g_marqDblKind != 0 && g_marqLane >= 0 && g_marqLane < nT) {
                 Track& lane = g_proj.tracks[(size_t)g_marqLane];
-                if (g_marqDblKind == 1 && hasClips(lane)) {
+                if (trackFrozen(lane)) {   // frozen: the lane is locked, no new clips (the double-click ran on a lane that froze since)
+                    g_marqDblKind = 0;
+                } else if (g_marqDblKind == 1 && hasClips(lane)) {
                     // new clip = new, independent instrument (own name, code copy, color, MIDI)
                     if (lane.kind == 7) {
                         // audio lane: the new clip asks for its file (canceled: no clip is added)
@@ -2749,6 +2989,7 @@ void drawArrange(float belowH, float rightW) {
             if (g_drag == Drag::Playhead && g_timelineRun && g_pdTimelineMode) pdTransport(true);
             if (g_drag == Drag::Marquee) g_marqDblKind = 0;
             g_drag = Drag::None;
+            g_dragDots.clear();
         } else if (g_drag == Drag::Playhead) {
             g_play = std::max(0.0, xt(m.x));
         } else if (g_drag == Drag::ResizeTrack) {
@@ -2801,7 +3042,12 @@ void drawArrange(float belowH, float rightW) {
                     g_selClip = (int)g_proj.tracks[(size_t)nt].clips.size() - 1;
                 }
             }
-            if (!g_dragOrig.empty()) g_clipAutomationMove.apply(g_proj, dt);
+            if (!g_dragOrig.empty() || !g_dragDots.empty()) {
+                ClipAutomationMove::DotSelection moved;
+                const int primaryTrack = g_autoSelTrackId; const std::string primaryChannel = g_autoSelChannel;
+                g_clipAutomationMove.apply(g_proj, dt, nullptr, &moved);
+                if (!g_dragDots.empty()) setAllSelectedDots(moved, primaryTrack, primaryChannel);
+            }
         } else if (g_drag == Drag::ResizeLeft && g_selTrack >= 0 && g_selTrack < nT && g_selClip >= 0 &&
                    g_selClip < (int)g_proj.tracks[(size_t)g_selTrack].clips.size()) {
             Clip& c = g_proj.tracks[(size_t)g_selTrack].clips[(size_t)g_selClip];
@@ -3038,7 +3284,8 @@ void drawArrange(float belowH, float rightW) {
             if (x1 - x0 > S(46)) {   // small M button: mute this clip
                 const ImVec2 ma(b.x - S(21), a.y + S(3)), mb(b.x - S(5), a.y + S(19));
                 dl->AddRectFilled(ma, mb, c.muted ? IM_COL32(190, 60, 52, 255) : IM_COL32(0, 0, 0, 110), S(3));
-                dl->AddText(ImVec2(ma.x + S(3), ma.y + S(1)), IM_COL32(255, 255, 255, c.muted ? 255 : 170), "M");
+                const ImVec2 ms = ImGui::CalcTextSize("M");   // the letter sits centered in the chip (x and y)
+                dl->AddText(ImVec2((ma.x + mb.x) * 0.5f - ms.x * 0.5f, (ma.y + mb.y) * 0.5f - ms.y * 0.5f), IM_COL32(255, 255, 255, c.muted ? 255 : 170), "M");
             }
         }
     }
@@ -3190,8 +3437,63 @@ void drawArrange(float belowH, float rightW) {
             if (cx1 - cx0 > S(46)) {
                 const ImVec2 ma(cx1 - S(21), midiY + S(5)), mb(cx1 - S(5), midiY + S(21));
                 dl->AddRectFilled(ma, mb, mc.muted ? IM_COL32(190, 60, 52, 255) : IM_COL32(0, 0, 0, 110), S(3));
-                dl->AddText(ImVec2(ma.x + S(3), ma.y + S(1)), IM_COL32(255, 255, 255, mc.muted ? 255 : 170), "M");
+                const ImVec2 ms = ImGui::CalcTextSize("M");   // the letter sits centered in the chip (x and y)
+                dl->AddText(ImVec2((ma.x + mb.x) * 0.5f - ms.x * 0.5f, (ma.y + mb.y) * 0.5f - ms.y * 0.5f), IM_COL32(255, 255, 255, mc.muted ? 255 : 170), "M");
             }
+        }
+    }
+    {   // TRACK FREEZE: frozen lanes draw dimmed and untouchable; the rendered WAV shows as one icy clip with its waveform
+        for (int i = 0; i < nT; ++i) {
+            if (hiddenTrack(i)) continue;
+            const Track& t = g_proj.tracks[(size_t)i];
+            if (!trackFrozen(t)) continue;
+            const float y0 = yTop[(size_t)i], y1 = baseBottom[(size_t)i];
+            if (y1 < bodyMin.y || y0 > bodyMax.y) continue;
+            // the frozen WAV as a clip-shaped range with a small waveform (the sound that actually plays)
+            if (t.freezeEnd > t.freezeStart) {
+                float fx0 = tx(t.freezeStart), fx1 = tx(t.freezeEnd);
+                if (fx1 >= bodyMin.x && fx0 <= bodyMax.x) {
+                    fx0 = std::max(fx0, bodyMin.x);
+                    fx1 = std::min(fx1, bodyMax.x);
+                    const float fy0 = y0 + S(4), fy1 = y1 - S(4);
+                    dl->AddRectFilled(ImVec2(fx0, fy0), ImVec2(fx1, fy1), IM_COL32(120, 170, 210, 55), S(4));
+                    dl->AddRect(ImVec2(fx0, fy0), ImVec2(fx1, fy1), IM_COL32(150, 200, 235, 190), S(4), 0, S(1.2f));
+                    Clip fc;                                   // only the path matters: the loader caches by file
+                    fc.audioFile = t.freezePath;
+                    std::string err;
+                    const auto data = audioClipData(fc, err);
+                    if (data && data->channels > 0 && !data->samples.empty()) {
+                        const int ch = data->channels;
+                        const size_t frames = data->samples.size() / (size_t)ch;
+                        const double span = t.freezeEnd - t.freezeStart;
+                        const float midY = (fy0 + fy1) * 0.5f;
+                        const float half = std::max(S(2.f), (fy1 - fy0) * 0.5f - S(3.f));
+                        for (float x = fx0 + 1.f; x < fx1; x += 2.f) {
+                            double tt = xt(x);
+                            tt = std::max(t.freezeStart, std::min(t.freezeEnd - 1e-6, tt));
+                            const double pos = (tt - t.freezeStart) / span * (double)frames;
+                            const size_t f0 = (size_t)std::max(0.0, pos);
+                            const size_t f1 = std::min(frames, f0 + 256);
+                            float mn = 1.f, mx = -1.f;
+                            for (size_t f = f0; f < f1; ++f)
+                                for (int c = 0; c < std::min(ch, 2); ++c) {
+                                    const float v = data->samples[f * (size_t)ch + (size_t)c];
+                                    mn = std::min(mn, v);
+                                    mx = std::max(mx, v);
+                                }
+                            if (mn > mx) continue;
+                            dl->AddLine(ImVec2(x, midY - mx * half), ImVec2(x, midY - mn * half), IM_COL32(165, 210, 240, 230), S(1.2f));
+                        }
+                    }
+                    {   // the LOCKED caption sits centered in the icy range (only when the range is wide enough)
+                        const ImVec2 ls = ImGui::CalcTextSize("LOCKED");
+                        if (fx1 - fx0 > ls.x + S(12))
+                            dl->AddText(ImVec2((fx0 + fx1) * 0.5f - ls.x * 0.5f, (fy0 + fy1) * 0.5f - ls.y * 0.5f), IM_COL32(175, 215, 245, 235), "LOCKED");
+                    }
+                }
+            }
+            // the untouchable look: a cool translucent veil over the whole lane (clips, automations, MIDI lane)
+            dl->AddRectFilled(ImVec2(bodyMin.x, y0), ImVec2(bodyMax.x, y1), IM_COL32(120, 165, 205, 30));
         }
     }
     {   // selection boxes go on top of every lane (clips, automation, MIDI)
@@ -3246,7 +3548,16 @@ void drawArrange(float belowH, float rightW) {
 
         dl->AddRectFilled(r0, r1, i == g_selTrack ? IM_COL32(50, 50, 57, 255) : IM_COL32(36, 36, 40, 255));
         dl->AddRectFilled(r0, ImVec2(r0.x + S(5), r1.y), trackColor(i, 255, t.color));
+        {   // the engine of the track: a faint tint over the header and a solid strip beside the track color
+            const uint32_t er = engineRgb(t.kind);
+            const int ecr = (int)((er >> 16) & 0xFF), ecg = (int)((er >> 8) & 0xFF), ecb = (int)(er & 0xFF);
+            dl->AddRectFilled(ImVec2(r0.x + S(5), r0.y), r1, IM_COL32(ecr, ecg, ecb, 22));
+            dl->AddRectFilled(ImVec2(r0.x + S(5), r0.y), ImVec2(r0.x + S(9), r1.y), IM_COL32(ecr, ecg, ecb, 235));
+            if (ImGui::IsMouseHoveringRect(ImVec2(r0.x, r0.y), ImVec2(r0.x + S(9), r1.y)) && ImGui::IsWindowHovered()) helpTip("%s", engineName(t.kind));
+        }
         if (t.muted) dl->AddRectFilled(ImVec2(r0.x + S(6), r0.y), ImVec2(r1.x, r1.y), IM_COL32(10, 10, 10, 34));
+        if (trackFrozen(t))   // frozen: the header is tinted icy blue; the LOCKED caption is drawn right of the controls (below, next to the meter)
+            dl->AddRectFilled(r0, r1, IM_COL32(110, 165, 205, 26));
         dl->AddLine(ImVec2(r0.x, r1.y), ImVec2(r1.x, r1.y), IM_COL32(12, 12, 14, 255));
 
         // drag handle on the left: drag a track onto another one to change the order
@@ -3268,8 +3579,11 @@ void drawArrange(float belowH, float rightW) {
 
         // per-track meter: one bar per output channel (mono 1, stereo 2, quad 4 ...) and a red clip LED. Always shown: the other elements give way.
         float meterReserve = 0.f;
+        // VST tracks: the width of the plugin that is loaded NOW (the engine's layout was taken at Run,
+        // before a later-loaded 4-out plugin existed). Their peaks come by track id, not by layout index.
+        const int liveVstCh = (t.kind == 3 || t.kind == 4) && vstTrackOutputChannels ? std::max(1, std::min(8, vstTrackOutputChannels(t.id))) : 0;
         for (const LaneMeterInfo& lm : (g_liveCsound ? g_engineMeters : g_idleMeters))
-            if (lm.trackId == t.id) { meterReserve = lm.channels * S(8) + S(12); break; }
+            if (lm.trackId == t.id) { meterReserve = (liveVstCh > 0 ? liveVstCh : lm.channels) * S(8) + S(12); break; }
         if (t.kind == 5) meterReserve = 2 * S(8) + S(12);
         if (t.kind == 7) {   // sample tracks: one meter per output channel the clips use
             const auto ch = g_sampleMeterCh.find(t.id);
@@ -3280,24 +3594,33 @@ void drawArrange(float belowH, float rightW) {
             for (const LaneMeterInfo& lm : layout) {
                 if (lm.trackId != t.id) continue;
                 const float barW = S(6), barGap = S(2);
-                const float totalW = lm.channels * barW + (lm.channels - 1) * barGap;
+                const int nBars = liveVstCh > 0 ? liveVstCh : lm.channels;
+                const float totalW = nBars * barW + (nBars - 1) * barGap;
                 const float mx1 = r1.x - S(8), mx0 = mx1 - totalW;
                 const float top = y0 + S(5), bot = y1 - S(5);
                 if (bot - top > S(4)) {
-                    for (int c = 0; c < lm.channels; ++c) {
+                    for (int c = 0; c < nBars; ++c) {
                         const float bx0 = mx0 + c * (barW + barGap), bx1 = bx0 + barW;
                         const size_t idx = (size_t)(lm.first + c);
                         float db = (g_liveCsound && idx < g_meterDb.size()) ? g_meterDb[idx] : -90.f;
                         bool clipped = idx < g_meterClipHold.size() && g_meterClipHold[idx] > 0.f;
-                        if(t.kind==6 && c<2) {
+                        if(t.kind==6 && c<8) {
                             auto it=g_pdMeterDb.find(t.id);
-                            db=it==g_pdMeterDb.end()?-90.f:it->second[c];clipped=db>=0.f;
+                            db=it==g_pdMeterDb.end()?-90.f:it->second[(size_t)c];clipped=db>=0.f;
                         }
-                        if((t.kind==3 || t.kind==4) && g_vstEngineOn && c<2) {   // VSTi AND VSTe render in the VST engine, not in the Csound layout - the VSTe lane meter reads the same rack peaks
+                        const int vstMaxCh = 8;   // one bar per plugin output channel in both output modes
+                        if ((t.kind == 3 || t.kind == 4) && c >= lm.channels) { db = -90.f; clipped = false; }   // beyond the Run-time layout: never read the next track's meter slot
+                        if((t.kind==3 || t.kind==4) && (g_vstEngineOn || g_liveCsound) && c<vstMaxCh) {   // VST tracks: always by TRACK ID (both racks publish per-track peaks) - never by a slot index that a width change shifts
                             auto it=g_vstMeterDb.find(t.id);
-                            db=it==g_vstMeterDb.end()?-90.f:it->second[c];clipped=db>=0.f;
+                            db=it==g_vstMeterDb.end()?-90.f:it->second[(size_t)c];clipped=db>=0.f;
                         }
-                        const bool grayMeter = lm.csoundOnly || trackConsumedByMasterVste(g_proj, t);   // a master-mode (replace) VSTe suppresses this source's own master output: its meter goes gray
+                        bool grayMeter = lm.csoundOnly || trackConsumedByMasterVste(g_proj, t);   // a master-mode (replace) VSTe suppresses this source's own master output: its meter goes gray
+                        if (trackFrozen(t)) {   // locked: the WAV voice rides the sample engine - the level is live, gray like a consumed source (the engines behind the lock are stopped)
+                            auto sit = g_sampleMeterDb.find(t.id);
+                            db = (sit != g_sampleMeterDb.end() && c < (int)sit->second.size()) ? sit->second[(size_t)c] : -100.f;
+                            clipped = db >= 0.f;
+                            grayMeter = true;
+                        }
                         drawLedMeter(dl, bx0, bx1, top, bot, db, clipped, grayMeter);
                     }
                 }
@@ -3306,23 +3629,34 @@ void drawArrange(float belowH, float rightW) {
         }
         if (t.kind == 5) {
             const auto it = g_scMeterDb.find(t.id);
-            const float barW = S(6), gap = S(2), totalW = 2 * barW + gap;
+            const int channels = scTrackMeterChannels(t);   // the meter follows the clip code's channel count
+            const float barW = S(6), gap = S(2), totalW = (float)channels * barW + (float)(channels - 1) * gap;
             const float mx1 = r1.x - S(8), mx0 = mx1 - totalW;
             const float top = y0 + S(5), bot = y1 - S(5);
-            const std::array<float, 2> values = it == g_scMeterDb.end()
-                ? std::array<float, 2>{-100.f, -100.f} : it->second;
+            if (it == g_scMeterDb.end()) {
+                g_scMeterDb[t.id].fill(-100.f);
+            }
+            std::array<float, ScEngine::slotStride> values{};
+            values.fill(-100.f);
+            if (it != g_scMeterDb.end()) values = it->second;
+            if (trackFrozen(t)) {   // locked: the WAV voice rides the sample engine - live level, gray like a consumed source
+                const auto sit = g_sampleMeterDb.find(t.id);
+                for (int channel = 0; channel < 2; ++channel)
+                    values[(size_t)channel] = (sit != g_sampleMeterDb.end() && channel < (int)sit->second.size()) ? sit->second[(size_t)channel] : -100.f;
+            }
             if (bot - top > S(4)) {
-                for (int channel = 0; channel < 2; ++channel) {
-                    const float x0 = mx0 + channel * (barW + gap);
+                for (int channel = 0; channel < channels; ++channel) {
+                    const float x0 = mx0 + (float)channel * (barW + gap);
                     const float x1 = x0 + barW;
-                    drawLedMeter(dl, x0, x1, top, bot, values[static_cast<size_t>(channel)],
-                                 values[static_cast<size_t>(channel)] >= 0.f, false);
+                    drawLedMeter(dl, x0, x1, top, bot, values[(size_t)channel],
+                                 values[(size_t)channel] >= 0.f,
+                                 trackFrozen(t) || trackConsumedByMasterVste(g_proj, t));   // FX only: a consumed source's meter is gray like the other source tracks
                 }
                 ImGui::PushID(700000 + i);
                 ImGui::SetCursorScreenPos(ImVec2(mx0, top));
                 ImGui::InvisibleButton("##sc_engine_meter", ImVec2(totalW, bot - top));
                 if (ImGui::IsItemHovered())
-                    helpTip("Live left/right peaks for this SC track. CAW routes the common ~cawgroup / Out.ar(0, ...) patterns to this track's isolated bus.");
+                    helpTip("Live per-channel peaks for this SC track. The meter follows the clip code's channel count (Out.ar arrays / ! N, up to %d channels). CAW routes the common ~cawgroup / Out.ar(0, ...) patterns to this track's isolated bus.", ScEngine::slotStride);
                 ImGui::PopID();
             }
         }
@@ -3340,8 +3674,9 @@ void drawArrange(float belowH, float rightW) {
                     const float x1 = x0 + barW;
                     float db = -100.f;
                     if (it != g_sampleMeterDb.end() && channel < (int)it->second.size()) db = it->second[(size_t)channel];
-                    // FX only (master-replace) VSTe consumes this sample track: its own master output is replaced, so the meter goes gray (like the other source tracks)
-                    drawLedMeter(dl, x0, x1, top, bot, db, db >= 0.f, trackConsumedByMasterVste(g_proj, t));
+                    // FX only (master-replace) VSTe consumes this sample track: its own master output is replaced, so the meter goes gray (like the other source tracks).
+                    // A locked track is gray too: the WAV voice rides the sample engine, the engines behind the lock are stopped.
+                    drawLedMeter(dl, x0, x1, top, bot, db, db >= 0.f, trackConsumedByMasterVste(g_proj, t) || trackFrozen(t));
                 }
                 ImGui::PushID(700000 + i);
                 ImGui::SetCursorScreenPos(ImVec2(mx0, top));
@@ -3352,10 +3687,53 @@ void drawArrange(float belowH, float rightW) {
             }
         }
 
+        // frozen tracks: the LOCKED caption takes its own reserve between the controls and the meter
+        // (meterReserve feeds the name width and rowRight, so nothing can slide under the caption)
+        if (trackFrozen(t)) {
+            meterReserve += ImGui::CalcTextSize("LOCKED").x + S(12);
+            const ImVec2 ls = ImGui::CalcTextSize("LOCKED");
+            dl->AddText(ImVec2(r1.x - meterReserve + S(6), (y0 + y1) * 0.5f - ls.y * 0.5f), IM_COL32(150, 200, 235, 190), "LOCKED");
+        }
+
         const float fh = ImGui::GetFrameHeight();
+        const float rowY1 = y0 + S(6);                              // row-1 top (the name input sits here)
+        // Header controls use Button (never SmallButton - its label pins to the text baseline). The
+        // strip's height is the project's t.height (y1 = yTop + S(t.height)) while the widgets' natural
+        // height comes from the ImGui style (fh) - two different sources - so the buttons take what the
+        // strip actually offers (never under one text line; taller tracks grow them back up to fh).
+        const float row2Y = y0 + S(6) + fh + S(4);
+        const float row2H = std::max(ImGui::GetFontSize(), std::min(fh, y1 - row2Y - S(4)));
+        // ---- exact vertical label centering ----
+        // ImGui cuts every text origin to the whole-pixel grid (ImFont::RenderText does IM_TRUNC on pos;
+        // InputText draws its label at frame_bb.Min + FramePadding and the same truncation follows), so
+        // a fractional FramePadding.y can never land a label dead-center: the sub-pixel part of
+        // top + padding is simply cut off - that is why the labels never sat perfectly in center. The
+        // fix: every control gets an integer top, an INTEGER FramePadding.y and an explicit height, so
+        // top + padding is an exact integer (the truncation then changes nothing) and the label's ink
+        // band - measured from the real glyphs (ImFontGlyph Y0/Y1 are text-top-relative) - lands where
+        // it is aimed, with no rounding jitter from one track to the next.
+        auto inkBand = [](const char* label, float& y0min, float& y1max) {
+            ImFont* fnt = ImGui::GetFont();
+            y0min = 1e9f; y1max = -1e9f;
+            for (const char* p = label; *p && !(p[0] == '#' && p[1] == '#'); ++p)
+                if (*p != ' ') {
+                    const ImFontGlyph* g = fnt->FindGlyph((ImWchar)*p);
+                    y0min = std::min(y0min, g->Y0);
+                    y1max = std::max(y1max, g->Y1);
+                }
+            if (y0min > y1max) { y0min = fnt->Ascent - fnt->FontSize * 0.72f; y1max = fnt->Ascent; }   // no ink: cap-height fallback
+        };
+        float inkA0 = 0.f, inkA1 = 0.f;
+        inkBand("A", inkA0, inkA1);                          // the cap band shared by M, S, LKD, SCO, III and the dB digits
+        const float inkMidCap = (inkA0 + inkA1) * 0.5f;      // ink center below the text top; the row's label-line reference
+        const float rowY1q = std::floor(rowY1 + 0.5f);       // whole-pixel tops: with integer paddings the text origins stay exact
+        const float row2Yq = std::floor(row2Y + 0.5f);
+        const float nameLabelTop = rowY1q + std::floor(ImGui::GetStyle().FramePadding.y);   // where the name's label really renders (top + padding, truncated)
+        const float m2 = std::round((row2H - 2.f * inkMidCap) * 0.5f);       // integer row-2 padding: the cap ink lands dead-center
+        const float row2Hq = 2.f * inkMidCap + 2.f * m2;                     // the exact ink-centered box height (row2H +- 1px)
         // the panel hides elements as it gets narrower; the meter stays, the name gives way
-        // row 2 buttons are placed left to right; each one shows only if it still ends before the meter, so they vanish one after another from the right
-        const float rowRight = r1.x - meterReserve;   // the meter's left edge (+ a small gap)
+        // row 1 = name, III (VSTi / VSTe), volume; row 2 = (+), M, S, LKD, SCO
+        const float rowRight = r1.x - meterReserve;   // the meter's (and the LOCKED caption's) left edge (+ a small gap)
         const float btnGap = S(8);
         const ImGuiStyle& gst = ImGui::GetStyle();
         auto smallBtnW = [&](const char* label, float padX) { return ImGui::CalcTextSize(label, nullptr, true).x + padX * 2.f; };
@@ -3371,18 +3749,102 @@ void drawArrange(float belowH, float rightW) {
         const float nameW = std::max(S(48), std::min(S(170), nameRoom));   // the title never disappears
         ImGui::PushID(i);
         {
-            ImGui::SetCursorScreenPos(ImVec2(r0.x + S(16), y0 + S(6)));
+            // row 1: the name, then Show (VSTi / VSTe only), then the volume box
+            ImGui::SetCursorScreenPos(ImVec2(r0.x + S(16), rowY1q));   // whole-pixel top: the name's label origin is exact
             ImGui::SetNextItemWidth(nameW);
+            const bool lockedName = trackFrozen(t);
+            if (lockedName) ImGui::BeginDisabled();   // frozen: the track is locked (the name is part of what was rendered)
             if (inputStr("##name", t.name, 0, nameFilter)) g_selTrack = i;
             if (!ImGui::IsItemActive()) ensureUniqueInstrumentName(i);
+            if (lockedName) ImGui::EndDisabled();
             if (ImGui::IsItemHovered()) helpTip(t.kind == 2 ? "Name of the graph (its lane name in the score). Right-click the track for more." : t.kind == 1 ? "Name of the marker track. Right-click the track for more." : "Lane name. Every clip on the lane is its own instr (right-click a clip to rename it). Right-click the track for more.", t.name.c_str());
         }
-        if (r0.x + S(18) + smallBtnW("+", gst.FramePadding.x) <= rowRight) {   // second row: + (lanes), M, S
-            ImGui::SetCursorScreenPos(ImVec2(r0.x + S(18), y0 + S(6) + fh + S(4)));
+        // row 1 continues right of the name. Each element fits independently (no cascade): a narrow
+        // panel drops the Show button first, the volume stays as long as there is any room for it.
+        // (prevRight / rowFull are the shared variables captured by fitsRow above.)
+        prevRight = r0.x + S(16) + nameW;   // right edge of the last placed row-1 element
+        if ((t.kind == 3 || t.kind == 4) && prevRight + S(8) + smallBtnW("III", S(7)) <= rowRight) {   // VSTi / VSTe: open the plugin window again
+            ImGui::SetCursorScreenPos(ImVec2(std::floor(prevRight + S(8) + 0.5f), nameLabelTop - m2));   // integer top + integer padding: the label lands on the name's own label line
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(std::round(S(7)), m2));   // Button (not SmallButton): the label centers vertically
+            ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.5f, 0.f));   // top-aligned text line: ImGui does not re-center it, so the ink lands exactly on the box center (padding is the integer ink offset)
+            const bool winOpen = [&] {   // a plugin window of the track (effect 1 or a chain stage) is open: the button stays on
+                for (int st = 0; st <= t.vstChainCount(); ++st) {
+                    const auto it = vstui::slots().find(vstui::slotKey(t.id, st));
+                    if (it != vstui::slots().end() && it->second.open) return true;
+                }
+                return false;
+            }();
+            bool btnOn = false;
+            if (winOpen) {
+                const uint32_t er = engineRgb(t.kind);
+                btnOn = true;
+                pushBtnOn(ImVec4(((er >> 16) & 0xFF) / 255.f, ((er >> 8) & 0xFF) / 255.f, (er & 0xFF) / 255.f, 1.f));
+            }
+            const bool showClicked = ImGui::Button("III##vst", ImVec2(0.f, row2Hq));   // explicit height: the cap ink sits exactly on the box center
+            if (btnOn) ImGui::PopStyleColor(3);
+            prevRight = ImGui::GetItemRectMax().x;
+            ImGui::PopStyleVar(2);
+            if (showClicked) vstui::openWindow(t.id);
+            if (ImGui::IsItemHovered()) helpTip(winOpen ? "The plugin window is open - click to bring it up again" : "Open the plugin window: pick the 8 parameters, show the plugin interface");
+        }
+        {   // volume number box in whole dB: double-click to type. 0 dB = unity; stored as linear gain.
+            const float volW = S(52);
+            if (prevRight + S(8) + volW <= rowRight) {
+                const float volPadY = std::round((row2H - ImGui::GetFontSize()) * 0.5f);   // integer: frame height (font + 2*pad) matches row2H
+                ImGui::SetCursorScreenPos(ImVec2(std::floor(prevRight + S(8) + 0.5f), nameLabelTop - volPadY));   // integer top: the digits land on the name's own label line
+                const float before = t.volume;
+                const float dbf = t.volume <= 0.0005f ? -60.f : (float)(20.0 * std::log10(std::max(0.0005, (double)t.volume)));
+                int dbi = (int)std::lround(std::max(-60.f, dbf));
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ImGui::GetStyle().FramePadding.x, volPadY));
+                if (dbIntBox("##trackvol_db", dbi, -60, kMaxVolumeDb, volW, " dB"))   // whole dB, typed (double-click, then type); -60 = silence, no practical upper limit
+                    t.volume = dbi <= -60 ? 0.f : (float)std::pow(10.0, (double)dbi / 20.0);
+                if (!std::isfinite(t.volume) || t.volume < 0.f) t.volume = 0.f;
+                if (std::fabs(t.volume - before) > 1e-6f) {
+                    if (t.kind == 7 || trackFrozen(t)) g_audioVoiceSig.clear();   // sample voices rebuild from the signature on the next tick (frozen tracks carry the fader live)
+                    if (g_vstEngineOn && trackIsVst(t.id)) vstSolo().setTrackVolume(t.id, t.volume);   // the VST fader is live: applied at the master join on the next block
+                }
+                prevRight = ImGui::GetItemRectMax().x;
+                ImGui::PopStyleVar();
+                if (ImGui::IsItemHovered()) helpTip("Track volume in whole dB: double-click, then type (-60 = silence, 0 = unity, no upper limit). Applies to the sample engine voices and the VSTi / VSTe output at the master join; the volume lane multiplies on top.");
+            }
+        }
+        {   // the engine tag (CSD / VSTi / VSTe / SC / PD / SMP ...): a small pill in the engine color, only where there is room
+            const char* tag = engineTag(t.kind);
+            const float tagScale = 0.78f;
+            const ImVec2 ts = ImGui::CalcTextSize(tag);
+            const float tw = ts.x * tagScale + S(10), th = ts.y * tagScale + S(4);
+            if (prevRight + S(8) + tw <= rowRight) {
+                const uint32_t er = engineRgb(t.kind);
+                const float px = std::floor(prevRight + S(8) + 0.5f);
+                const float py = std::floor(rowY1q + (fh - th) * 0.5f + 0.5f);
+                dl->AddRectFilled(ImVec2(px, py), ImVec2(px + tw, py + th), IM_COL32((er >> 16) & 0xFF, (er >> 8) & 0xFF, er & 0xFF, 215), S(3));
+                dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * tagScale, ImVec2(px + S(5), py + S(2)), IM_COL32(18, 18, 22, 255), tag);
+            }
+        }
+        // row 2: (+) lanes, M, S, LKD (freeze / lock), sco - left to right; each one shows only if it
+        // still ends before the meter, so they vanish one after another from the right
+        prevRight = r0.x + S(18);
+        rowFull = false;   // restart the fit cascade for this row
+        if (r0.x + S(18) + smallBtnW("+", gst.FramePadding.x) <= rowRight) {
+            const float plusW = smallBtnW("+", gst.FramePadding.x);   // same width the font "+" button had
+            ImGui::SetCursorScreenPos(ImVec2(std::floor(r0.x + S(18) + 0.5f), row2Yq));
             // one (+) icon only: it opens the list that adds the automation lanes and the MIDI track.
             // (the old fold arrow was removed - the - on a lane removes the lane, so the pair covers everything)
             // the + works for every track kind: SuperCollider reads lanes with ~cawget, Pure Data with [r $0-cawget-name]
-            const bool plusClicked = ImGui::SmallButton("+");
+            // The + is DRAWN (two strokes) instead of printed from the font: a font glyph's ink box is rounded
+            // to whole pixels (and the font scale moves it), so a symbol this small never sat exactly in the middle.
+            const bool plusClicked = ImGui::Button("##plus", ImVec2(plusW, row2Hq));
+            {
+                const ImVec2 bmin = ImGui::GetItemRectMin(), bmax = ImGui::GetItemRectMax();
+                const float span = std::max(4.f, std::round(ImGui::GetFontSize() * 0.5f));   // total arm length
+                const float th = (((int)std::round(bmax.y - bmin.y)) % 2 == 0) ? 2.f : 1.f;   // stroke thickness: even box height -> 2px, odd -> 1px (the stroke then centers on whole pixels)
+                const float cx = (bmin.x + bmax.x) * 0.5f, cy = (bmin.y + bmax.y) * 0.5f;
+                const float x0 = std::round(cx - span * 0.5f), y0p = std::round(cy - th * 0.5f);
+                const float cxi = std::round(cx - th * 0.5f), y0v = std::round(cy - span * 0.5f);
+                const ImU32 pc = ImGui::GetColorU32(ImGuiCol_Text);
+                dl->AddRectFilled(ImVec2(x0, y0p), ImVec2(x0 + span, y0p + th), pc);        // horizontal stroke
+                dl->AddRectFilled(ImVec2(cxi, y0v), ImVec2(cxi + th, y0v + span), pc);      // vertical stroke
+            }
             prevRight = ImGui::GetItemRectMax().x;
             if (plusClicked) ImGui::OpenPopup("add_automation_lane");
             if (ImGui::IsItemHovered()) helpTip("Add automation lanes and the MIDI lane (the - on a lane removes it)");
@@ -3425,7 +3887,10 @@ void drawArrange(float belowH, float rightW) {
                 // underflowed ImGui's style stack on every click and recolored ALL buttons of the project.
                 const bool wasMuted = t.muted;
                 if (wasMuted) pushBtnOn(ImVec4(0.48f, 0.20f, 0.18f, 1.f));
-                const bool mClicked = ImGui::SmallButton("M");
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(std::round(gst.FramePadding.x), m2));   // Button (not SmallButton): the label centers vertically
+                ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.5f, 0.f));   // top-aligned text line: ImGui does not re-center it, so the ink lands exactly on the box center (padding is the integer ink offset)
+                const bool mClicked = ImGui::Button("M", ImVec2(0.f, row2Hq));
+                ImGui::PopStyleVar(2);
                 prevRight = ImGui::GetItemRectMax().x;
                 if (mClicked) { t.muted = !wasMuted; if (t.muted) t.solo = false; pushVstActiveLive(); }   // mute and solo are exclusive; push live so VSTe tracks react without a restart
                 if (wasMuted) ImGui::PopStyleColor(3);
@@ -3435,53 +3900,72 @@ void drawArrange(float belowH, float rightW) {
                 ImGui::SameLine(0, S(8));
                 const bool wasSolo = t.solo;
                 if (wasSolo) pushBtnOn(ImVec4(0.20f, 0.42f, 0.24f, 1.f));
-                const bool sClicked = ImGui::SmallButton("S");
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(std::round(gst.FramePadding.x), m2));   // Button (not SmallButton): the label centers vertically
+                ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.5f, 0.f));   // top-aligned text line: ImGui does not re-center it, so the ink lands exactly on the box center (padding is the integer ink offset)
+                const bool sClicked = ImGui::Button("S", ImVec2(0.f, row2Hq));
+                ImGui::PopStyleVar(2);
                 prevRight = ImGui::GetItemRectMax().x;
                 if (sClicked) { t.solo = !wasSolo; if (t.solo) t.muted = false; pushVstActiveLive(); }   // mute and solo are exclusive; push live so VSTe tracks react without a restart
                 if (wasSolo) ImGui::PopStyleColor(3);
                 if (ImGui::IsItemHovered()) helpTip(t.solo ? "Unsolo track" : "Solo track (turns mute off)");
             }
-            {   // volume number box in dB: drag or double-click to type. 0 dB = unity; stored as linear gain.
-                const float volW = S(52);
-                if (fitsRow(volW)) {
-                    ImGui::SameLine(0, S(8));
-                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(S(2), 0.f));
-                    ImGui::SetNextItemWidth(volW);
-                    const float before = t.volume;
-                    float dbf = t.volume <= 0.0005f ? -60.f : (float)(20.0 * std::log10(std::max(0.0005, (double)t.volume)));
-                    dbf = std::min(6.f, std::max(-60.f, dbf));
-                    if (ImGui::InputFloat("##trackvol_db", &dbf, 0.0f, 0.0f, "%.1f dB"))   // typing only (drag was not smooth): double-click / click the value and type
-                        t.volume = dbf <= -60.4f ? 0.f : (float)std::pow(10.0, (double)dbf / 20.0);
-                    t.volume = std::max(0.f, std::min(2.f, t.volume));
-                    if (std::fabs(t.volume - before) > 1e-6f && t.kind == 7) g_audioVoiceSig.clear();   // sample voices rebuild from the signature on the next tick
-                    prevRight = ImGui::GetItemRectMax().x;
-                    ImGui::PopStyleVar();
-                    if (ImGui::IsItemHovered()) helpTip("Track volume in dB: drag, or double-click / Ctrl-click to type (-60 to +6, 0 = unity). Applies to the sample engine; other engines follow.");
-                }
-            }
-            if ((t.kind == 3 || t.kind == 4) && fitsRow(smallBtnW("Show", S(7)))) {   // VSTi / VSTe: open the plugin window again
+            if ((trackCanFreeze(t) || t.kind == 4) && fitsRow(smallBtnW("LKD", gst.FramePadding.x))) {   // freeze (Cubase-style lock): render the track (or the rack with its sources) into a WAV and lock it
                 ImGui::SameLine(0, S(8));
-                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(S(7), 0.f));
-                const bool showClicked = ImGui::SmallButton("Show##vst");
+                const bool wasFrozen = trackFrozen(t);
+                if (wasFrozen) pushBtnOn(ImVec4(0.28f, 0.50f, 0.66f, 1.f));   // icy blue: the track is locked (untouchable)
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(std::round(gst.FramePadding.x), m2));   // Button (not SmallButton): the label centers vertically
+                ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.5f, 0.f));   // top-aligned text line: ImGui does not re-center it, so the ink lands exactly on the box center (padding is the integer ink offset)
+                const bool fClicked = ImGui::Button("LKD", ImVec2(0.f, row2Hq));
+                ImGui::PopStyleVar(2);
                 prevRight = ImGui::GetItemRectMax().x;
-                ImGui::PopStyleVar();
-                if (showClicked) vstui::openWindow(t.id);
-                if (ImGui::IsItemHovered()) helpTip("Open the plugin window: pick the 8 parameters, show the plugin interface");
+                if (fClicked && !freezeActive()) {
+                    if (t.kind == 4) {   // the rack: its sound is the sources through the plugins - the dialog plans the render-and-lock
+                        if (wasFrozen) freezeUnfreeze(i);
+                        else { g_freezeVsteAsk = i; g_freezeVsteOpen = true; ImGui::OpenPopup("##freeze_vste_ask"); }
+                    } else if (wasFrozen) {
+                        freezeUnfreeze(i);
+                    } else {
+                        // The freeze renders OFFLINE for kinds 0 / 3 / 5 / 6 / 7 (no live engine needed);
+                        // kind 5 needs sclang.exe + scsynth.exe (scNrtAvailable logs why when missing).
+                        // Real-time render mode (Settings > Audio): the LIVE engines are the renderer,
+                        // so kind 5 needs the SC engine up instead of the NRT tools.
+                        const char* warnEng = "";
+                        bool down = false;
+                        if (t.kind == 5 && (g_proj.cs.renderMode == 1 ? !g_scReady : !scNrtAvailable())) { down = true; warnEng = g_proj.cs.renderMode == 1 ? "SuperCollider (DSP)" : "SuperCollider"; }
+                        else if (t.kind == 0 && !g_langCsound && (!engineIsUp() || !g_useCsoundApi)) { down = true; warnEng = "Csound (DSP)"; }
+                        if (down) {
+                            g_freezeWarnTrack = i;
+                            g_freezeWarnOpen = true;
+                            ImGui::OpenPopup("##freeze_need_engine");
+                        } else {
+                            freezeTrackBegin(i);   // falls back to the real-time capture with a log line if the offline host is unavailable
+                        }
+                    }
+                }
+                if (wasFrozen) ImGui::PopStyleColor(3);
+                if (ImGui::IsItemHovered()) helpTip(wasFrozen
+                    ? (t.kind == 4
+                        ? "Unlock the rack: delete the rendered WAV - the sources play live through the plugins again (you can edit them)"
+                        : "Unlock the track: delete the rendered WAV - the engines play the track live again (you can edit it)")
+                    : (t.kind == 4
+                        ? "Lock the rack: render its current sources through the plugins into one WAV, without freezing the sources first. Much less CPU; the sources are muted until you unlock the rack."
+                        : "Lock the track (freeze): render the whole track into a WAV file and lock it. The engines stop processing the track (much less CPU) and the WAV plays instead. The track cannot be edited until you unlock it. Mute / solo and the volume fader keep working."));
             }
-            if (fitsRow(smallBtnW("sco", S(7)))) {
+            if (fitsRow(smallBtnW("SCO", S(7)))) {
                 ImGui::SameLine(0, S(8));
-                { ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(S(7), 0.f));
-                  const bool scoClicked = ImGui::SmallButton("sco##trk");
+                { ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(std::round(S(7)), m2));   // Button (not SmallButton): the label centers vertically
+                  ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.5f, 0.f));   // top-aligned text line: ImGui does not re-center it, so the ink lands exactly on the box center (padding is the integer ink offset)
+                  const bool scoClicked = ImGui::Button("SCO##trk", ImVec2(0.f, row2Hq));   // explicit height: the cap ink sits exactly on the box center
                   prevRight = ImGui::GetItemRectMax().x;
                   if (scoClicked) ImGui::OpenPopup("track_score_popup");
-                  ImGui::PopStyleVar(); }
+                  ImGui::PopStyleVar(2); }
                 if (ImGui::IsItemHovered()) helpTip(t.kind == 2 ? "Score: the lane of the whole graph. Give it the same name as another track and the graph is drawn in that track's lane (overlap or separated)." : "Score: the name of this track lane (the same name = the same lane) and how it shows");
                 if (ImGui::BeginPopup("track_score_popup")) { drawTrackScoreMenu(t); ImGui::EndPopup(); }
             }
         }
         ImGui::PopID();
         if (ImGui::IsMouseHoveringRect(r0, r1) && ImGui::IsMouseClicked(0) && edgeTrack < 0) g_selTrack = i;
-        if (ImGui::IsMouseHoveringRect(r0, r1) && ImGui::IsMouseClicked(1)) { g_ctxTrack = i; g_selTrack = i; ImGui::OpenPopup("##track_ctx"); }
+        if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(r0, r1) && ImGui::IsMouseClicked(1)) { g_ctxTrack = i; g_selTrack = i; ImGui::OpenPopup("##track_ctx"); }
 
         float laneTop = y1;
         int automationLaneIndex = 0;
@@ -3551,10 +4035,15 @@ void drawArrange(float belowH, float rightW) {
                             std::isfinite(p.value) && p.max > p.min && p.step > 0) {
                             p.value = quantizeAutomation(p.value, p);
                             t.automationRanges[channel] = p;
+                            // the dots follow the new range: a 1200 dot under a new maximum of 700 becomes 700 (what
+                            // the lane shows is what plays). Values inside the range are left exactly as they were.
+                            const auto dots = t.automation.find(channel);
+                            if (dots != t.automation.end())
+                                for (AutoPoint& d : dots->second) d.v = std::min(p.max, std::max(p.min, d.v));
                         }
                         if (!(p.max > p.min) || !(p.step > 0))
                             ImGui::TextDisabled("Maximum must exceed minimum, and step must be positive.");
-                        ImGui::TextDisabled("Restart Csound to apply range changes to playback.");
+                        ImGui::TextDisabled("Dots outside the new range are clamped to it. Restart Csound to apply range changes to playback.");
                         ImGui::EndPopup();
                     }
                 }
@@ -3654,11 +4143,19 @@ void drawArrange(float belowH, float rightW) {
                     }
                 }
                 if (showAutoSco) {   // put this automation in the printed score
-                    ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(82), laneTop + S(2)));
+                    const ImFontGlyph* ga = ImGui::GetFont()->FindGlyph((ImWchar)'A');
+                    const float inkMidCapL = (ga->Y0 + ga->Y1) * 0.5f;   // the cap band's ink center below the text top
+                    const float scoPadX = std::round(ImGui::GetStyle().FramePadding.x);
+                    const float scoW = ImGui::CalcTextSize("SCO").x + scoPadX * 2.f;   // "SCO" (caps) is wider than the old fixed slot: auto width, same right edge the S(34) button ended at
+                    const float scoPadY = std::round((ImGui::GetFrameHeight() - 2.f * inkMidCapL) * 0.5f);   // integer padding + explicit height: the cap ink lands dead-center
+                    const float scoHq = 2.f * inkMidCapL + 2.f * scoPadY;
+                    ImGui::SetCursorScreenPos(ImVec2(std::floor(bodyMin.x - S(48) - scoW + 0.5f), std::floor(laneTop + S(2) + 0.5f)));
                     const auto sm = t.scoreAuto.find(channel);
                     const int smode = sm == t.scoreAuto.end() ? 1 : sm->second;
                     if (smode > 0) pushBtnOn(ImVec4(0.93f, 0.50f, 0.15f, 0.85f));
-                    if (ImGui::Button("sco##auto", ImVec2(S(34), 0))) ImGui::OpenPopup("auto_score_popup");
+                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(scoPadX, scoPadY));
+                    if (ImGui::Button("SCO##auto", ImVec2(0.f, scoHq))) ImGui::OpenPopup("auto_score_popup");
+                    ImGui::PopStyleVar();
                     if (smode > 0) ImGui::PopStyleColor(3);
                     if (ImGui::IsItemHovered()) helpTip("Score: this automation gets its own lane in the printed score (orange = on)");
                     if (ImGui::BeginPopup("auto_score_popup")) { drawAutoScoreMenu(t, channel); ImGui::EndPopup(); }
@@ -3692,7 +4189,7 @@ void drawArrange(float belowH, float rightW) {
                 ImGui::PopID();
                 ImGui::PopID();
                 if (ImGui::IsMouseHoveringRect(la, lb) && ImGui::IsMouseClicked(0) && edgeTrack < 0 && edgeAutomationTrack < 0) g_selTrack = i;
-                if (ImGui::IsMouseHoveringRect(la, lb) && ImGui::IsMouseClicked(1) && edgeTrack < 0 && edgeAutomationTrack < 0) {
+                if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(la, lb) && ImGui::IsMouseClicked(1) && edgeTrack < 0 && edgeAutomationTrack < 0) {
                     g_selTrack = i;   // right-click selects the lane and opens its menu
                     g_ctxAutoTrack = i;
                     g_ctxAutoChannel = channel;
@@ -3710,10 +4207,18 @@ void drawArrange(float belowH, float rightW) {
             dl->AddLine(ml0, ImVec2(ml1.x, midiTop), IM_COL32(12, 12, 14, 255));
             dl->AddText(ImVec2(ml0.x + S(16), midiTop + S(4)), IM_COL32(195, 195, 205, 255), "MIDI track");
             const float midiTitleEnd = ml0.x + S(16) + ImGui::CalcTextSize("MIDI track").x + S(8);
-            if (bodyMin.x - S(80) >= midiTitleEnd) {
+            const ImFontGlyph* ga = ImGui::GetFont()->FindGlyph((ImWchar)'A');
+            const float inkMidCapM = (ga->Y0 + ga->Y1) * 0.5f;   // the cap band's ink center below the text top
+            const float midiScoPadX = std::round(ImGui::GetStyle().FramePadding.x);
+            const float midiScoW = ImGui::CalcTextSize("SCO").x + midiScoPadX * 2.f;   // "SCO" (caps): auto width instead of the old S(34) slot
+            const float midiScoPadY = std::round((ImGui::GetFrameHeight() - 2.f * inkMidCapM) * 0.5f);   // integer padding + explicit height: the cap ink lands dead-center
+            const float midiScoH = 2.f * inkMidCapM + 2.f * midiScoPadY;
+            if (bodyMin.x - S(46) - midiScoW >= midiTitleEnd) {
                 ImGui::PushID(i);
-                ImGui::SetCursorScreenPos(ImVec2(bodyMin.x - S(80), midiTop + S(2)));
-                if (ImGui::Button("sco##midi_score", ImVec2(S(34), 0))) ImGui::OpenPopup("midi_score_popup");
+                ImGui::SetCursorScreenPos(ImVec2(std::floor(bodyMin.x - S(46) - midiScoW + 0.5f), std::floor(midiTop + S(2) + 0.5f)));   // same right edge the S(34) button ended at; whole-pixel top
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(midiScoPadX, midiScoPadY));
+                if (ImGui::Button("SCO##midi_score", ImVec2(0.f, midiScoH))) ImGui::OpenPopup("midi_score_popup");
+                ImGui::PopStyleVar();
                 if (ImGui::IsItemHovered()) helpTip("Score: the name of the MIDI lane (the same name = the same lane) and how the notes show");
                 if (ImGui::BeginPopup("midi_score_popup")) { drawMidiScoreMenu(t); ImGui::EndPopup(); }
                 ImGui::PopID();
@@ -3775,7 +4280,7 @@ void drawArrange(float belowH, float rightW) {
         pruneFolders();
     }
 
-    if (ImGui::IsMouseHoveringRect(hdrMin, hdrMax) && ImGui::IsMouseClicked(1) && m.y >= yTop[(size_t)nT] && !ImGui::IsPopupOpen("##track_ctx")) { g_ctxTrack = -1; ImGui::OpenPopup("##track_ctx"); }
+    if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(hdrMin, hdrMax) && ImGui::IsMouseClicked(1) && m.y >= yTop[(size_t)nT] && !ImGui::IsPopupOpen("##track_ctx")) { g_ctxTrack = -1; ImGui::OpenPopup("##track_ctx"); }
     if (ImGui::BeginPopup("##track_ctx")) {
         // Every kind of track can be added whatever the session list says: an unchecked engine
         // is only not RUN (code it now, enable the engine in Settings > Engines to hear it).
@@ -3888,6 +4393,10 @@ void drawArrange(float belowH, float rightW) {
 
     if (del >= 0 && del < (int)g_proj.tracks.size()) {
         const int removedId = g_proj.tracks[(size_t)del].id;
+        if (trackFrozen(g_proj.tracks[(size_t)del])) {   // a frozen track takes its rendered WAV with it
+            std::error_code rmEc;
+            std::filesystem::remove(std::filesystem::u8path(g_proj.tracks[(size_t)del].freezePath), rmEc);
+        }
         g_proj.tracks.erase(g_proj.tracks.begin() + del);
         pruneFolders();
         if (g_autoDragTrackId == removedId) { g_autoDragTrackId = -1; g_autoDragPoint = -1; g_autoDragChannel.clear(); }
@@ -3931,6 +4440,9 @@ void drawArrange(float belowH, float rightW) {
                     std::string err;
                     if (const auto data = audioClipData(ac, err)) { ac.audioSegs.push_back({0.0, data->duration()}); ac.dur = std::max(0.05, data->duration()); }
                 }
+                if (ImGui::MenuItem("Edit sample...")) { openSoundEditor(ac.id, ac.audioView); ImGui::CloseCurrentPopup(); }   // opens the editor in the clip's current view (waveshape / spectrogram)
+                if (ImGui::IsItemHovered()) helpTip("A big window with its own timeline: zoom down to single samples, select, cut, fade, normalize and save the file. The editor opens in the clip's chosen view (waveshape / spectrogram below).");
+                ImGui::Separator();
                 int view = ac.audioView;
                 const char* views[] = {"Waveshape", "Spectrogram"};
                 ImGui::SetNextItemWidth(S(170));
@@ -4211,6 +4723,165 @@ void drawArrange(float belowH, float rightW) {
     ImGui::SetCursorScreenPos(org);
     ImGui::Dummy(avail);
     endChildTight();
+
+    // TRACK FREEZE: the render pass runs as a modal - the user cannot edit while the pass rolls
+    {
+        const ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+        ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(S(420), 0.f));
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                       ImGuiWindowFlags_NoCollapse |
+                                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar;
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.09f, 0.10f, 0.13f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.30f, 0.50f, 0.66f, 1.f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.f);
+        if (freezeActive() && !ImGui::IsPopupOpen("##freeze_progress")) ImGui::OpenPopup("##freeze_progress");
+        if (ImGui::BeginPopupModal("##freeze_progress", nullptr, flags)) {
+            if (freezeActive()) {
+                ImGui::TextColored(ImVec4(0.55f, 0.78f, 0.92f, 1.f), "Freezing track \"%s\"...", freezeTrackName().c_str());
+                if (freezeOffline())
+                    ImGui::TextDisabled("OFFLINE render: silent, running as fast as the CPU allows (no playback). SC / PD / VSTe racks still render in real time.");
+                else
+                    ImGui::TextDisabled("Rendering the whole track into a WAV file. The playhead runs through the range once; the engines play only this track while it renders.");
+                ImGui::Spacing();
+                ImGui::ProgressBar(freezeProgress(), ImVec2(-FLT_MIN, S(16)));
+                ImGui::Spacing();
+                ImGui::TextDisabled("Freeze keeps the volume fader live; mute / solo keep working. Everything else is locked until you unfreeze the track.");
+                ImGui::Separator();
+                if (ImGui::Button("Cancel")) { freezeCancel(); ImGui::CloseCurrentPopup(); }
+            } else {
+                ImGui::CloseCurrentPopup();   // the pass finished (or was cancelled) elsewhere
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+    }
+    {   // TRACK LOCK: the engine is down - a lock renders the track LIVE, so there is nothing to capture yet
+        const ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+        ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(S(440), 0.f));
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                       ImGuiWindowFlags_NoCollapse |
+                                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar;
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.11f, 0.09f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.66f, 0.50f, 0.25f, 1.f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.f);
+        if (g_freezeWarnOpen && !ImGui::IsPopupOpen("##freeze_need_engine")) ImGui::OpenPopup("##freeze_need_engine");
+        if (ImGui::BeginPopupModal("##freeze_need_engine", &g_freezeWarnOpen, flags)) {
+            if (g_freezeWarnTrack < 0 || g_freezeWarnTrack >= (int)g_proj.tracks.size()) {
+                ImGui::CloseCurrentPopup();
+                g_freezeWarnOpen = false;
+            } else {
+                const Track& wt = g_proj.tracks[(size_t)g_freezeWarnTrack];
+                const char* engName = "";
+                const char* runLabel = "";
+                bool down = false;
+                if (wt.kind == 0 && !engineIsUp()) { down = true; engName = "Csound (DSP)"; runLabel = "Run DSP"; }
+                else if (wt.kind == 3 && !g_vstEngineOn) { down = true; engName = "The VST engine"; runLabel = "Run VST"; }
+                else if (wt.kind == 5 && !g_scReady) { down = true; engName = "SuperCollider"; runLabel = "Run SuperCollider"; }
+                else if (wt.kind == 6 && !g_pdEngineOn && !g_mixedPd) { down = true; engName = "Pure Data (DSP)"; runLabel = "Run DSP"; }
+                else if (wt.kind == 7 && !g_sampleEngineOn) { down = true; engName = "The sample engine"; runLabel = "Run Sample"; }
+                if (!down && wt.kind == 0 && !g_useCsoundApi) {   // the external csound process renders outside CAW: nothing to capture
+                    ImGui::TextColored(ImVec4(0.92f, 0.68f, 0.30f, 1.f), "Csound can't render online in the external csound process mode.");
+                    ImGui::TextDisabled("A lock renders the track live through CAW's Csound API engine. Switch CAW to its API engine (the external csound process plays outside CAW), run Csound again, then lock the track.");
+                    ImGui::Spacing();
+                    ImGui::TextDisabled("Nothing was changed.");
+                    ImGui::Separator();
+                    if (ImGui::Button("Close")) { ImGui::CloseCurrentPopup(); g_freezeWarnOpen = false; }
+                } else if (!down) {   // the engine came up while the dialog was open
+                    ImGui::TextColored(ImVec4(0.55f, 0.78f, 0.92f, 1.f), "The engine is running now.");
+                    ImGui::TextDisabled("Close this dialog and lock the track again.");
+                    ImGui::Separator();
+                    if (ImGui::Button("Close")) { ImGui::CloseCurrentPopup(); g_freezeWarnOpen = false; }
+                } else {
+                    ImGui::TextColored(ImVec4(0.92f, 0.68f, 0.30f, 1.f), "%s can't render online.", engName);
+                    ImGui::TextDisabled("A lock renders the track LIVE through its engine: run the engine first, then lock the track. Nothing was changed.");
+                    ImGui::Separator();
+                    if (ImGui::Button(runLabel)) {
+                        if (wt.kind == 5) startScEngine();
+                        else if (wt.kind == 3) startVstEngine();
+                        else if (wt.kind == 7) {   // the sample engine has no heavy start: flip it on and open the stream
+                            g_sampleEngineOn = true;
+                            ensureSampleOutput();
+                            logLine("[caw] Sample engine running: the sample clips play with Play.");
+                        }
+                        else startEngine();   // Csound (DSP), Pure Data (DSP): the shared DSP host stream
+                        ImGui::CloseCurrentPopup();
+                        g_freezeWarnOpen = false;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Close")) { ImGui::CloseCurrentPopup(); g_freezeWarnOpen = false; }
+                }
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+    }
+    {   // TRACK LOCK: render the VSTe's current sources through its plugins and lock only the rack
+        const ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+        ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(S(480), 0.f));
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                       ImGuiWindowFlags_NoCollapse |
+                                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar;
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.09f, 0.10f, 0.13f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.30f, 0.50f, 0.66f, 1.f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.f);
+        if (g_freezeVsteOpen && !ImGui::IsPopupOpen("##freeze_vste_ask")) ImGui::OpenPopup("##freeze_vste_ask");
+        if (ImGui::BeginPopupModal("##freeze_vste_ask", &g_freezeVsteOpen, flags)) {
+            if (g_freezeVsteAsk < 0 || g_freezeVsteAsk >= (int)g_proj.tracks.size()) {
+                ImGui::CloseCurrentPopup();
+                g_freezeVsteOpen = false;
+            } else {
+                const Track& rack = g_proj.tracks[(size_t)g_freezeVsteAsk];
+                ImGui::TextColored(ImVec4(0.55f, 0.78f, 0.92f, 1.f), "Render the effect of \"%s\" (lock the rack)", rack.name.c_str());
+                ImGui::TextDisabled("Locking renders everything OFFLINE (fast - not the playing time): Csound / sample sources render through the Csound offline host, the rack and its VSTi / PD sources render in CAW's C++ VST / PD hosts. The source tracks are not frozen (except Csound / sample / SC sources, which render first). The sources stay muted until you unlock the rack.");
+                const std::vector<int> sources = freezeVsteSources(g_freezeVsteAsk);
+                if (!sources.empty()) {
+                    ImGui::Spacing();
+                    ImGui::TextDisabled("Sources:");
+                    for (int si : sources) {
+                        const Track& st = g_proj.tracks[(size_t)si];
+                        const char* kn = st.kind == 0 ? "Csound" : st.kind == 3 ? "VSTi" : st.kind == 5 ? "SuperCollider" : st.kind == 6 ? "Pure Data" : "Sample";
+                        if (trackFrozen(st)) ImGui::BulletText("%s  (%s, already locked - its WAV feeds the effect)", st.name.c_str(), kn);
+                        else ImGui::BulletText("%s  (%s, rendered directly through the effect)", st.name.c_str(), kn);
+                    }
+                }
+                std::string problem;
+                const bool ready = freezeVsteReady(g_freezeVsteAsk, problem);
+                if (!problem.empty()) {
+                    ImGui::Spacing();
+                    ImGui::TextColored(ImVec4(0.92f, 0.68f, 0.30f, 1.f), "%s", problem.c_str());
+                }
+                ImGui::Separator();
+                if (ready) {
+                    if (ImGui::Button("Render sources through VSTe and lock rack")) {
+                        // try/catch: an exception escaping the frame dies with the whole app with no
+                        // report - whatever the offline/realtime setup hits is logged instead, and
+                        // a half-started pass is cancelled cleanly.
+                        try { freezeVsteRenderAll(g_freezeVsteAsk); }
+                        catch (const std::exception& e) {
+                            if (freezeActive()) freezeCancel();
+                            logLine(std::string("[caw] Rack lock failed with an error: ") + e.what());
+                        } catch (...) {
+                            if (freezeActive()) freezeCancel();
+                            logLine("[caw] Rack lock failed with an unknown error (out of memory?).");
+                        }
+                        ImGui::CloseCurrentPopup();
+                        g_freezeVsteOpen = false;
+                    }
+                    if (ImGui::IsItemHovered()) helpTip("The current sources feed the plugins directly; only the effect's final output is written to a WAV. No source track is frozen.");
+                    ImGui::SameLine();
+                }
+                if (ImGui::Button("Close")) { ImGui::CloseCurrentPopup(); g_freezeVsteOpen = false; }
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+    }
 }
 #include "app.h"
 float catmullRom(float p0, float p1, float p2, float p3, float t) {
@@ -4412,7 +5083,7 @@ void drawEditor() {
                 ImGui::SetNextWindowSize(ImVec2(S(640), S(460)), ImGuiCond_FirstUseEver);
                 ImGui::SetNextWindowPos(ImVec2(S(300), S(150)), ImGuiCond_FirstUseEver);
                 winMaxPrepare(clip.id);
-                if (ImGui::Begin(title.c_str(), &open)) {
+                if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
                     winMaxTitleButton(clip.id);
                     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) g_textEditorFocused = true;   // a code window has focus: Space types, never plays
                     ImGui::SetNextItemWidth(S(150));
@@ -4452,7 +5123,7 @@ void drawEditor() {
                     pushBtnOn(ImVec4(0.20f, 0.42f, 0.24f, 1.f));
                     if (ImGui::Button(dirty ? "Run clip *" : "Run clip")) applySampleClip(clip, lane.id);
                     ImGui::PopStyleColor(3);
-                    if (ImGui::IsItemHovered()) helpTip("Apply this clip's CAW code. With the timeline playing and the playhead inside the clip, the sounding sample restarts with the new code; with the transport stopped, the clip is auditioned once for its duration (Run sample must be on).");
+                    if (ImGui::IsItemHovered()) helpTip("DSP off: Run plays this clip's CAW code once (the sample engine starts if it is off). DSP on: Run is an APPLY button only - the code is applied; a playing window restarts with the new code, nothing else is auditioned.");
                     ImGui::SameLine();
                     midiToggleButton((int)ti, clip, "audio");
                     if (ImGui::IsItemHovered()) helpTip("Sampler mode: the file is NOT played by the timeline any more - it only plays when the playhead reaches a MIDI note of this lane's MIDI lane (the note starts the file with its pitch as the speed; the velocity scales the volume). Draw notes on the MIDI lane below.");
@@ -4489,7 +5160,7 @@ void drawEditor() {
                 ImGui::SetNextWindowSize(ImVec2(S(640), S(440)), ImGuiCond_FirstUseEver);
                 ImGui::SetNextWindowPos(ImVec2(S(300), S(150)), ImGuiCond_FirstUseEver);
                 winMaxPrepare(clip.id);
-                if (ImGui::Begin(title.c_str(), &open)) {
+                if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
                     winMaxTitleButton(clip.id);
                     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
                         g_textEditorFocused = true;
@@ -4517,7 +5188,7 @@ void drawEditor() {
                         else applyScClip(clip);
                     }
                     ImGui::PopStyleColor(3);
-                    if (ImGui::IsItemHovered()) helpTip("Apply / evaluate this SuperCollider clip. With the project playing, Run only applies the code (the timeline keeps playing its windows); with the project stopped, Run plays the clip once for its duration. The timeline playing a clip never changes this button.");
+                    if (ImGui::IsItemHovered()) helpTip("DSP off: Run plays this SuperCollider clip once (it boots the engine and waits for it). DSP on: Run is an APPLY button only - the code becomes what the timeline uses from now on, nothing is auditioned. The timeline playing a clip never changes this button.");
                     ImGui::SameLine();
                     midiToggleButton((int)ti, clip, "sc");
                     ImGui::SameLine();
@@ -4564,7 +5235,7 @@ void drawEditor() {
                 ImGui::SetNextWindowSize(ImVec2(S(640), S(440)), ImGuiCond_FirstUseEver);
                 ImGui::SetNextWindowPos(ImVec2(S(300), S(150)), ImGuiCond_FirstUseEver);
                 winMaxPrepare(clip.id);
-                if (ImGui::Begin(title.c_str(), &open)) {
+                if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
                     winMaxTitleButton(clip.id);
                     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) g_textEditorFocused=true;
                     const ImGuiStyle& st=ImGui::GetStyle();
@@ -4582,18 +5253,13 @@ void drawEditor() {
                     if (running) pushBtnOn(ImVec4(0.85f,0.35f,0.10f,1.f));
                     else pushBtnOn(ImVec4(0.20f,0.42f,0.24f,1.f));
                     if (ImGui::Button(running ? "  Stop  ##pd" : (g_clipCodeDirty.count(clip.id) ? "  Run * ##pd" : "  Run  ##pd"))) {
-                        if (g_timelineRun && (g_pdTimelineMode || g_mixedPd)) {
-                            // Project playing: Run APPLIES the code to the running timeline clip (never auditions,
-                            // never restarts the engine): save the in-memory patch, then force the live replan -
-                            // the changed file stamp makes the engine reload the patch into the running clip.
+                        if (g_pdEngineOn || g_mixedPd) {
+                            // DSP ON: Run is an APPLY button only - save the in-memory patch (and force the live
+                            // replan while the transport plays, so the running clip reloads the changed patch).
+                            // Never auditions, never restarts the engine.
                             for (auto& kv : g_pdPatchBuffers) if (kv.second.dirty()) pd_patch_editor::save(std::filesystem::u8path(kv.first), kv.second);
-                            g_pdPlanT = 1.0;   // the next frame re-plans; the engine reloads the changed patch
+                            if (g_timelineRun && (g_pdTimelineMode || g_mixedPd)) g_pdPlanT = 1.0;   // the next frame re-plans; the engine reloads the changed patch
                             g_clipCodeDirty.erase(clip.id);
-                        } else if(g_mixedPd) {
-                            const auto* event=pd_timeline::find(g_pdTimelineEvents,clip.id);
-                            if(!event)logLine("[caw] This PD clip is not in the current engine plan. Restart the engine after changing its patch, mute or solo state.");
-                            else if(!g_apiProc.auditionPd(*event,!mixedRunning))
-                                logLine("[caw] Wait until the shared PD engine is ready.");
                         } else if (running) stopPdPatch();
                         else {
                             std::filesystem::path patch=std::filesystem::u8path(clip.code);
@@ -4606,7 +5272,7 @@ void drawEditor() {
                         }
                     }
                     ImGui::PopStyleColor(3);
-                    if(ImGui::IsItemHovered())helpTip("Run this patch. Edits are applied with Alt+Enter or Run (SuperCollider-style: nothing is applied while typing).");
+                    if(ImGui::IsItemHovered())helpTip("DSP off: Run plays this patch (the PD preview engine starts if the DSP is off). DSP on: Run is an APPLY button only - the patch is saved into the running engine (a playing clip reloads it), nothing is auditioned. Edits are applied with Alt+Enter or Run (SuperCollider-style: nothing is applied while typing).");
                     ImGui::SameLine();
                     midiToggleButton((int)ti, clip, "pd");
                     ImGui::SameLine();
@@ -4781,7 +5447,7 @@ void drawEditor() {
             const std::string title = "Code editor - " + clip.name + (sharedCount > 1 ? "  (clip at " + std::string(startText) + " s)" : std::string()) +
                                       "###clip_editor_" + std::to_string(clip.id);
             bool open = clip.editorOpen;
-            if (ImGui::Begin(title.c_str(), &open)) {
+            if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
                 winMaxTitleButton(clip.id);
                 if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
                     g_textEditorFocused = true;
@@ -4820,10 +5486,14 @@ void drawEditor() {
                 if (ImGui::Button(clipIsRunning ? "  Stop  " : (codeDirty ? "  Run *  " : "  Run  "))) {
                     if (clipIsRunning) stopClipRun(clip);
                     else if (lane.kind == 3 || lane.kind == 4) applyClipCodeNow(clip, lane);   // VSTi / VSTe: Run pushes the edited code (no Csound round-trip)
-                    else runClip(clip);   // Csound: Run applies the code and plays the clip
+                    else if (engineIsUp()) {   // DSP ON: Run is an APPLY button only - the code goes into the running engine, nothing plays
+                        if (pushClipCodeToEngine(clip)) logLine("[caw] Run clip " + clip.name + ": applied to the running engine (the DSP is on - Play runs the clip).\n");
+                        g_clipCodeDirty.erase(clip.id);
+                    }
+                    else runClip(clip);   // DSP OFF: Run plays the clip (it starts the DSP and fires when the engine is up)
                 }
                 ImGui::PopStyleColor(3);
-                if (ImGui::IsItemHovered()) helpTip(clipIsRunning ? "Stop this clip" : "Play this clip in the running Csound (Run), or run it alone and print the errors. Alt+Enter pushes the edited code into the running engine without replaying (SuperCollider-style: nothing is applied while typing).");
+                if (ImGui::IsItemHovered()) helpTip(clipIsRunning ? "Stop this clip" : "DSP off: Run plays this clip once (it starts the DSP engine and fires when the engine is up). DSP on: Run is an APPLY button only - the edited code goes into the running engine, nothing plays. Alt+Enter pushes the edited code into the running engine without replaying (SuperCollider-style: nothing is applied while typing).");
                 const std::string runLabel = "x-fields";
                 const char* scoreLabel = "Score";
                 const char* shapeLabel = "Automation shape";
@@ -4917,7 +5587,7 @@ void drawEditor() {
             winMaxPrepare(100000 + lane.id);
             const std::string title = "Lane template - " + lane.name + "###lane_template_" + std::to_string(lane.id);
             bool open = lane.editorOpen;
-            if (ImGui::Begin(title.c_str(), &open)) {
+            if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
                 winMaxTitleButton(100000 + lane.id);
                 if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) g_textEditorFocused = true;
                 ImGui::TextDisabled("New clips on lane %s copy this code.", lane.name.c_str());
@@ -4944,6 +5614,82 @@ const char* midiPitchName(int pitch) {
     return text;
 }
 #include "app.h"
+#include <cstdlib>
+namespace {
+struct DbEditState { ImGuiID id = 0; char buf[16] = {0}; char initial[16] = {0}; bool touched = false; int startFrame = 0; };
+DbEditState g_dbEdit;
+int dbEditCallback(ImGuiInputTextCallbackData* d) {
+    // Until the user types / moves the caret / deletes, the WHOLE number stays selected (a click or a drag cannot
+    // make a partial selection). After the first real edit the box behaves like a normal text field.
+    DbEditState* st = (DbEditState*)d->UserData;
+    if (!st->touched) {
+        if (std::strcmp(d->Buf, st->initial) != 0 ||
+            ImGui::IsKeyPressed(ImGuiKey_Backspace) || ImGui::IsKeyPressed(ImGuiKey_Delete) ||
+            ImGui::IsKeyPressed(ImGuiKey_LeftArrow) || ImGui::IsKeyPressed(ImGuiKey_RightArrow) ||
+            ImGui::IsKeyPressed(ImGuiKey_Home) || ImGui::IsKeyPressed(ImGuiKey_End))
+            st->touched = true;
+        else
+            d->SelectAll();
+    }
+    return 0;
+}
+}  // namespace
+bool dbIntBox(const char* id, int& db, int minDb, int maxDb, float width, const char* suffix) {
+    ImGui::PushID(id);
+    const ImGuiID gid = ImGui::GetID("##dbint");
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    bool changed = false;
+    if (g_dbEdit.id != gid) {
+        // display mode: a plain frame with the centered number. One click does nothing; a double-click starts editing.
+        const ImVec2 size(width, ImGui::GetFrameHeight());
+        ImGui::InvisibleButton("##dbint", size);
+        const bool hovered = ImGui::IsItemHovered();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        dl->AddRectFilled(a, b, ImGui::GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg), st.FrameRounding);
+        if (st.FrameBorderSize > 0.f) dl->AddRect(a, b, ImGui::GetColorU32(ImGuiCol_Border), st.FrameRounding, 0, st.FrameBorderSize);
+        char txt[32];
+        std::snprintf(txt, sizeof txt, "%d%s", db, suffix ? suffix : "");
+        const float tw = ImGui::CalcTextSize(txt).x;
+        dl->AddText(ImVec2(std::floor(a.x + (width - tw) * 0.5f + 0.5f), a.y + st.FramePadding.y),   // integer-friendly origin: top + the caller's padding
+                    ImGui::GetColorU32(ImGuiCol_Text), txt);
+        if (hovered && ImGui::IsMouseDoubleClicked(0)) {
+            g_dbEdit.id = gid;
+            std::snprintf(g_dbEdit.buf, sizeof g_dbEdit.buf, "%d", db);
+            std::snprintf(g_dbEdit.initial, sizeof g_dbEdit.initial, "%d", db);
+            g_dbEdit.touched = false;
+            g_dbEdit.startFrame = ImGui::GetFrameCount();
+            ImGui::SetCursorScreenPos(pos);   // the text field takes the same place this frame
+        }
+    }
+    if (g_dbEdit.id == gid) {
+        const int age = ImGui::GetFrameCount() - g_dbEdit.startFrame;
+        if (age <= 1) ImGui::SetKeyboardFocusHere();
+        const float tw = ImGui::CalcTextSize(g_dbEdit.buf).x;
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(std::max(st.FramePadding.x, std::floor((width - tw) * 0.5f)), st.FramePadding.y));
+        ImGui::SetNextItemWidth(width);
+        const bool enter = ImGui::InputText("##dbint", g_dbEdit.buf, sizeof g_dbEdit.buf,
+            ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackAlways,
+            dbEditCallback, &g_dbEdit);
+        ImGui::PopStyleVar();
+        const bool cancel = ImGui::IsKeyPressed(ImGuiKey_Escape);
+        const bool lostFocus = age > 3 && !ImGui::IsItemActive();
+        if (enter || cancel || lostFocus) {
+            if (!cancel) {
+                char* end = nullptr;
+                const long v = std::strtol(g_dbEdit.buf, &end, 10);
+                if (end != g_dbEdit.buf) {   // a real number was typed (an empty box or a lone "-" changes nothing)
+                    const int nv = (int)std::max((long)minDb, std::min((long)maxDb, v));
+                    if (nv != db) { db = nv; changed = true; }
+                }
+            }
+            g_dbEdit.id = 0;
+        }
+    }
+    ImGui::PopID();
+    return changed;
+}
 bool midiZoomSlider(const char* id, float& zoom) {
     ImGui::TextDisabled("-");
     ImGui::SameLine(0, S(4));
@@ -4990,7 +5736,9 @@ void drawMultiMidiEditor() {
     ImGui::SetNextWindowSize(ImVec2(S(1000), S(700)), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(S(280), S(120)), ImGuiCond_FirstUseEver);
     bool open = true;
-    if (ImGui::Begin("MIDI Editor - several clips###midi_multi_editor", &open)) {
+    winMaxPrepareT("MIDI Editor - several clips###midi_multi_editor");
+    if (ImGui::Begin("MIDI Editor - several clips###midi_multi_editor", &open, ImGuiWindowFlags_NoCollapse)) {
+        winMaxTitleButtonT("MIDI Editor - several clips###midi_multi_editor");
         ImGuiIO& io = ImGui::GetIO();
         const ImVec2 mouse = io.MousePos;
         if (ImGui::IsWindowAppearing()) {
@@ -5255,7 +6003,7 @@ void drawMidiEditor() {
         winMaxPrepare(200000 + mc.id);
         const std::string title = "MIDI Editor - " + (mc.name.empty() ? tgt.name : mc.name) + "###midi_editor_clip_" + std::to_string(mc.id);
         bool open = mc.editorOpen;
-        if (ImGui::Begin(title.c_str(), &open)) {
+        if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
             winMaxTitleButton(200000 + mc.id);
             if (ImGui::IsWindowAppearing()) {
                 g_midiScrollX = (float)std::max(0.0, mc.start - 0.25);

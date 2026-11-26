@@ -7,6 +7,7 @@
 // Compact waveform and code-bracket app mark. Kept as geometry so GLFW,
 // Windows/macOS icons and the startup screen can use the same visual.
 namespace caw_brand {
+inline constexpr const char* buildTag = "133_csound_tap_lifetime";
 struct Point { float x, y; };
 inline const Point* points(int& count) {
     static const Point p[] = {

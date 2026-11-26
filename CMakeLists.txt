@@ -161,6 +161,7 @@ endif()
 # ------------------------------------------------------------------ CAW
 set(CAW_SOURCES
   src/app.cpp src/engine_dispatch.cpp src/ui_panels.cpp src/ui_timeline.cpp src/audio_devices.cpp src/csd_builder.cpp src/csound_api_runner.cpp
+  src/ui_sound_editor.cpp
   src/platform.cpp src/process_runner.cpp src/project_io.cpp src/score_svg.cpp src/pd_backend.cpp src/svg_raster.cpp
   ${CAW_TEXTEDITOR_DIR}/TextEditor.cpp
   ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp

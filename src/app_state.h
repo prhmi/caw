@@ -112,9 +112,13 @@ inline double g_scLastPDTimelineTime = -1.0;
 
 inline std::chrono::steady_clock::time_point g_scStartTime{};
 
-inline CawScRing g_scRing;                        // the SuperCollider mix, captured for VSTe "SuperCollider" inputs
+inline CawScRing g_scRing;                        // the whole SuperCollider device mix (mode-2 "master" inputs)
 
 inline std::map<int, std::unique_ptr<CawScRing>> g_sampleRings;
+
+inline std::map<int, std::unique_ptr<CawScRing>> g_scTrackRings;   // per-track-slot SC mix (engine 2): one ring per SuperCollider track
+
+inline std::mutex g_scTrackRingMutex;
 
 inline std::mutex g_sampleRingMutex;
 
@@ -123,6 +127,10 @@ inline std::atomic<bool> g_scRawSuppress{false};  // true while an active master
 inline std::atomic<bool> g_sampleRawSuppress{false};   // true while an active master-mode ("FX only") VSTe consumes a sample track: the raw sample mix is silenced, the effect's output replaces it
 
 inline std::atomic<int> g_sampleDryLatencyComp{0};   // reported latency (samples) of the largest active sample-consuming VSTe: the raw dry mix is delayed by it in mix mode so dry and wet stay in sync
+// Play diagnostics (frozen-track noise hunt): the shared audio callback measures the SuperCollider engine's
+// own mix level and the sample engine's level separately, so a console line can name the noisy source.
+inline std::atomic<float> g_diagScRms{0.f};
+inline std::atomic<float> g_diagCawRms{0.f};
 
 struct DryDelay {
     std::vector<float> buf;
@@ -205,6 +213,8 @@ inline int g_selTrack = -1, g_selClip = -1;
 inline int g_nextTrackId = 1;
 
 inline std::string g_projectPath;
+
+inline bool g_renderInProjectFolder = true;   // lock renders (LKD WAVs) inside the project folder (exports/lkd) vs next to the .caw file (Settings > Engines)
 
 inline std::string g_savedSnap;               // the project as it was when it was last saved / opened (to know if there are unsaved changes)
 
@@ -289,6 +299,9 @@ inline int g_resync = 0;                                 // not 0 = the timeline
 inline std::string g_runName;                            // clip started with "Run clip" in the running engine
 
 inline double g_runLeft = 0.0;                           // seconds until that clip ends by itself
+// Run with the DSP OFF plays the clip: the engine is started and the clip fires when it is up.
+inline int g_csoundPendingClipId = 0;                    // the clip waiting for the DSP to come up
+inline double g_csoundPendingAt = 0.0;                   // when the pending Run was pressed (steady-clock seconds)
 
 inline double g_pdRunLeft = 0.0;                         // SUPERCOLLIDER-STYLE: seconds until the PD Run-clip ends by itself (Run plays the patch for the clip duration, then stops)
 
@@ -403,6 +416,8 @@ inline std::set<int> g_autoSel;              // selected point indices in that l
 inline std::map<std::pair<int, std::string>, std::set<int>> g_autoSelMulti;   // dots picked by a box over several lanes: (track id, channel) -> indices
 
 inline std::vector<AutoPoint> g_autoDragOrig;
+inline std::map<std::pair<int, std::string>, std::vector<AutoPoint>> g_autoDragOrigMulti;   // the other selected lanes as they were when a dot drag began
+inline std::map<std::pair<int, std::string>, std::set<int>> g_dragDots;   // the dots that travel with a clip drag (all lanes)
 
 inline ImVec2 g_autoDragStartMouse;
 
@@ -527,10 +542,9 @@ inline int g_specScale = 0;     // 0 logarithmic, 1 linear
 inline int g_specInterpolation = 1; // 0 linear, 1 cubic
 
 inline int g_specStyle = 0;     // tonal peaks by default
+inline bool g_specBetter = true;   // Better view: calm, readable (default). Realistic: raw and fast.
 
 inline bool g_specGrid = true;
-
-inline bool g_specFast = true;    // analyse only the newest 512 samples: faster response, coarser frequency resolution
 
 inline float g_specMinHz = 25.f, g_specMaxHz = 18000.f;
 
@@ -576,6 +590,11 @@ inline std::string g_renderPath;
 inline std::string g_renderTemp, g_renderEncodedTemp;
 
 inline bool g_renderConverting = false, g_confirmRenderOverwrite = false;
+
+// The DSP-switch gates (popup asks, user request): offline rendering is blocked while the DSP is
+// on, real-time rendering while it is off. The popup offers the switch and continues.
+inline bool g_askDspOffExport = false, g_askDspOnExport = false;
+inline bool g_askDspOffLock = false; inline int g_askDspOffLockTrack = -1;
 
 inline bool g_renderWillOverwrite = false, g_renderWarnVst = false;
 
@@ -643,11 +662,12 @@ inline std::vector<float> g_peakIn(2, 0.f);               // newest peak per met
 
 inline std::vector<float> g_meterDb;                      // smoothed display value per meter index (dB)
 
-inline std::map<int,std::array<float,2>> g_pdMeterDb;       // per-track PD output channel peak dB
+using PdMeterArr = std::array<float,8>;   // one peak per patch channel (up to 8; a stereo patch uses the first two)
+inline std::map<int,PdMeterArr> g_pdMeterDb;       // per-track PD output channel peak dB
 
-inline std::map<int,std::array<float,2>> g_scMeterDb;       // SC engine output peak dB shown on SC track headers
+inline std::map<int,std::array<float,ScEngine::slotStride>> g_scMeterDb;   // SC engine output peak dB per channel, shown on SC track headers
 
-inline std::map<int,std::array<float,2>> g_vstMeterDb;      // VST engine output peak dB shown on VSTi track headers
+inline std::map<int,PdMeterArr> g_vstMeterDb;      // VST engine output peak dB per plugin output channel (up to 8)
 
 inline uint64_t g_pdSnapshotSeq = 0;
 
@@ -676,6 +696,9 @@ inline std::vector<float> g_fftDb;
 inline std::vector<monitor_bands::Band> g_spectrumBands;
 
 inline std::vector<monitor_bands::Band> g_columnBands;
+inline std::vector<float> g_columnHold;   // the static columns' peak-hold caps: jump up instantly, fall slowly
+inline std::vector<float> g_columnDisp;   // the static columns' display smoothing: fast attack, slow release
+inline std::vector<float> g_fftDbDisp;    // the FFT line's display smoothing: fast attack, release-limited fall
 
 inline std::vector<monitor_peaks::Peak> g_tonePeaks;
 
@@ -756,6 +779,10 @@ struct WaveHandleDrag {
     bool active = false; int kind = 0;   // 1 depth, 2 time stretch, 3 wave shape
     int trackId = 0; std::string channel; std::vector<int> idx; std::vector<AutoPoint> orig;
     double center = 0.0, lo = 0.0, hi = 1.0; float handleY = 0.f, startY = 0.f;
+    // the other selected lanes (one track or several): reshaped by the same handles, each in its own range
+    struct Lane { int trackId = 0; std::string channel; std::vector<int> idx; std::vector<AutoPoint> orig; double lo = 0.0, hi = 1.0; };
+    std::vector<Lane> others;
+    double t0 = 0.0, span = 0.0;   // the common time origin / length of every reshaped lane
 };
 
 inline WaveHandleDrag g_wh;
@@ -851,6 +878,9 @@ struct PRect { ImVec2 a, b; };
 struct WinMax { bool maxed = false; bool restore = false; ImVec2 pos, size; };
 
 inline std::unordered_map<int, WinMax> g_winMax;
+
+inline int g_tlFollow = 0;   // timeline follow while playing: 0 off, 1 page jump (Cubase), 2 move by timeline (playhead pinned)
+inline int g_tlFollowLast = 2;   // the last non-off mode (the F shortcut toggles back to it)
 
 struct UdoPoolEntry {
     std::string name, outputs, inputs, source;

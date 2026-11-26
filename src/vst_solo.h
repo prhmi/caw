@@ -102,15 +102,16 @@ public:
                     // the apply: kHs-class plugin frameworks deadlock when one instance runs
                     // setState while another processes at the same time (the rack goes permanently
                     // silent - the render mutex is only released when setState returns).
-                    vstui::g_stateApplyTrackId.store(job.trackId, std::memory_order_release);
+                    const int key = job.trackId * 8 + std::min(7, std::max(0, job.stage));   // the editor housekeeping compares against its SLOT KEY
+                    vstui::g_stateApplyTrackId.store(key, std::memory_order_release);
                     const auto applyStart = std::chrono::steady_clock::now();
                     std::lock_guard<std::mutex> render(renderMutex_);
                     std::lock_guard<std::mutex> apply(applyMutex_);   // never two instances of one framework at once (editor capture)
-                    rack_.applyStateNow(job.trackId, job.blob, job.originPath, job.originClassId);
+                    rack_.applyStateNow(job.trackId, job.blob, job.originPath, job.originClassId, job.stage);
                     const long long applyMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - applyStart).count();
                     vstui::g_stateApplyTrackId.store(-1, std::memory_order_release);
                     // the engine instance holds a patch now: identical captures are skipped
-                    { std::lock_guard<std::mutex> sl(stateMutex_); instanceHasState_[job.trackId] = true; lastStateBlob_[job.trackId] = job.blob; }
+                    { std::lock_guard<std::mutex> sl(stateMutex_); instanceHasState_[key] = true; lastStateBlob_[key] = job.blob; }
                     if (applyMs > 1000 && log_)
                         log_("[caw] VST track " + std::to_string(job.trackId) + ": patch state took " + std::to_string(applyMs) +
                              " ms to apply - the effect was silent while it loaded. If this repeats with the plugin window open, close the window before changing its patch.\n");
@@ -168,6 +169,7 @@ public:
             rack_.clearSoloPeaks();
             { std::lock_guard<std::mutex> mirrorLock(mirror_.mutex); mirror_.values.clear(); }
             rack_.setSoloMode(true);
+            rack_.setShareUiInstances(true);   // ONE INSTANCE PER PLUGIN: render the plugins the user sees
             const bool ok = rack_.init(jobs, sr_, block_, channels_, 4,
                 [](const std::string&, int) -> void* { return nullptr; },          // no Csound channels in the 4th engine
                 [](int) -> const void* { return nullptr; },                        // no Csound tables either
@@ -178,7 +180,7 @@ public:
             for (const VstJob& j : jobs) activeIds_.insert(j.id);
             spout_.assign((size_t)block_ * (size_t)channels_, 0.f);
             fifo_.assign((size_t)std::max<size_t>(8, 16384 / (size_t)block_) * (size_t)block_ * (size_t)channels_, 0.f);
-            fifoRead_ = 0; fifoFrames_ = 0;
+            fifoRead_ = 0; fifoFrames_ = 0; renderCredit_ = 0;
             notesA_.clear(); notesB_.clear(); notesIndex_.store(0);
             cursor_.store(0);
             active_.clear();
@@ -222,7 +224,7 @@ public:
         notesA_.clear(); notesB_.clear(); notesIndex_.store(0); cursor_.store(0);
         active_.clear();
         idle_ = false;
-        fifoRead_ = 0; fifoFrames_ = 0;
+        fifoRead_ = 0; fifoFrames_ = 0; renderCredit_ = 0;
         // jobsSig_ / activeIds_ / the rack itself stay: start() with the same instruments reuses
         // the loaded plugins. No DSP meanwhile - renderDue() is false and the stream is closed.
     }
@@ -246,7 +248,7 @@ public:
         notesA_.clear(); notesB_.clear(); notesIndex_.store(0); cursor_.store(0);
         active_.clear();
         idle_ = false;
-        fifoRead_ = 0; fifoFrames_ = 0;
+        fifoRead_ = 0; fifoFrames_ = 0; renderCredit_ = 0;
     }
 
     // While on, the engine is audible (renders) even when the transport is stopped, so
@@ -266,6 +268,8 @@ public:
     // Live VSTe input on/off and AUDIO OUTPUT (replace / mix) while the effects run in this engine.
     void setInputMasks(const std::map<int, unsigned>& masks) { rack_.setInputMasks(masks); }
     void setOutMode(int trackId, int mode) { rack_.setOutMode(trackId, mode); }
+    void setOutWide(int trackId, int mode) { rack_.setOutWide(trackId, mode); }
+    void setTrackVolume(int trackId, float v) { rack_.setTrackVolume(trackId, v); }   // the fader, live
     void setWiring(const std::vector<VstJob>& jobs) { rack_.setWiring(jobs); }
 
     // Runs fn while the engine's plugin instances are quiet: no render block runs (the audio
@@ -388,7 +392,7 @@ public:
         time_.store(fromSeconds, std::memory_order_release);
         cursor_.store(seekCursorLocked(fromSeconds), std::memory_order_release);
         active_.clear();
-        fifoRead_ = 0; fifoFrames_ = 0;
+        fifoRead_ = 0; fifoFrames_ = 0; renderCredit_ = 0;
         playing_.store(true, std::memory_order_release);
         scriptsReset_.store(true, std::memory_order_release);
         touch();
@@ -400,7 +404,7 @@ public:
         time_.store(toSeconds, std::memory_order_release);
         cursor_.store(seekCursorLocked(toSeconds), std::memory_order_release);
         active_.clear();
-        fifoRead_ = 0; fifoFrames_ = 0;
+        fifoRead_ = 0; fifoFrames_ = 0; renderCredit_ = 0;
         scriptsReset_.store(true, std::memory_order_release);
         touch();
     }
@@ -430,17 +434,18 @@ public:
         staged_.push_back(s);
         touch();
     }
-    void pushParamOverride(int trackId, int slot, double value) { rack_.pushParamOverride(trackId, slot, value); touch(); }
-    void pushParamValue(int trackId, int paramIndex, double value) { rack_.pushParamValue(trackId, paramIndex, value); touch(); }
+    void pushParamOverride(int trackId, int slot, double value, int stage = 0) { rack_.pushParamOverride(trackId, slot, value, stage); touch(); }
+    void pushParamValue(int trackId, int stage, int paramIndex, double value) { rack_.pushParamValue(trackId, paramIndex, value, stage); touch(); }
     // A source outside the transport is still sounding (a manual sample-clip audition): keep the
     // plugins rendering every block until it ends, exactly like a held note's tail.
     void keepAwake() { touch(); }
     // SEPARATED ENGINES: the editor instance's full plugin state (Kontakt's loaded .nki) reaches
     // the engine's instance through the STATE WORKER (see the constructor) - parameters cannot
     // express a loaded patch, and setState must never run on the audio or the UI thread.
-    void pushState(int trackId, const std::string& blob, const std::string& originPath, const std::string& originClassId) {
+    void pushState(int trackId, int stage, const std::string& blob, const std::string& originPath, const std::string& originClassId) {
 #ifdef CAW_VST3
         if (blob.empty()) return;
+        const int key = trackId * 8 + std::min(7, std::max(0, stage));   // per stage instance
         // Live applies: an identical blob is skipped outright (the periodic capture usually finds
         // nothing new - re-applying it under the render mutex every 2 s read as a frozen sound),
         // and a CHANGED blob (a curve drawn in the plugin's window) applies at once. An engine
@@ -448,22 +453,24 @@ public:
         {
             std::lock_guard<std::mutex> lock(stateMutex_);
             const auto now = std::chrono::steady_clock::now();
-            if (instanceHasState_[trackId]) {
-                if (lastStateBlob_[trackId] == blob) return;
-                if (now - lastApplyAttempt_[trackId] < std::chrono::seconds(1)) return;   // a plugin whose blob mutates constantly: at most one apply a second
+            if (instanceHasState_[key]) {
+                if (lastStateBlob_[key] == blob) return;
+                if (now - lastApplyAttempt_[key] < std::chrono::seconds(1)) return;   // a plugin whose blob mutates constantly: at most one apply a second
             }
-            lastApplyAttempt_[trackId] = now;
-            stateQ_.push_back(StateJob{trackId, blob, originPath, originClassId});
+            lastApplyAttempt_[key] = now;
+            stateQ_.push_back(StateJob{trackId, stage, blob, originPath, originClassId});
         }
         stateCv_.notify_one();
 #else
-        (void)trackId; (void)blob; (void)originPath; (void)originClassId;
+        (void)trackId; (void)stage; (void)blob; (void)originPath; (void)originClassId;
 #endif
     }
     // SEPARATED ENGINES: the engine instance of a track - the source of the editor feed (EQ
     // analyzers / synth meters). Null when the engine is off or the track is not loaded.
 #ifdef CAW_VST3
     std::shared_ptr<caw::IPlugin> pluginOfTrack(int trackId) { return rack_.pluginOfTrack(trackId); }
+    std::shared_ptr<caw::IPlugin> pluginOfTrackStage(int trackId, int stage) { return rack_.pluginOfTrackStage(trackId, stage); }   // one chain stage's engine instance
+    std::shared_ptr<caw::IPlugin> pluginOfTrackEnd(int trackId) { return rack_.pluginOfTrackEnd(trackId); }   // the chain end (the meter width)
 #endif
     // What the engine's plugins are actually using right now (P1..P8 of a track). Lets the UI follow
     // clip-code P writes and engine-side changes in this engine too, not only in the Csound rack.
@@ -509,11 +516,13 @@ public:
         if (render.owns_lock() && rackReady_ && !renderPause_.load(std::memory_order_acquire)) {
             renderInFlight_.fetch_add(1, std::memory_order_acq_rel);
             if (!renderPause_.load(std::memory_order_acquire)) {   // an editor state capture started right now: let it have the instances
+                renderCredit_ = std::min(renderCredit_ + (size_t)frames, (size_t)block_ * 2);
                 int guard = 0;
-                while ((size_t)fifoFrames_ < (size_t)frames && ++guard < 64) {
+                while (renderCredit_ >= (size_t)block_ && fifoFrames_ + (size_t)block_ <= cap && ++guard < 64) {
                     const size_t before = fifoFrames_;
                     renderBlock(cap);
                     if (fifoFrames_ == before) break;   // idle block: nothing to mix
+                    renderCredit_ -= (size_t)block_;
                 }
             }
             renderInFlight_.fetch_sub(1, std::memory_order_acq_rel);
@@ -756,7 +765,7 @@ private:
     // A patch state tagged with the plugin instance it was captured from: the state worker drops
     // a blob whose origin does not match the track's CURRENT plugin (kHs bundles reject a foreign
     // state with an error dialog - "Expected 'filter' but got 'equalizer'").
-    struct StateJob { int trackId = 0; std::string blob, originPath, originClassId; };
+    struct StateJob { int trackId = 0; int stage = 0; std::string blob, originPath, originClassId; };
     std::deque<StateJob> stateQ_;
     std::map<int, std::chrono::steady_clock::time_point> lastApplyAttempt_;   // per track: last queued live patch apply (rate limit)
     std::map<int, bool> instanceHasState_;   // per track: the engine instance holds a patch (live applies rate limited)
@@ -773,6 +782,7 @@ private:
     std::vector<float> spout_;          // one rack block, interleaved (channels_)
     std::vector<float> fifo_;           // ring of rendered audio
     size_t fifoRead_ = 0, fifoFrames_ = 0;
+    size_t renderCredit_ = 0;           // device frames accumulated toward the next fixed plugin block
 
     std::mutex control_;                // transport / schedule (UI thread) vs render constants
     std::vector<VstSoloNote> notesA_, notesB_;

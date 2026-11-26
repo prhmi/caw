@@ -6,6 +6,7 @@
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
+#include "ui_texture.h"
 
 #include <d3d11.h>
 #include <shellapi.h>
@@ -53,10 +54,12 @@ static bool createDevice(HWND hwnd) {
                                            D3D11_SDK_VERSION, &sd, &g_sc, &g_dev, &got, &g_ctx);
     if (FAILED(hr)) return false;
     createRTV();
+    uitex::setD3DDevice(g_dev);   // the sound editor's spectrogram textures are created from this device
     return true;
 }
 
 static void destroyDevice() {
+    uitex::setD3DDevice(nullptr);
     releaseRTV();
     if (g_sc) { g_sc->Release(); g_sc = nullptr; }
     if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
@@ -105,6 +108,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int) {
     cawcrash::install();
+    // Recovered third-party plugin faults surface in the console (the user asked for the problem
+    // in the log, never a silent app-kill).
+    extern void logLine(const std::string& s);   // the console (app.cpp)
+    cawcrash::sehConsole = [](const std::string& s) { logLine(s); };
     ImGui_ImplWin32_EnableDpiAwareness();
     const float dpi = ImGui_ImplWin32_GetDpiScaleForMonitor(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY));
 
@@ -119,7 +126,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int) {
     wc.lpszClassName = "CawWindow";
     RegisterClassExA(&wc);
 
-    HWND hwnd = CreateWindowA(wc.lpszClassName, "CAW - Code Audio Workstation (build 19)", WS_OVERLAPPEDWINDOW, 100, 100,
+    HWND hwnd = CreateWindowA(wc.lpszClassName, "CAW - Code Audio Workstation (build 20)", WS_OVERLAPPEDWINDOW, 100, 100,
                               (int)(1400 * dpi), (int)(800 * dpi), nullptr, nullptr, hInst, nullptr);
 
     if (!createDevice(hwnd)) {

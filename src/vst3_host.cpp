@@ -34,11 +34,138 @@
 #include "public.sdk/source/vst/hosting/processdata.h"
 #include "public.sdk/source/common/memorystream.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
+#include "pluginterfaces/vst/vstspeaker.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivstmessage.h"
 #include "pluginterfaces/vst/ivstevents.h"
 #include "pluginterfaces/vst/ivstmidicontrollers.h"
+#include "crash_dump.h"   // cawcrash::sehSwallowRecord: a faulting plugin is recorded, not fatal
 using namespace Steinberg; using namespace Steinberg::Vst;
+
+// ---- SEH trampolines for the plugin-facing calls -------------------------------------------
+// A third-party plugin must never kill CAW: an access violation inside its parameter / state
+// entry points (seen with Arturia ARP 2600 V3) used to take the whole app down, so saving,
+// loading and exporting all died with it. These small helpers contain ONLY the raw COM call
+// (no C++ objects, so __try is legal); on a fault they record caw_crash.txt and report failure.
+#ifdef _WIN32
+#define CAW_SEH_GETINFO GetExceptionInformation()
+#else
+// macOS / Linux: no SEH. The guards become plain calls (a faulting plugin crashes CAW there).
+#include <functional>
+#include <string>
+#define __try if (true)
+#define __except(x) else if (false)
+#define CAW_SEH_GETINFO 0
+namespace cawcrash { inline int sehSwallowRecord(int) { return 0; } inline std::function<void(const std::string&)> sehConsole; }
+#endif
+static bool seh_getParam(IEditController* ctrl, Vst::ParamID id, double* out) {
+    __try { *out = ctrl->getParamNormalized(id); return true; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+static bool seh_setParam(IEditController* ctrl, Vst::ParamID id, double v) {
+    __try { ctrl->setParamNormalized(id, v); return true; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+static bool seh_getState(IComponent* comp, IBStream* stream) {
+    __try { return comp->getState(stream) == kResultTrue; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+static bool seh_setState(IComponent* comp, IBStream* stream) {
+    __try { return comp->setState(stream) == kResultTrue; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+static bool seh_setComponentState(IEditController* ctrl, IBStream* stream) {
+    __try { ctrl->setComponentState(stream); return true; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+// The render call: the most frequently executed plugin entry point - an access violation here
+// (repeated LKD / export runs with a fragile plugin) killed CAW outright. On a fault the block is
+// silenced instead.
+static bool seh_process(IAudioProcessor* proc, ProcessData* d) {
+    __try { return proc->process(*d) == kResultTrue; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+// Lifecycle calls (prepare / activate / processing on/off): a fault during a repeated instance
+// build killed CAW too. The caller treats false as "the plugin did not start".
+static bool seh_setupProcessing(IAudioProcessor* proc, ProcessSetup* s) {
+    __try { return proc->setupProcessing(*s) == kResultOk; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+static bool seh_setActive(IComponent* comp, bool on) {
+    __try { return comp->setActive(on) == kResultOk; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+static bool seh_setProcessing(IAudioProcessor* proc, bool on) {
+    __try { return proc->setProcessing(on) == kResultOk; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+static int32 seh_getLatency(IAudioProcessor* proc) {
+    __try { return proc->getLatencySamples(); }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return 0; }
+}
+// Load-path calls: every fresh plugin instance runs these (every LKD / export pass builds one).
+// The ARP 2600 still escaped through comp->getState on a repeated lock - all of these are now guarded.
+static bool seh_providerInitialize(Steinberg::Vst::PlugProvider* p) {
+    __try { return p->initialize(); }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+static int32 seh_getBusCount(IComponent* comp, MediaType mt, BusDirection dir) {
+    __try { return comp->getBusCount(mt, dir); }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return -1; }
+}
+static bool seh_activateBus(IComponent* comp, MediaType mt, BusDirection dir, int32 idx, bool on) {
+    __try { return comp->activateBus(mt, dir, idx, on) == kResultOk; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+static bool seh_getBusInfo(IComponent* comp, MediaType mt, BusDirection dir, int32 idx, BusInfo* out) {
+    __try { return comp->getBusInfo(mt, dir, idx, *out) == kResultOk; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+static bool seh_setBusArrangements(IAudioProcessor* proc, SpeakerArrangement* in, int32 nIn, SpeakerArrangement* out, int32 nOut) {
+    __try { return proc->setBusArrangements(in, nIn, out, nOut) == kResultTrue; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+// A speaker arrangement with exactly n channels (the standard ones for 1/2/4/6/8, else n generic bits).
+static SpeakerArrangement cawArrangement(int n) {
+    using namespace Steinberg::Vst::SpeakerArr;
+    switch (n) {
+        case 1: return kMono;
+        case 2: return kStereo;
+        case 4: return k40Music;   // L R Ls Rs (quad)
+        case 6: return k51;
+        case 8: return k71Music;
+        default: { SpeakerArrangement a = 0; for (int i = 0; i < n && i < 32; ++i) a |= (SpeakerArrangement)1 << i; return a; }
+    }
+}
+static int32 seh_getParameterCount(IEditController* ctrl) {
+    __try { return ctrl->getParameterCount(); }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return 0; }
+}
+static bool seh_getParameterInfo(IEditController* ctrl, int32 idx, ParameterInfo* out) {
+    __try { return ctrl->getParameterInfo(idx, *out) == kResultOk; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+static float seh_getParamNormalized(IEditController* ctrl, ParamID id) {
+    __try { return ctrl->getParamNormalized(id); }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return 0.f; }
+}
+static bool seh_createView(IEditController* ctrl, FIDString name, Steinberg::IPlugView** out) {
+    __try { *out = ctrl->createView(name); return true; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+static void seh_setComponentHandler(IEditController* ctrl, IComponentHandler* h) {
+    __try { ctrl->setComponentHandler(h); }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) {}
+}
+static bool seh_getMidiControllerAssignment(IMidiMapping* mm, int16 chn, CtrlNumber cn, ParamID* pid) {
+    __try { return mm->getMidiControllerAssignment(0, chn, cn, *pid) == kResultTrue; }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) { return false; }
+}
+static void seh_terminate(Steinberg::IPluginBase* u) {
+    __try { u->terminate(); }
+    __except (cawcrash::sehSwallowRecord(CAW_SEH_GETINFO)) {}
+}
+
 namespace fs = std::filesystem;
 
 namespace caw {
@@ -123,10 +250,13 @@ public:
     std::function<void()> onInteract;   // the user changed something in the editor: the full state is due (no timer polls it any more)
     void clearTouches() { std::lock_guard<std::mutex> lock(touchMutex); touches.clear(); }
     int popTouch() { std::lock_guard<std::mutex> lock(touchMutex); if (touches.empty()) return -1; int i = touches.front(); touches.pop_front(); return i; }
-    tresult PLUGIN_API beginEdit(ParamID) override { return kResultOk; }
+    std::atomic<int> gestureDepth{0};   // inside beginEdit / endEdit = the USER is editing
+    tresult PLUGIN_API beginEdit(ParamID) override { gestureDepth.fetch_add(1, std::memory_order_relaxed); return kResultOk; }
     tresult PLUGIN_API performEdit(ParamID id, ParamValue v) override {
         const int i = indexOf ? indexOf(id) : -1;
-        if (onInteract) onInteract();
+        // A value the plugin moves itself (a Cabbage meter, 25x a second) is not a user edit: it
+        // must not mark the state dirty - that started a full getState capture every time (meter CPU).
+        if (onInteract && gestureDepth.load(std::memory_order_relaxed) > 0) onInteract();
         if (learning && i >= 0) { std::lock_guard<std::mutex> lock(touchMutex); if (touches.size() < 256) touches.push_back(i); }
         if (i >= 0 && onLiveEdit) onLiveEdit(i, (double)v);   // the editor's value used to be discarded: live sync could never see a knob turn
         return kResultOk;
@@ -146,7 +276,7 @@ public:
     struct PendEdit { std::atomic<int> idx{-1}; std::atomic<float> val{0.f}; };
     PendEdit pendEdit_[kPendEditN];
     std::atomic<unsigned> pendW_{0}, pendR_{0};
-    tresult PLUGIN_API endEdit(ParamID) override { return kResultOk; }
+    tresult PLUGIN_API endEdit(ParamID) override { int d = gestureDepth.load(std::memory_order_relaxed); while (d > 0 && !gestureDepth.compare_exchange_weak(d, d - 1, std::memory_order_relaxed)) {} return kResultOk; }
     tresult PLUGIN_API restartComponent(int32) override { if (onInteract) onInteract(); return kResultOk; }    tresult PLUGIN_API resizeView(IPlugView* view, ViewRect* r) override { return resize && r ? resize(view, r) : kResultFalse; }
     tresult PLUGIN_API queryInterface(const TUID _iid, void** obj) override {
         QUERY_INTERFACE(_iid, obj, FUnknown::iid, IComponentHandler)
@@ -158,8 +288,33 @@ public:
     uint32 PLUGIN_API release() override { return 1000; }
 };
 
+// ONE module (DLL) per .vst3 file for the whole process. Every instance of the same plugin shares it,
+// and it is never unloaded while CAW runs: with many plugins loading / unloading on the loader, editor
+// and UI threads, a per-instance Module::create / release unloaded a DLL while another instance of the
+// same bundle still ran code in it (the crash with many VSTs): every Module object calls the bundle's
+// InitDll / ExitDll, and an ExitDll tears the plugin's global state down under every live instance.
+static std::mutex& moduleMutex() { static std::mutex m; return m; }
+static std::map<std::string, std::shared_ptr<VST3::Hosting::Module>>& moduleCache() {
+    static auto* cache = new std::map<std::string, std::shared_ptr<VST3::Hosting::Module>>();   // never destroyed: DLLs stay loaded until exit
+    return *cache;
+}
+static std::shared_ptr<VST3::Hosting::Module> sharedModule(const std::string& path, std::string& err) {
+    auto* cache = &moduleCache();
+    std::lock_guard<std::mutex> lock(moduleMutex());
+    auto it = cache->find(path);
+    if (it != cache->end() && it->second) return it->second;
+    auto mod = VST3::Hosting::Module::create(path, err);
+    if (mod) (*cache)[path] = mod;
+    return mod;
+}
 class Vst3Plugin : public IPlugin {
-    std::atomic<int> inBusCh_{2}, outBusCh_{2};   // channel count of the plugin's first audio input / output bus (queried at prepare)
+    std::atomic<int> auxBusCh_{0};                // channels of the plugin's sidechain (auxiliary) input bus, 0 = none
+    const float* scIn_ = nullptr;                 // the rack's sidechain block for the next process() (audio thread only)
+    std::vector<std::vector<float>> auxScratch_;
+    static constexpr int kMaxProcessFrames = 8192;   // no block bigger than this ever reaches a plugin (scratch stays bounded)
+    std::atomic<int> inBusCh_{2}, outBusCh_{2};
+    int wantChannels_ = 0;
+    bool enginePrepared_ = false; double preparedSr_ = 0.0; int preparedBlock_ = 0, preparedWant_ = -1;   // the engine setup in force   // the track's channel count, requested from the plugin at prepare (0 = leave its layout)   // channel count of the plugin's first audio input / output bus (queried at prepare)
     bool editorComponentActive_ = false;
     // The EDITOR instance is touched by two threads: the housekeeping worker (processIdle, state
     // capture) and the UI thread (open / close / re-attach / state restore). kHs-class plugins are
@@ -186,6 +341,7 @@ class Vst3Plugin : public IPlugin {
     // Editor interaction: see IPlugin::stateDirty / windowBusy.
     std::atomic<bool> stateDirty_{false};
     std::atomic<bool> windowBusy_{false};
+    std::atomic<bool> closeRequested_{false};   // the user closed the window: destroy it on the next message turn
     std::atomic<bool> hostParam_{false};     // the HOST is setting a parameter (slider / automation): not a user edit
     std::atomic<double> lastTouchMs_{0.0};   // steady_clock ms
     struct HostParamGuard {
@@ -228,14 +384,20 @@ public:
                 vstLog("controller: connection points disconnected");
             }
         }
-        if (ctrl_) ctrl_->setComponentHandler(nullptr);
+        if (ctrl_) seh_setComponentHandler(ctrl_.get(), nullptr);
+        // The plugin may fault even on its way out (a repeated lock/export with a fragile plugin
+        // killed CAW during teardown too): shut it down through the same guarded trampolines.
+        if (proc_) seh_setProcessing(proc_.get(), false);
+        if (comp_) seh_setActive(comp_.get(), false);
+        if (comp_) seh_terminate(comp_.get());
+        if (ctrl_) seh_terminate(ctrl_.get());
     }
     bool load(const std::string& path, const std::string& classId, std::string& err) override {
 #ifdef _WIN32
         EditorDpiContext dpi(systemScaling_);
 #endif
         ensureHostContext();
-        module_ = VST3::Hosting::Module::create(path, err); if (!module_) { vstLog("load failed " + path + ": " + err); return false; }
+        module_ = sharedModule(path, err); if (!module_) { vstLog("load failed " + path + ": " + err); return false; }
         auto& fac = module_->getFactory();
         fac.setHostContext(&hostApp());
         vstLog("load " + path + (classId.empty() ? std::string() : (" class " + classId)));
@@ -257,7 +419,7 @@ public:
         provider_ = Steinberg::owned(new PlugProvider(fac, chosenCopy, true));
         if (!provider_) { err = "no audio class"; return false; }
         vstLog("initialize");
-        if (!provider_->initialize()) { err = "the plugin did not start"; return false; }
+        if (!seh_providerInitialize(provider_.get())) { err = "the plugin faulted while starting (CAW recovered)"; return false; }
         vstLog("initialized");
         // PlugProvider's accessors return already-retained references.
         comp_ = Steinberg::owned(provider_->getComponent());
@@ -280,7 +442,7 @@ public:
                 vstLog(std::string("controller: connection points unavailable component=") +
                     (componentCP ? "yes" : "no") + " controller=" + (controllerCP ? "yes" : "no"));
             }
-            handler_.indexOf = [this](ParamID id) { for (const PluginParam& p : params_) if (p.id == id) return p.index; return -1; };
+            handler_.indexOf = [this](ParamID id) { const auto it = paramIndexById_.find(id); return it == paramIndexById_.end() ? -1 : it->second; };
             // A real DAW captures the full plugin state when the USER changed something (the
             // editor tick takes it once the mouse settles), never on a timer: a state poll stalls
             // kHs-class editors and re-applies a blob with volatile fields forever. Slice EQ-style
@@ -302,15 +464,15 @@ public:
                     liveHook_(i, v);
                 }
             };
-            ctrl_->setComponentHandler(&handler_);
+            seh_setComponentHandler(ctrl_.get(), &handler_);
             // Newly initialized split controllers need the processor's initial state.
             Steinberg::MemoryStream state;
-            const tresult read = comp_->getState(&state);
-            if (read == kResultTrue) {
+            const bool read = seh_getState(comp_.get(), &state);
+            if (read) {
                 state.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
-                const tresult sync = ctrl_->setComponentState(&state);
-                vstLog("controller: component state sync result=" + std::to_string((int)sync));
-            } else vstLog("controller: component state unavailable result=" + std::to_string((int)read));
+                const bool sync = seh_setComponentState(ctrl_.get(), &state);
+                vstLog("controller: component state sync result=" + std::to_string(sync ? 1 : 0));
+            } else vstLog("controller: component state unavailable (fault or empty)");
             // The controller MAY map MIDI CCs / bend / aftertouch to parameters (IMidiMapping,
             // a UI-thread interface): cache the whole assignment table once here - process()
             // then only looks it up, never calls the interface.
@@ -322,7 +484,7 @@ public:
                     for (int chn = 0; chn < 16; ++chn)
                         for (int cn = 0; cn <= 140; ++cn) {
                             ParamID pid = 0;
-                            if (mm->getMidiControllerAssignment(0, (int16)chn, (CtrlNumber)cn, pid) == kResultTrue) {
+                            if (seh_getMidiControllerAssignment(mm, (int16)chn, (CtrlNumber)cn, &pid)) {
                                 ccMap_[(size_t)chn * 141 + (size_t)cn] = pid;
                                 ++mapped;
                             }
@@ -331,14 +493,34 @@ public:
                 } else vstLog("controller: IMidiMapping absent - CC / bend do not drive parameters");
             }
         } else vstLog("controller: unavailable");
-        for (int i = 0, n = comp_->getBusCount(kEvent, kInput); i < n; ++i) comp_->activateBus(kEvent, kInput, i, true);
-        comp_->activateBus(kAudio, kOutput, 0, true);
-        if (comp_->getBusCount(kAudio, kInput) > 0) comp_->activateBus(kAudio, kInput, 0, true);
-        for (int i = 0, n = ctrl_ ? ctrl_->getParameterCount() : 0; i < n; ++i) {
-            ParameterInfo pi{}; ctrl_->getParameterInfo(i, pi);
+        for (int i = 0, n = seh_getBusCount(comp_.get(), kEvent, kInput); i < n; ++i) seh_activateBus(comp_.get(), kEvent, kInput, i, true);
+        seh_activateBus(comp_.get(), kAudio, kOutput, 0, true);
+        if (seh_getBusCount(comp_.get(), kAudio, kInput) > 0) seh_activateBus(comp_.get(), kAudio, kInput, 0, true);
+        if (seh_getBusCount(comp_.get(), kAudio, kInput) > 1) {   // the sidechain: an auxiliary audio input bus
+            BusInfo ai{};
+            if (seh_getBusInfo(comp_.get(), kAudio, kInput, 1, &ai) && ai.busType == BusTypes::kAux && ai.channelCount > 0) seh_activateBus(comp_.get(), kAudio, kInput, 1, true);
+        }
+        applyWantedLayout();   // the layout the track wants, BEFORE the plugin's first activation
+        {   // the real bus widths right at load: the EDITOR instance never runs prepare(), and its processIdle,
+            // the meter layout and the chain fold all read these (a 4-out plugin used to report 2 here)
+            BusInfo bi{};
+            if (seh_getBusCount(comp_.get(), kAudio, kInput) > 0 && seh_getBusInfo(comp_.get(), kAudio, kInput, 0, &bi) && bi.channelCount > 0)
+                inBusCh_.store(std::min(8, (int)bi.channelCount), std::memory_order_relaxed);
+            else inBusCh_.store(instrument_ ? 0 : 2, std::memory_order_relaxed);
+            if (seh_getBusInfo(comp_.get(), kAudio, kOutput, 0, &bi) && bi.channelCount > 0)
+                outBusCh_.store(std::min(8, (int)bi.channelCount), std::memory_order_relaxed);
+            if (seh_getBusCount(comp_.get(), kAudio, kInput) > 1 && seh_getBusInfo(comp_.get(), kAudio, kInput, 1, &bi) && bi.busType == BusTypes::kAux && bi.channelCount > 0)
+                auxBusCh_.store(std::min(8, (int)bi.channelCount), std::memory_order_relaxed);
+        }
+        for (int i = 0, n = ctrl_ ? seh_getParameterCount(ctrl_.get()) : 0; i < n; ++i) {
+            ParameterInfo pi{}; if (!seh_getParameterInfo(ctrl_.get(), i, &pi)) continue;   // a faulting plugin loses that one parameter, not the load
             PluginParam p; p.index = i; p.id = pi.id; p.def = pi.defaultNormalizedValue; p.steps = pi.stepCount;
             p.readOnly = pi.flags & ParameterInfo::kIsReadOnly;
-            p.title = u16to8(pi.title); p.units = u16to8(pi.units); p.value = ctrl_->getParamNormalized(pi.id);
+            p.title = u16to8(pi.title); p.units = u16to8(pi.units);
+            double v = pi.defaultNormalizedValue;
+            if (!seh_getParam(ctrl_.get(), pi.id, &v)) v = pi.defaultNormalizedValue;   // the load path must survive a faulting plugin
+            p.value = v;
+            paramIndexById_[p.id] = p.index;
             params_.push_back(p);
         }
         changes_.setMaxParameters((int32)params_.size() + 8);
@@ -349,23 +531,25 @@ public:
     std::string classId() const override { return classId_; }
     void prepareEditor(double sr, int maxBlock) override {
         if (!proc_ || !comp_ || sr <= 0.0 || maxBlock <= 0) return;
+        if (engineOwned.load(std::memory_order_acquire)) return;   // the engine set this object up (prepare) and renders it
         std::lock_guard<std::mutex> api(editorApiMutex_);
         if (editorComponentActive_ && std::fabs(editorSetupSr_ - sr) < 0.01 && editorSetupBlock_ == maxBlock) return;
         // The UI instance is separate from the real-time audio instance. Configure and activate
         // its component only after the host engine has a real format; processIdle() (vstui::
         // queueEditorTasks, on the housekeeping worker) runs small silent blocks on it so sampler UIs stay alive, but it is
         // never connected to the audio callback.
-        if (editorProcessing_) { proc_->setProcessing(false); editorProcessing_ = false; }
+        if (editorProcessing_) { if (!seh_setProcessing(proc_.get(), false)) vstLog("editor: setProcessing(false) faulted (recovered)"); editorProcessing_ = false; }
         editorLogged_ = false;   // a re-prepare (sample-rate / block change, reactivation) gets a fresh confirmation log
-        if (editorComponentActive_) comp_->setActive(false);
+        if (editorComponentActive_) { if (!seh_setActive(comp_.get(), false)) vstLog("editor: setActive(false) faulted (recovered)"); }
+        applyWantedLayout();
         ProcessSetup setup{kRealtime, kSample32, maxBlock, sr};
-        const tresult setupResult = proc_->setupProcessing(setup);
+        const tresult setupResult = seh_setupProcessing(proc_.get(), &setup) ? kResultOk : kResultFalse;
         if (setupResult != kResultOk) {
             vstLog("editor: setupProcessing failed, result=" + std::to_string((int)setupResult));
             editorComponentActive_ = false;
             return;
         }
-        const tresult activeResult = comp_->setActive(true);
+        const tresult activeResult = seh_setActive(comp_.get(), true) ? kResultOk : kResultFalse;
         if (activeResult != kResultOk) {
             vstLog("editor: component activation failed, result=" + std::to_string((int)activeResult));
             editorComponentActive_ = false;
@@ -385,6 +569,7 @@ public:
     // meters run at realtime speed.
     void processIdle(int frames, const EditorFeed* feed) override {
         if (!proc_ || !comp_ || !editorComponentActive_ || frames <= 0) return;
+        if (engineOwned.load(std::memory_order_acquire)) return;   // one instance: the engine processes it, the window just shows it
         std::lock_guard<std::mutex> api(editorApiMutex_);
         // VST3: IAudioProcessor::setProcessing is OPTIONAL. Many plugins (and VST2 adapters)
         // return kResultFalse from setProcessing(true) - the spec says the host must then just
@@ -393,7 +578,7 @@ public:
         // plays fine. Call setProcessing once (polite), then ALWAYS process.
         if (!editorProcessing_) {
             editorProcessing_ = true;
-            const tresult sp = proc_->setProcessing(true);
+            const tresult sp = seh_setProcessing(proc_.get(), true) ? kResultOk : kResultFalse;
             if (!editorLogged_) {
                 editorLogged_ = true;
                 vstLog("editor instance: processing started (setProcessing returned " + std::to_string((int)sp) + "; " + std::to_string(inBusCh_.load(std::memory_order_relaxed)) + " input channel(s))");
@@ -402,10 +587,12 @@ public:
         if (editorSetupBlock_ > 0 && frames > editorSetupBlock_) frames = editorSetupBlock_;   // stay within the prepared block
         // The feed's engine audio replaces the silence. An instrument has no input bus: its GUI
         // lives on the dispatched notes (below).
-        int nIn = instrument_ ? 0 : std::min(2, inBusCh_.load(std::memory_order_relaxed));
+        // The plugin's own bus widths (see process): a 4-out instrument gets 4 output buffers here too.
+        int nIn = std::max(0, std::min(8, inBusCh_.load(std::memory_order_relaxed)));   // every active bus gets buffers (an instrument's are silent)
         const bool haveAudio = feed && feed->frames > 0 && (int)feed->audio.size() >= feed->frames * 2 && !instrument_;
         if (haveAudio && feed->frames < frames) frames = feed->frames;
-        const int nOut = std::min(2, outBusCh_.load(std::memory_order_relaxed));
+        const int nOut = std::max(1, std::min(8, outBusCh_.load(std::memory_order_relaxed)));
+        if (frames > kMaxProcessFrames) frames = kMaxProcessFrames;
         if ((int)inScratch_.size() < nIn) inScratch_.resize((size_t)nIn);
         if ((int)outScratch_.size() < nOut) outScratch_.resize((size_t)nOut);
         for (int c = 0; c < nIn; ++c) {
@@ -457,11 +644,20 @@ public:
                 ++sent;
             }
         }
+        float* auxp[8] = {};
+        const int nAux = nIn > 0 ? fillAux(auxp, frames, false) : 0;   // the editor instance hears no sidechain: silence
+        AudioBusBuffers ab{}; ab.numChannels = nAux; ab.channelBuffers32 = auxp;
+        AudioBusBuffers inBuses[2] = {ib, ab};
         ProcessData d{}; d.processMode = kRealtime; d.symbolicSampleSize = kSample32; d.numSamples = frames;
-        d.numInputs = nIn > 0 ? 1 : 0; d.inputs = nIn > 0 ? &ib : nullptr; d.numOutputs = 1; d.outputs = &ob;
+        d.numInputs = nIn > 0 ? (nAux > 0 ? 2 : 1) : 0; d.inputs = nIn > 0 ? inBuses : nullptr; d.numOutputs = 1; d.outputs = &ob;
         d.inputEvents = feed && !feed->events.empty() ? &events_ : nullptr;
         d.inputParameterChanges = &changes_;
-        proc_->process(d);
+        if (!seh_process(proc_.get(), &d)) {
+            static std::atomic<int> warned{0};
+            if (warned.fetch_add(1) < 3) vstLog("process: the editor instance faulted inside the plugin (recovered, block silenced)");
+            for (int c = 0; c < nOut && c < (int)outScratch_.size(); ++c)   // was frames*2 on ONE channel buffer: a write past its end
+                std::fill_n(outScratch_[(size_t)c].begin(), std::min((size_t)frames, outScratch_[(size_t)c].size()), 0.f);
+        }
     }
     // The editor tick drains this instance's engine snapshot for the feed. Copies everything out
     // without ever blocking the render thread: audio comes from the SPSC ring (the producer only
@@ -473,7 +669,10 @@ public:
         out.events.clear();
         size_t r = tapRead_.load(std::memory_order_relaxed);
         size_t w = tapWrite_.load(std::memory_order_acquire);
-        if (w - r > kTapCap) r = w - kTapCap;   // the consumer fell behind: drop the oldest
+        // The window only needs RECENT audio: if more than two blocks wait, jump to the newest ones
+        // instead of replaying the backlog (the 2-blocks-per-tick drain can never catch up otherwise).
+        { const size_t keepFrames = (size_t)(editorSetupBlock_ > 0 ? editorSetupBlock_ : 512) * 2;
+          if (w - r > keepFrames) r = w - keepFrames; }
         const int block = editorSetupBlock_ > 0 ? editorSetupBlock_ : 512;
         int n = (int)std::min<size_t>(w - r, (size_t)block);
         if (n > 0) {
@@ -554,15 +753,87 @@ public:
         }
     }
     void prepare(double sr, int maxBlock) override {
+        // Already running with exactly this setup: nothing to do. A shared plugin is wrapped again by
+        // the NEW graph while the old one still plays it (a chain re-order / add / remove); calling
+        // setupProcessing / setActive again on an ACTIVE plugin breaks VST3's state machine - Cabbage
+        // and others then process silence, which was the "next effect receives nothing".
+        if (enginePrepared_ && preparedSr_ == sr && preparedBlock_ == maxBlock && preparedWant_ == wantChannels_) return;
+        if (enginePrepared_) {   // a real re-setup: the VST3 order is processing off -> inactive -> setup -> active -> processing on
+            seh_setProcessing(proc_.get(), false);
+            seh_setActive(comp_.get(), false);
+            enginePrepared_ = false;
+        }
+        {   // the same object was set up for the window (prepareEditor): stop that before the engine takes it
+            std::lock_guard<std::mutex> api(editorApiMutex_);
+            if (editorProcessing_) { seh_setProcessing(proc_.get(), false); editorProcessing_ = false; }
+            if (editorComponentActive_) { seh_setActive(comp_.get(), false); editorComponentActive_ = false; }
+        }
         audioBuffers_.prepare(maxBlock);
-        ProcessSetup s{kRealtime, kSample32, maxBlock, sr}; proc_->setupProcessing(s);
-        comp_->setActive(true); proc_->setProcessing(true); maxBlock_ = maxBlock;
+        // ASK the plugin for the host's channel layout (VST3 setBusArrangements, before setup /
+        // activation). Plugins that follow the host (Cabbage: nchnls = 4) otherwise stay at their
+        // default stereo layout and only ever see / write 2 channels. The plugin may refuse: it then
+        // keeps its own layout, and the real widths are read back from getBusInfo below.
+        applyWantedLayout();
+        ProcessSetup s{kRealtime, kSample32, maxBlock, sr};
+        if (!seh_setupProcessing(proc_.get(), &s)) vstLog("prepare: setupProcessing faulted inside the plugin (recovered)");
+        if (!seh_setActive(comp_.get(), true)) vstLog("prepare: setActive faulted inside the plugin (recovered)");
+        if (!seh_setProcessing(proc_.get(), true)) vstLog("prepare: setProcessing faulted inside the plugin (recovered)");
+        maxBlock_ = maxBlock;
+        enginePrepared_ = true; preparedSr_ = sr; preparedBlock_ = maxBlock; preparedWant_ = wantChannels_;
         BusInfo bi{};   // the real channel counts: the process buffers must match the plugin's buses
-        if (comp_->getBusInfo(kAudio, kInput, 0, bi) == kResultOk && bi.channelCount > 0) inBusCh_.store((int)bi.channelCount, std::memory_order_relaxed); else inBusCh_.store(2, std::memory_order_relaxed);
-        if (comp_->getBusInfo(kAudio, kOutput, 0, bi) == kResultOk && bi.channelCount > 0) outBusCh_.store((int)bi.channelCount, std::memory_order_relaxed); else outBusCh_.store(2, std::memory_order_relaxed);
-        latency_.store((int)proc_->getLatencySamples(), std::memory_order_relaxed);   // the plugin's own delay (oversampling / look-ahead): the dry/wet alignment uses it
+        if (seh_getBusCount(comp_.get(), kAudio, kInput) > 0 && seh_getBusInfo(comp_.get(), kAudio, kInput, 0, &bi) && bi.channelCount > 0) inBusCh_.store(std::min(8, (int)bi.channelCount), std::memory_order_relaxed); else inBusCh_.store(instrument_ ? 0 : 2, std::memory_order_relaxed);
+        if (seh_getBusInfo(comp_.get(), kAudio, kOutput, 0, &bi) && bi.channelCount > 0) outBusCh_.store(std::min(8, (int)bi.channelCount), std::memory_order_relaxed); else outBusCh_.store(2, std::memory_order_relaxed);
+        auxBusCh_.store(0, std::memory_order_relaxed);
+        if (seh_getBusCount(comp_.get(), kAudio, kInput) > 1 && seh_getBusInfo(comp_.get(), kAudio, kInput, 1, &bi) && bi.busType == BusTypes::kAux && bi.channelCount > 0)
+            auxBusCh_.store(std::min(8, (int)bi.channelCount), std::memory_order_relaxed);
+        latency_.store((int)seh_getLatency(proc_.get()), std::memory_order_relaxed);   // the plugin's own delay (oversampling / look-ahead): the dry/wet alignment uses it
         vstLog("audio buses: in " + std::to_string(inBusCh_.load()) + " ch, out " + std::to_string(outBusCh_.load()) + " ch, latency " + std::to_string(latency_.load()) + " samples"); }
     int latencySamples() const override { return latency_.load(std::memory_order_relaxed); }
+    void setWantedChannels(int n) override { wantChannels_ = std::max(0, std::min(8, n)); }
+    // Ask the plugin for the wanted layout (VST3 setBusArrangements) while it is INACTIVE. Called at
+    // load (before the very first activation - Cabbage builds its internal Csound with the layout of
+    // its FIRST start; asked later, it keeps that one and fills the extra channels with copies), and
+    // again before every setup. A refusal keeps the plugin's own layout.
+    void applyWantedLayout() {
+        if (wantChannels_ <= 0 || !proc_ || !comp_) return;
+        const int nInBus = std::max(0, seh_getBusCount(comp_.get(), kAudio, kInput));
+        const int nOutBus = std::max(0, seh_getBusCount(comp_.get(), kAudio, kOutput));
+        std::vector<SpeakerArrangement> ins((size_t)nInBus), outs((size_t)nOutBus);
+        for (int b = 0; b < nInBus; ++b) {   // main bus = the wanted width; sidechain / aux buses keep their own
+            SpeakerArrangement cur = 0;
+            if (b > 0 && proc_->getBusArrangement(kInput, b, cur) == kResultTrue) ins[(size_t)b] = cur;
+            else ins[(size_t)b] = b == 0 ? cawArrangement(wantChannels_) : SpeakerArr::kStereo;
+        }
+        for (int b = 0; b < nOutBus; ++b) {
+            SpeakerArrangement cur = 0;
+            if (b > 0 && proc_->getBusArrangement(kOutput, b, cur) == kResultTrue) outs[(size_t)b] = cur;
+            else outs[(size_t)b] = b == 0 ? cawArrangement(wantChannels_) : SpeakerArr::kStereo;
+        }
+        const bool ok = seh_setBusArrangements(proc_.get(), ins.empty() ? nullptr : ins.data(), nInBus,
+                                               outs.empty() ? nullptr : outs.data(), nOutBus);
+        BusInfo bi{};
+        int outW = 0;
+        if (seh_getBusInfo(comp_.get(), kAudio, kOutput, 0, &bi)) outW = (int)bi.channelCount;
+        vstLog("bus layout: asked for " + std::to_string(wantChannels_) + " ch -> " + (ok ? "accepted" : "refused") +
+               ", output bus now " + std::to_string(outW) + " ch");
+        if (outW > 0) outBusCh_.store(std::min(8, outW), std::memory_order_relaxed);
+        if (nInBus > 0 && seh_getBusInfo(comp_.get(), kAudio, kInput, 0, &bi) && bi.channelCount > 0) inBusCh_.store(std::min(8, (int)bi.channelCount), std::memory_order_relaxed);
+    }
+    void setSidechain(const float* sc) override { scIn_ = sc; }
+    int sidechainChannels() const override { return auxBusCh_.load(std::memory_order_relaxed); }
+    int outputChannels() const override { return std::min(8, outBusCh_.load(std::memory_order_relaxed)); }
+    int inputChannels() const override { return std::min(8, inBusCh_.load(std::memory_order_relaxed)); }
+    // the aux (sidechain) input bus buffers for one block: the rack's stereo sidechain (or silence)
+    int fillAux(float** auxp, int frames, bool withSignal) {
+        const int nAux = std::min(8, auxBusCh_.load(std::memory_order_relaxed));
+        if ((int)auxScratch_.size() < nAux) auxScratch_.resize((size_t)nAux);
+        for (int c = 0; c < nAux; ++c) {
+            if ((int)auxScratch_[(size_t)c].size() < frames) auxScratch_[(size_t)c].resize((size_t)frames);
+            for (int i = 0; i < frames; ++i) auxScratch_[(size_t)c][(size_t)i] = (withSignal && scIn_ && c < 2) ? scIn_[(size_t)i * 2 + (size_t)c] : 0.f;
+            auxp[c] = auxScratch_[(size_t)c].data();
+        }
+        return nAux;
+    }
     void process(const float* in, float* out, int frames, int ch, Endpoint& ep) override {
         // 1. MIDI events from the ring (cawsm, MIDI clips, device). CC / bend / aftertouch are
         //    mapped too now (see mapMidi): the transport stop's all-notes-off MUST reach the
@@ -614,13 +885,24 @@ public:
             if (q) q->addPoint(0, pm.value, pi); params_[pm.paramIndex].value = pm.value;
         }
         // 3. audio: de-interleave into per-channel scratch, hand the plugin its real bus sizes, interleave back
-        const int nIn = in ? std::min(ch, inBusCh_.load(std::memory_order_relaxed)) : 0;
-        const int nOut = std::min(ch, outBusCh_.load(std::memory_order_relaxed));
+        // The buses are handed over at the plugin's OWN widths (what getBusInfo reported, max 8): a
+        // plugin always writes every channel of its bus, so declaring a bus with fewer buffers than
+        // it has channels made it write through null / foreign pointers (the crash with many or wide
+        // plugins). Channels the caller does not carry are fed silence / dropped on interleave.
+        if (frames <= 0) return;
+        if (frames > kMaxProcessFrames) frames = kMaxProcessFrames;
+        const int busIn = std::max(0, std::min(8, inBusCh_.load(std::memory_order_relaxed)));
+        // EVERY active bus gets its buffers, also on an instrument: Cabbage (and other) instruments keep
+        // an audio input bus, CAW activates it at load - handing the plugin 0 inputs for an ACTIVE bus
+        // breaks the VST3 contract and the plugin returns silence. No input audio = silent buffers.
+        const int nIn = busIn;
+        const int nOut = std::max(1, std::min(8, outBusCh_.load(std::memory_order_relaxed)));
         if ((int)inScratch_.size() < nIn) inScratch_.resize((size_t)nIn);
         if ((int)outScratch_.size() < nOut) outScratch_.resize((size_t)nOut);
         for (int c = 0; c < nIn; ++c) {
             if ((int)inScratch_[(size_t)c].size() < frames) inScratch_[(size_t)c].resize((size_t)frames);
-            for (int i = 0; i < frames; ++i) inScratch_[(size_t)c][(size_t)i] = in[(size_t)i * ch + c];
+            if (in && c < ch) for (int i = 0; i < frames; ++i) inScratch_[(size_t)c][(size_t)i] = in[(size_t)i * ch + c];
+            else std::fill_n(inScratch_[(size_t)c].begin(), (size_t)frames, 0.f);
         }
         for (int c = 0; c < nOut; ++c) {
             if ((int)outScratch_[(size_t)c].size() < frames) outScratch_[(size_t)c].resize((size_t)frames);
@@ -630,12 +912,20 @@ public:
         for (int c = 0; c < nIn; ++c) ins[c] = inScratch_[(size_t)c].data();
         for (int c = 0; c < nOut; ++c) outs[c] = outScratch_[(size_t)c].data();
         AudioBusBuffers ib{}, ob{}; ib.numChannels = nIn; ib.channelBuffers32 = ins; ob.numChannels = nOut; ob.channelBuffers32 = outs;
+        float* auxp[8] = {};
+        const int nAux = nIn > 0 ? fillAux(auxp, frames, in != nullptr) : 0;   // an active sidechain bus always gets buffers (silence without a sidechain)
+        AudioBusBuffers ab{}; ab.numChannels = nAux; ab.channelBuffers32 = auxp;
+        AudioBusBuffers inBuses[2] = {ib, ab};
         ProcessData d{}; d.processMode = kRealtime; d.symbolicSampleSize = kSample32; d.numSamples = frames;
-        d.numInputs = nIn > 0 ? 1 : 0; d.inputs = nIn > 0 ? &ib : nullptr; d.numOutputs = 1; d.outputs = &ob;
+        d.numInputs = nIn > 0 ? (nAux > 0 ? 2 : 1) : 0; d.inputs = nIn > 0 ? inBuses : nullptr; d.numOutputs = 1; d.outputs = &ob;
         d.inputEvents = &events_; d.inputParameterChanges = &changes_;
-        proc_->process(d);
+        if (!seh_process(proc_.get(), &d)) {
+            static std::atomic<int> warned{0};
+            if (warned.fetch_add(1) < 3) vstLog("process: the plugin faulted inside its render call (recovered, block silenced)");
+            for (int c = 0; c < nOut; ++c) std::memset(outScratch_[(size_t)c].data(), 0, (size_t)frames * sizeof(float));
+        }
         if (out) for (int c = 0; c < ch; ++c) for (int i = 0; i < frames; ++i)
-            out[(size_t)i * ch + c] = c < nOut ? outScratch_[(size_t)c][(size_t)i] : 0.f;   // channels the plugin does not have stay silent
+            out[(size_t)i * ch + c] = c < nOut ? outScratch_[(size_t)c][(size_t)i] : 0.f;   // channels the plugin does not have stay silent (wider buses than `ch` are dropped here, never written past `out`)
         // SEPARATED ENGINES: stream the first stereo pair of this block into the editor's ring
         // (EQ analyzers, scopes). Instruments stream silence - their GUI meters move on the
         // dispatched notes, not on input audio. The audio thread never waits on the editor: a
@@ -665,7 +955,7 @@ public:
         if (ctrl_ && i >= 0 && i < (int)params_.size() && !params_[i].readOnly) {
             v = std::min(1.0, std::max(0.0, v));
             HostParamGuard hostSet(hostParam_);   // the plugin may echo this as performEdit: not a user edit
-            ctrl_->setParamNormalized(params_[i].id, v);
+            if (!seh_setParam(ctrl_.get(), params_[i].id, v)) vstLog("param: setParamNormalized faulted inside the plugin (recovered)");
             params_[i].value = v;
             { std::lock_guard<std::mutex> lock(initParamMutex_); initialParameters_[i] = v; }
         }
@@ -675,7 +965,10 @@ public:
         EditorDpiContext dpi(systemScaling_);
 #endif
         if (i < 0 || i >= (int)params_.size()) return 0.0;
-        return ctrl_ ? ctrl_->getParamNormalized(params_[i].id) : params_[i].value;
+        if (!ctrl_) return params_[i].value;
+        double v = params_[i].value;
+        if (!seh_getParam(ctrl_.get(), params_[i].id, &v)) vstLog("param: getParamNormalized faulted inside the plugin (recovered)");
+        return v;
     }
     // Bulk normalized values for host-side change detection. ONE DPI context for the whole
     // sweep (a per-parameter context switch would cost more than the getters themselves).
@@ -686,8 +979,12 @@ public:
         EditorDpiContext dpi(systemScaling_);
 #endif
         out.resize((size_t)n);
-        for (int i = 0; i < n; ++i)
-            out[(size_t)i] = params_[(size_t)i].readOnly ? 0.0 : ctrl_->getParamNormalized(params_[(size_t)i].id);
+        for (int i = 0; i < n; ++i) {
+            if (params_[(size_t)i].readOnly) { out[(size_t)i] = 0.0; continue; }
+            double v = params_[(size_t)i].value;
+            if (!seh_getParam(ctrl_.get(), params_[(size_t)i].id, &v)) v = params_[(size_t)i].value;
+            out[(size_t)i] = v;
+        }
         return n;
     }
     bool editorVisible() const override {
@@ -707,7 +1004,7 @@ public:
         learnValues_.clear();
         if (!enabled || !ctrl_) return;
         learnValues_.reserve(params_.size());
-        for (const auto& p : params_) learnValues_.push_back(ctrl_->getParamNormalized(p.id));
+        for (const auto& p : params_) learnValues_.push_back(seh_getParamNormalized(ctrl_.get(), p.id));
         nextLearnPoll_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(120);
         handler_.learning = true;
         vstLog("learn: armed");
@@ -728,7 +1025,8 @@ public:
         nextLearnPoll_ = now + std::chrono::milliseconds(120);
         int changed = -1;
         for (size_t n = 0; n < params_.size() && n < learnValues_.size(); ++n) {
-            const double value = ctrl_->getParamNormalized(params_[n].id);
+            double value = learnValues_[n];
+            if (!seh_getParam(ctrl_.get(), params_[n].id, &value)) value = learnValues_[n];
             if (changed < 0 && !params_[n].readOnly && std::isfinite(value) &&
                 std::fabs(value - learnValues_[n]) > 1e-6) changed = (int)n;
             learnValues_[n] = value;
@@ -742,9 +1040,15 @@ public:
         EditorDpiContext dpiContext(systemScaling_);
         if (!ctrl_) { err = "this plugin has no controller"; return false; }
         if (!view_) {
-            handler_.indexOf = [this](ParamID id) { for (const PluginParam& p : params_) if (p.id == id) return p.index; return -1; };
-            ctrl_->setComponentHandler(&handler_);
-            view_ = owned(ctrl_->createView(ViewType::kEditor));
+            handler_.indexOf = [this](ParamID id) { const auto it = paramIndexById_.find(id); return it == paramIndexById_.end() ? -1 : it->second; };
+            seh_setComponentHandler(ctrl_.get(), &handler_);
+            Steinberg::IPlugView* view = nullptr;
+            if (!seh_createView(ctrl_.get(), ViewType::kEditor, &view)) {
+                vstLog("editor: createView faulted inside the plugin (recovered)");
+                err = "The plugin's editor could not be created (it faulted). Try its parameters below, or check caw_vst_log.txt.";
+                return false;
+            }
+            view_ = owned(view);
             if (!view_) {
                 vstLog("editor: createView returned null; parameters=" + std::to_string(params_.size()));
                 err = "The plugin did not provide an editor. Try its parameters below, or check caw_vst_log.txt.";
@@ -767,7 +1071,9 @@ public:
             // window is found by its class ("CawWindow", registered in main.cpp) so one plugin editor
             // never becomes the owner of another (closing an owner destroys its owned windows).
             const HWND owner = FindWindowA("CawWindow", nullptr) ? FindWindowA("CawWindow", nullptr) : GetActiveWindow();
-            hwnd_ = CreateWindowExA(0, "CawVstEditor", title.c_str(), style, 100, 100, 400, 300, owner, nullptr, GetModuleHandle(nullptr), nullptr);
+            // WS_EX_TOOLWINDOW: the plugin window never gets its own taskbar entry / thumbnail (it is a
+            // child panel of CAW, like a DAW's plugin windows).
+            hwnd_ = CreateWindowExA(WS_EX_TOOLWINDOW, "CawVstEditor", title.c_str(), style, 100, 100, 400, 300, owner, nullptr, GetModuleHandle(nullptr), nullptr);
             if (!hwnd_) { view_ = nullptr; err = "could not create the window"; return false; }
             SetWindowLongPtr(hwnd_, GWLP_USERDATA, (LONG_PTR)this);
             handler_.resize = [this](IPlugView* v, ViewRect* r) -> tresult {
@@ -812,7 +1118,7 @@ public:
         std::lock_guard<std::mutex> api(editorApiMutex_);
         try {
             Steinberg::MemoryStream state;
-            if (comp_->getState(&state) != kResultTrue) return {};
+            if (!seh_getState(comp_.get(), &state)) { vstLog("state: getState faulted inside the plugin (recovered)"); return {}; }
             Steinberg::int64 size = 0;
             if (state.seek(0, Steinberg::IBStream::kIBSeekEnd, &size) != kResultOk || size <= 0) return {};
             std::string raw; raw.resize((size_t)size);
@@ -836,12 +1142,11 @@ public:
                 vstLog("state: could not buffer the blob - skipped"); return;
             }
             stream.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
-            const tresult applied = comp_->setState(&stream);
-            if (applied != kResultTrue) { vstLog("state: component refused the state, result=" + std::to_string((int)applied)); return; }
+            if (!seh_setState(comp_.get(), &stream)) { vstLog("state: setState faulted inside the plugin (recovered)"); return; }
             // The controller follows the patch too, so parameter reads / the GUI reflect it.
             if (ctrl_) {
                 stream.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
-                ctrl_->setComponentState(&stream);
+                if (!seh_setComponentState(ctrl_.get(), &stream)) vstLog("state: setComponentState faulted inside the plugin (recovered)");
             }
             vstLog("state: applied " + std::to_string(raw.size()) + " bytes" + (ctrl_ ? " (controller resynced)" : ""));
         } catch (...) { vstLog("state: applying threw - the plugin keeps its previous state"); }
@@ -855,6 +1160,7 @@ private:
     std::vector<PluginParam> params_; std::map<int, double> initialParameters_; std::mutex initParamMutex_;   // setParam (UI) vs process/processIdle drain
     std::function<void(int, double)> liveHook_;   // app callback for every editor edit (all parameters)
     std::vector<double> lastLive_;                // last editor value forwarded per parameter (dedupe)
+    std::map<ParamID, int> paramIndexById_;       // performEdit id -> index (was a linear scan per call)
     bool instrument_ = false; std::string classId_; int maxBlock_ = 512;
     std::atomic<int> latency_{0};
     bool systemScaling_ = false;
@@ -936,7 +1242,20 @@ private:
         // window changes no sound, so it does not arm a capture either.
         if (self && (m == WM_ENTERSIZEMOVE || m == WM_EXITSIZEMOVE))
             self->windowBusy_.store(m == WM_ENTERSIZEMOVE, std::memory_order_relaxed);
-        if (m == WM_CLOSE) { if (self) self->touchEditor(); ShowWindow(h, SW_HIDE); return 0; }   // closed right after an edit: the tick still captures it
+        // Close = really close the window (the plugin instance and its state stay): a merely HIDDEN
+        // owned window is still listed by Windows' taskbar thumbnail / Aero Peek, so every plugin
+        // ever opened popped up when the mouse hovered CAW's taskbar button. The view is detached
+        // and the window destroyed after this message; the next Open re-creates it.
+        if (m == WM_CLOSE) {
+            if (self) { self->touchEditor(); self->closeRequested_.store(true, std::memory_order_release); }
+            ShowWindow(h, SW_HIDE);
+            if (self) PostMessageA(h, WM_APP + 41, 0, 0);   // tear down outside the plugin's own close handling
+            return 0;
+        }
+        if (m == WM_APP + 41 && self && self->closeRequested_.exchange(false, std::memory_order_acq_rel)) {
+            self->closeEditor();
+            return 0;
+        }
         if (m == WM_DPICHANGED && self && self->viewAttached_) {
             const RECT* suggested = reinterpret_cast<const RECT*>(l);
             if (suggested) SetWindowPos(h, nullptr, suggested->left, suggested->top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -960,7 +1279,15 @@ std::unique_ptr<IPlugin> makeVst3Plugin() { return std::make_unique<Vst3Plugin>(
 void vstLog(const std::string& line) {
     static std::mutex m; std::lock_guard<std::mutex> lock(m);
     if (FILE* f = std::fopen("caw_vst_log.txt", "ab")) { std::fputs((line + "\n").c_str(), f); std::fclose(f); }
+    // A recovered plugin fault surfaces in the CAW console too: the problem must be readable
+    // there, not only in caw_vst_log.txt / caw_crash.txt (and never a silent app-kill).
+    if (line.find("faulted") != std::string::npos || line.find("(recovered") != std::string::npos) {
+        static std::atomic<int> surf{0};
+        if (surf.fetch_add(1, std::memory_order_relaxed) < 24 && cawcrash::sehConsole)
+            cawcrash::sehConsole("[caw] VST3: " + line);
+    }
 }
+
 std::vector<std::string> scanVst3(const std::vector<std::string>& extra);
 std::vector<PluginInfo> scanVst3Info(const std::vector<std::string>& extra,
     const std::function<void(const std::vector<PluginInfo>&)>& publish) {
@@ -998,7 +1325,15 @@ std::vector<PluginInfo> scanVst3Info(const std::vector<std::string>& extra,
         else {
             try {
                 vstLog("scan " + path);
-                std::string err; auto mod = VST3::Hosting::Module::create(path, err);
+                std::string err; std::shared_ptr<VST3::Hosting::Module> mod;
+                {   // a bundle that already has live instances is read from its shared module: a temporary
+                    // Module would run the bundle's ExitDll under those instances. Others are opened
+                    // only for the scan and released again (no instance can exist for them).
+                    std::lock_guard<std::mutex> lock(moduleMutex());
+                    const auto known = moduleCache().find(path);
+                    if (known != moduleCache().end()) mod = known->second;
+                }
+                if (!mod) mod = VST3::Hosting::Module::create(path, err);
                 if (mod) for (auto& ci : mod->getFactory().classInfos()) {
                     if (ci.category() != kVstAudioEffectClass) continue;
                     const std::string categories = ci.subCategoriesString();

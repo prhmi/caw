@@ -394,12 +394,18 @@ inline std::vector<Band> analyze(const std::vector<float>& fftDb, double sampleR
         const double center = 1000.0 * std::pow(2.0, (double)k / bandsPerOctave);
         const double lo = center / edge, hi = center * edge;
         if (center < 20.0 || lo >= sampleRate * 0.5) continue;
-        const double lobe = 2.0 * sampleRate / len;   // half main-lobe width in Hz
+        const double lobe = 2.0 * sampleRate / len;   // half main-lobe width in Hz (report only)
         const bool resolved = (hi - lo) >= 2.0 * lobe;
-        const double iLo = resolved ? lo : std::min(lo, center - lobe);
-        const double iHi = resolved ? hi : std::max(hi, center + lobe);
-        int begin = std::max(1, (int)std::ceil(iLo / hzPerBin));
-        int end = std::min(monitor_fft::bins - 1, (int)std::ceil(iHi / hzPerBin));
+        // Measure the band's OWN frequency range only. Widening unresolved low bands to the whole
+        // window lobe made every low band integrate the same wide slice (including DC rumble), so
+        // all of them read high on any content - wrong data. A standard RTA reports what falls in
+        // the band's edges; resolution limits are stated, not compensated by overlap.
+        int begin = std::max(2, (int)std::ceil(lo / hzPerBin));   // bin 2 on: DC / infrasonic leakage stays out
+        int end = std::min(monitor_fft::bins - 1, (int)std::ceil(hi / hzPerBin));
+        if (end <= begin) {   // narrower than one bin: the nearest bin stands in
+            begin = std::max(2, std::min(begin, monitor_fft::bins - 2));
+            end = begin + 1;
+        }
         double energy = 0.0;
         for (int j = begin; j < end; ++j) {
             const double amplitude = std::pow(10.0, fftDb[(size_t)j] / 20.0);
@@ -427,11 +433,11 @@ struct Peak { double frequency = 0, db = -160; };
 // Visual width only, centred on the interpolated frequency rather than
 // snapped to fixed octave bands. This is not a measured bandwidth.
 inline std::pair<double, double> visualBounds(const Peak& peak) {
-    constexpr double factor = 1.0594630943592953; // 2^(1/12)
+    constexpr double factor = 1.0293151018611496; // 2^(1/24): half a semitone each way - narrow markers,
+                                                  // so neighbours stay distinguishable (designer pass)
     return {peak.frequency / factor, peak.frequency * factor};
 }
-inline std::vector<Peak> find(const std::vector<float>& fftDb, double sampleRate, int len = monitor_fft::size) {
-    std::vector<Peak> candidates, peaks;
+inline std::vector<Peak> find(const std::vector<float>& fftDb, double sampleRate, int len = monitor_fft::size) {    std::vector<Peak> candidates, peaks;
     if (fftDb.size() != monitor_fft::bins || !(sampleRate > 0)) return peaks;
     const double spacing = sampleRate / monitor_fft::fftSize;
     const double resolution = sampleRate / len;
@@ -465,6 +471,109 @@ inline std::vector<Peak> find(const std::vector<float>& fftDb, double sampleRate
         if (!likelyLeakage) peaks.push_back(candidate);
     }
     return peaks;
+}
+
+// ---- temporal tracking (user request: the tonal peak's x-position is too jittery) ----
+// The short fast window (512 samples) has a coarse bin spacing, so the interpolated peak swings
+// from bin to bin frame by frame. A tracker keeps each tone's DISPLAYED position as an exponentially
+// smoothed estimate: real glides still follow (snap on a big jump), noise jitter averages out.
+struct Tracked { double frequency; double db; int unseen; };
+inline std::vector<Tracked> g_tracker;
+
+inline void resetTracking() { g_tracker.clear(); }
+
+inline std::vector<Peak> track(const std::vector<Peak>& fresh, double sampleRate, int len, double maxGlideHzPerSec = 150.0, double dt = 0.033, int maxPeaks = 16) {
+    const double resolution = sampleRate / std::max(64, len);   // one bin's width at this window length
+    std::vector<int> taken(fresh.size(), -1);
+    std::vector<bool> matched(g_tracker.size(), false);
+    // Pass 1: match each fresh peak to the closest tracker within about half a bin (a real tone barely moves).
+    for (size_t f = 0; f < fresh.size(); ++f) {
+        int best = -1; double bestD = 1e30;
+        for (size_t t = 0; t < g_tracker.size(); ++t) {
+            if (matched[t]) continue;
+            const double d = std::abs(std::log(fresh[f].frequency / g_tracker[t].frequency));
+            if (d < bestD) { bestD = d; best = (int)t; }
+        }
+        if (best >= 0) {
+            const double tol = std::log(1.0 + std::max(0.5 * resolution, fresh[f].frequency * 0.004) / fresh[f].frequency);
+            if (bestD < tol) taken[f] = best;
+        }
+    }
+    // Pass 2: a fresh peak with no near tracker may belong to a tone that moved a few bins since
+    // the last analyzer frame (the short window jitters). Glide the SEEN-LATELY tracker toward it
+    // instead of adopting a new marker - a jump between two markers is what reads as "too fast".
+    // Tight (user bug): only two bins, and only when the level is compatible. A wider radius let
+    // a marker hop from peak to peak in dense material, and its slow speed-limited glide across
+    // the display read as a spurious portamento sweep.
+    const double glideRadius = std::log(1.0 + 2.0 * resolution);
+    for (size_t f = 0; f < fresh.size(); ++f) {
+        if (taken[f] >= 0) continue;
+        int best = -1; double bestD = 1e30;
+        for (size_t t = 0; t < g_tracker.size(); ++t) {
+            if (matched[t] || g_tracker[t].unseen > 4) continue;
+            if (std::abs(g_tracker[t].db - fresh[f].db) > 8.0) continue;   // a different tone's level: never steal it
+            const double d = std::abs(std::log(fresh[f].frequency / g_tracker[t].frequency));
+            if (d < bestD) { bestD = d; best = (int)t; }
+        }
+        if (best >= 0 && bestD < glideRadius) taken[f] = best;
+    }
+    // The glide step for this update: speed-limited, so the marker NEVER jumps frame to frame.
+    const double step = std::max(0.0, maxGlideHzPerSec) * std::max(0.001, dt);
+    std::vector<Peak> out;
+    const size_t known = matched.size();   // trackers that existed before this frame (adopting grows g_tracker)
+    out.reserve(fresh.size());
+    for (size_t f = 0; f < fresh.size(); ++f) {
+        const int t = taken[f];
+        if (t < 0) {   // no tracker: adopt immediately (new tones appear, they do not fade in)
+            if ((int)g_tracker.size() < 32) g_tracker.push_back({fresh[f].frequency, fresh[f].db, 0});
+            out.push_back(fresh[f]);
+            continue;
+        }
+        Tracked& tr = g_tracker[(size_t)t];
+        matched[(size_t)t] = true;
+        tr.unseen = 0;
+        // Position: glide toward the measurement at the speed limit. A genuinely different tone
+        // (more than three octaves away) snaps instead of crawling across the display.
+        const double d = fresh[f].frequency - tr.frequency;
+        if (std::abs(std::log(fresh[f].frequency / std::max(1.0, std::abs(tr.frequency)))) > std::log(8.0))
+            tr.frequency = fresh[f].frequency;
+        else if (std::abs(d) <= step)
+            tr.frequency = fresh[f].frequency;
+        else
+            tr.frequency += (d > 0 ? step : -step);
+        tr.db = tr.db + 0.35 * (fresh[f].db - tr.db);
+        out.push_back({tr.frequency, tr.db});
+    }
+    // Unmatched trackers survive a few frames with a decaying level, so a tone does not blink out
+    // on one noisy frame; then they are forgotten. Only the PRE-EXISTING trackers participate:
+    // adoptees were just matched and output (iterating the grown vector here would read past 'matched').
+    for (size_t t = 0; t < known; ++t) {
+        if (!matched[t]) {
+            Tracked& tr = g_tracker[t];
+            ++tr.unseen;
+            if (tr.unseen <= 6 && tr.db - 1.0 * tr.unseen > -120.0) out.push_back({tr.frequency, tr.db - 1.0 * tr.unseen});
+        }
+    }
+    // Drop stale trackers the moment they stop being displayed (the fade window is 6 frames).
+    // A marker that lingers past the window can silently re-capture a nearby peak with its old
+    // position and then glide slowly toward the real tone - on screen that reads as a spurious
+    // portamento sweep (the "messy after switching modes" bug).
+    g_tracker.erase(std::remove_if(g_tracker.begin(), g_tracker.end(),
+                                   [](const Tracked& tr) { return tr.unseen > 6; }),
+                    g_tracker.end());
+    // The displayed set: the strongest maxPeaks tones (Better view reads calmly; Realistic passes
+    // a huge cap so every detected peak is shown).
+    if ((int)out.size() > maxPeaks) {
+        std::sort(out.begin(), out.end(), [](const Peak& a, const Peak& b) { return a.db > b.db; });
+        out.resize(maxPeaks);
+    }
+    return out;
+}
+
+// Tracking variant of find(): same pure detection, then speed-limited glide (see track()).
+// maxGlideHzPerSec: how fast a marker may move - small = stable, larger = realistic.
+inline std::vector<Peak> findTracked(const std::vector<float>& fftDb, double sampleRate, int len, double maxGlideHzPerSec = 150.0, double dt = 0.033, int maxPeaks = 16) {
+    return track(find(fftDb, sampleRate, len), sampleRate, len, maxGlideHzPerSec, dt, maxPeaks);
 }
 
 // Put the strongest accepted tonal peak in each supplied frequency

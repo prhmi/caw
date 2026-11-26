@@ -141,6 +141,19 @@ bool PdBackend::reloadPatch(const std::string& patchPath,const std::vector<pd_co
     close_(oldPatch);
     return true;
 }
+// The CAW CABLE bridge: a tiny patch CAW writes for this clip and opens in the SAME instance as the
+// user's patch. It maps every cable name to its fixed channels: [adc~ 9..24] -> [s~ cawcable-<name>-L/R]
+// for the [cawr~ <name>] receivers, [r~ cawcable-<name>-out-L/R] -> [dac~ 9..24] for the [caws~ <name>]
+// senders. The user's patch never touches adc~ / dac~ for cables: adc~ stays the microphone.
+bool PdBackend::openBridge(const std::string& bridgePath,std::string& error) {
+    if(bridge_ && close_){close_(bridge_);bridge_=nullptr;}
+    if(bridgePath.empty())return true;
+    HookScope scope(this);
+    const auto p=std::filesystem::u8path(bridgePath);
+    bridge_=open_(p.filename().u8string().c_str(),p.parent_path().u8string().c_str());
+    if(!bridge_){error="libpd could not open the CAW cable bridge.";return false;}
+    return true;
+}
 bool PdBackend::bindOutputs(const std::vector<pd_control_syntax::Output>& outputs,std::string& error) {
     if(outputs.empty())return true;
     boundOutputs_=outputs;
@@ -217,18 +230,26 @@ bool PdBackend::openEngine(const std::string& libraryPath,int rate,int channels,
     unbind_=reinterpret_cast<Unbind>(symbol(library_,"libpd_unbind"));
     setFloatHook_=reinterpret_cast<SetFloatHook>(symbol(library_,"libpd_set_floathook"));
     const int initialized=init_();
-    if((initialized != 0 && initialized != -1) || blockSize_()!=tickFrames() || initAudio_(0,channels,rate)!=0) {
+    if((initialized != 0 && initialized != -1) || blockSize_()!=tickFrames() || initAudio_(kInputChannels,kTrackSlots+kCableOutChannels,rate)!=0) {
         error="libpd initialization or audio configuration failed.";close();return false;
     }
     if(!setDsp(true)) {error="Could not enable libpd DSP.";close();return false;}
     dsp_=true; channels_=channels;return true;
 }
-bool PdBackend::processTick(float* output,std::string& error) {
+bool PdBackend::processTick(float* output,std::string& error,const float* input,float* cableOut) {
     if(!dsp_||!patch_||!output){error="PD is not running.";return false;}
-    std::array<float,64> noInput{};
+    // inputs: mic (adc~ 1..8) + cables (adc~ 9..24), interleaved kInputChannels wide, or silence
+    std::array<float,64*kInputChannels> silence{};
+    // libpd writes channels_ + kCableOutChannels per frame: render wide, then split track / cables
+    const int wide=kTrackSlots+kCableOutChannels;   // dac~ 1..8 track, dac~ 9..24 cables (fixed, whatever the track width)
+    if(wideOut_.size()<(size_t)(64*wide))wideOut_.assign((size_t)(64*wide),0.f);
     HookScope scope(this);
-    if(process_(1,noInput.data(),output)!=0){error="libpd audio processing failed.";return false;}
-    for(int i=0;i<tickFrames()*channels_;++i)if(!std::isfinite(output[i]))output[i]=0.f;
+    if(process_(1,input?input:silence.data(),wideOut_.data())!=0){error="libpd audio processing failed.";return false;}
+    for(int f=0;f<tickFrames();++f) {
+        const float* src=wideOut_.data()+(size_t)f*wide;
+        for(int c=0;c<channels_;++c){const float v=src[c];output[(size_t)f*channels_+c]=std::isfinite(v)?v:0.f;}
+        if(cableOut)for(int c=0;c<kCableOutChannels;++c){const float v=src[kTrackSlots+c];cableOut[(size_t)f*kCableOutChannels+c]=std::isfinite(v)?v:0.f;}
+    }
     return true;
 }
 bool PdBackend::bang(const std::string& receiver,std::string& error) {
@@ -260,6 +281,8 @@ void PdBackend::close() noexcept {
     HookScope scope(this);
     unbindOutputs();
     if(dsp_) {setDsp(false);dsp_=false;}
+    if(bridge_ && close_) close_(bridge_);
+    bridge_=nullptr;
     if(patch_ && close_) close_(patch_);
     patch_=nullptr;channels_=0;dollarZero_=0;
     if(setPrintHook_)setPrintHook_(nullptr);

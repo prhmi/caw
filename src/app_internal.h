@@ -15,6 +15,9 @@ using SockLen = socklen_t;
 
 bool scManualRunning(int clipId);
 CawScRing* sampleRingOf(int trackId);
+CawScRing* scTrackRingOf(int slot);              // one ring per SuperCollider track slot (engine 2)
+void updateScSlotSuppress();                     // recompute which SC track slots an FX-only VSTe consumes
+void ensureSampleEngineForVstInputs();           // a VSTe input names a sample or locked source: start its sample-engine feed
 void clearSampleRings();
 void scRealtimeSource(void* context, float* output, unsigned long frames, int channels) noexcept;
 void attachScRealtimeSource(CawAudioSettings& settings);
@@ -115,11 +118,13 @@ void thinToLimit(std::vector<AutoPoint>& s, double eps, size_t maxPoints);
 double waveUnit(int shape, double ph);
 std::vector<AutoPoint> genWavePoints(int shape, double rate, double amp, double centerValue, double lo, double hi, double t0, double t1);
 bool autoSelBounds(const std::vector<AutoPoint>& lane, const std::set<int>& sel, double& tMin, double& tMax, double& vMin, double& vMax);
-void reshapeDots(std::vector<AutoPoint>& lane, const std::vector<int>& idx, const std::vector<AutoPoint>& orig, double dStart, double dEnd, double stretch, double morph, double lo, double hi);
+void reshapeDots(std::vector<AutoPoint>& lane, const std::vector<int>& idx, const std::vector<AutoPoint>& orig, double dStart, double dEnd, double stretch, double morph, double lo, double hi, double anchorT = -1.0, double anchorSpan = -1.0);
 WaveHandles waveHandlePos(float x0, float x1, float yTop, float yBot, float yMid, float ly0, float ly1, float xMax);
 void drawWaveHandles(ImDrawList* dl, const WaveHandles& h, int active);
 void recFeed(int idx, float v);
 bool hasAutoSelection();
+std::map<std::pair<int, std::string>, std::set<int>> allSelectedDots();
+void setAllSelectedDots(const std::map<std::pair<int, std::string>, std::set<int>>& all, int primaryTrack, const std::string& primaryChannel);
 void deleteSelectedAutoPoints();
 void endChildTight();
 int strCb(ImGuiInputTextCallbackData* d);
@@ -185,6 +190,7 @@ void saveScLangPath();
 std::filesystem::path scSynthConfigPath();
 void saveScSynthPath();
 std::string scLangExePath();
+bool scNrtAvailable();   // sclang + scsynth.exe found: the offline SuperCollider render can run (sc_nrt.h)
 std::string writePrivateSclangConf();
 std::string scSynthLibraryPath();
 std::string scBootstrap(int outputChannels, int serverPort);
@@ -204,7 +210,9 @@ void scTimelineWindows(double from);
 void scheduleScTimeline(double from, bool restart = false);
 void pollScEngine(float /*dt*/);
 void pollCawHub();
+void ensureCawAudioInput();   // open the soundcard input (mic) when the project needs it
 std::vector<std::string> collectCawHubNames();
+void collectCawBusNames(std::vector<std::string>& sends, std::vector<std::string>& recvs);   // cawbsend / cawbrecv names in the Csound code
 bool testPdLibrary(std::string& error);
 bool historyBusy();
 void historyCommit(std::string now);
@@ -262,9 +270,11 @@ void pollMonitor();
 void noteRealtimeOpcodeError(const std::string& line);
 void drainPlayOutput();
 void updateRecording();
+void seedScLaneDefaults();   // push every SC lane's default into the language after boot
 bool trackHasRec(const Track& t);
 void drawWavePopup(Track& lane, Clip& clip);
 void updateMeters(float dt);
+int scTrackMeterChannels(const Track& t);   // the SC meter follows the clip code's channel count
 void writeSerial();
 void sendCommand(bool replace, const std::string& rows, int count);
 void resetCommands();
@@ -276,6 +286,7 @@ std::vector<std::string> collectVstTapChannels(const std::vector<VstJob>& jobs);
 void pushVstTapsToCsound();
 std::vector<VstSoloNote> buildVstSoloNotes();
 std::vector<VstScript> buildVstScripts();
+std::vector<VstScript> buildVstScripts(const Project& proj);
 bool trackIsVst(int trackId);
 std::set<int> vstSoloActiveIds();
 std::vector<std::pair<std::string, double>> vstGateValues();
@@ -319,6 +330,7 @@ bool audioClipsSelected();
 void joinAudioSelectedClips();
 void mixedPdTransport(bool playing);
 void tickTimeline(float dt);
+void pushEngineTrackGains(double time, bool force = false);   // the fader x volume lane -> live Csound / PD / SuperCollider
 void playNotice(const std::string& text, const std::string& shortText = std::string());
 bool makePdPlan(std::vector<pd_timeline::Event>& events, std::string& error, bool includeMuted = false);
 void refreshMixedPdPlan(float dt);
@@ -344,6 +356,22 @@ void joinSelectedClips();
 bool timelinePlaying();
 void toggleTimelinePlay();
 void seekTimeline(double t);
+// TRACK FREEZE (Cubase-style lock): state in track_freeze.h, definitions in engine_dispatch.cpp.
+bool freezeTrackBegin(int trackIdx);   // starts the render pass (the lock button); false + console message when impossible
+void freezeUnfreeze(int trackIdx);     // unlock: delete the WAV, the live engines play again
+void freezeTick();                     // every UI frame: watches the render pass (finalize / cancel)
+void freezeCancel();                   // abort the pass from the progress dialog
+bool freezeActive();
+bool freezeOffline();
+float freezeProgress();
+const std::string& freezeTrackName();
+const std::string& freezeError();
+// A VSTe lock renders its current sources through the plugins directly, then locks only the rack.
+std::vector<int> freezeVsteSources(int rackIdx);           // the tracks the enabled inputs name
+bool freezeVsteReady(int rackIdx, std::string& problem);   // can the direct rack render run right now?
+bool freezeVsteBegin(int rackIdx);
+bool freezeVsteRenderAll(int rackIdx);                     // queue the source freezes, then the rack bounce (offline)
+std::string cawExportDir(const char* kind);                // where CAW saves generated files: <user>/caw/exports/<kind> or <project>/exports/<kind> (Settings > Files)
 int unmuteAllTracks();
 int unsoloAllTracks();
 void drawTransport();
@@ -373,6 +401,8 @@ void drawSettings();
 const TextEditor::LanguageDefinition& csoundLanguage();
 void winMaxPrepare(int key);
 void winMaxTitleButton(int key);
+void winMaxPrepareT(const char* title);   // the same maximize box, keyed by the window title
+void winMaxTitleButtonT(const char* title);
 bool codeEditorBody(std::unordered_map<int, std::unique_ptr<TextEditor>>& editors, int key, std::string& code, float reserveBottom = 0.f, int lang = 0, bool diag = false);
 bool colorPicker(const char* id, uint32_t& color, uint32_t fallback);
 std::vector<UdoPoolEntry> projectUdoEntries();
@@ -390,9 +420,15 @@ void drawX3FieldsPopup(Clip& clip, bool pd);
 void drawEditor();
 const char* midiPitchName(int pitch);
 bool midiZoomSlider(const char* id, float& zoom);
+// Whole-number dB text box (master / track volume): one click does nothing, a double-click selects the whole
+// number ready to type, Enter or a click elsewhere applies it, Esc cancels. No drag, no partial selection.
+bool dbIntBox(const char* id, int& db, int minDb, int maxDb, float width, const char* suffix);
 void midiPitchSlider(const char* id, int& pitchLow);
 void drawMultiMidiEditor();
 void drawMidiEditor();
+void openSoundEditor(int clipId, int view);   // the sound editor window of a sample clip (view 0 waveshape, 1 spectrogram)
+void drawSoundEditors();
+bool soundEditorFocused(); // a sound editor window has the keyboard focus: the project undo/redo (Ctrl+Z / Ctrl+Y) stays out of its way
 void appOpenProjectPath(const char* path);
 void appQueueFileDrop(const char* path, int x, int y);
 bool appTakeQueuedFileDrop(std::string& path, int& x, int& y);

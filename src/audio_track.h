@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -213,9 +214,17 @@ inline long long fileStamp(const std::string& path) {
 #endif
 }
 
+inline std::mutex& decodeCacheMutex() { static std::mutex mu; return mu; }
+inline std::map<std::string, DecodeEntry>& decodeCacheMap() { static std::map<std::string, DecodeEntry> cache; return cache; }
+// Drop a file from the decode cache: the next getAudio() reads it from disk again (the sound editor wrote it).
+inline void forgetAudio(const std::string& path) {
+    std::lock_guard<std::mutex> lock(decodeCacheMutex());
+    decodeCacheMap().erase(path);
+}
+
 inline AudioHandle getAudio(const std::string& path, int ffmpegSr, const std::string& ffmpegExe, std::string& error) {
-    static std::mutex mu;
-    static std::map<std::string, DecodeEntry> cache;
+    std::mutex& mu = decodeCacheMutex();
+    std::map<std::string, DecodeEntry>& cache = decodeCacheMap();
     const long long stamp = fileStamp(path);
     {
         std::lock_guard<std::mutex> lock(mu);
@@ -271,6 +280,23 @@ inline float monoAt(const AudioData& d, size_t frame) {
     const float* p = d.samples.data() + frame * (size_t)d.channels;
     if (d.channels == 1) return p[0];
     return 0.5f * (p[0] + p[1]);
+}
+// a channel-aware read for the editor: chan 0 = the mono mix (same as monoAt), chan >= 1
+// that channel index (1-based). The editor edits / displays one channel at a time.
+inline float monoAtChan(const AudioData& d, size_t frame, int chan) {
+    const int ch = std::max(1, d.channels);
+    const float* p = d.samples.data() + frame * (size_t)ch;
+    if (ch == 1) return p[0];
+    if (chan <= 0 || chan > ch) return 0.5f * (p[0] + p[1]);   // mix
+    return p[(size_t)(chan - 1)];
+}
+// the same read on raw interleaved samples (the editor's STFT works on the editable buffer)
+inline float specChanAt(const float* samples, int channels, size_t frame, int chan) {
+    const int ch = std::max(1, channels);
+    const float* p = samples + frame * (size_t)ch;
+    if (ch == 1) return p[0];
+    if (chan <= 0 || chan > ch) return 0.5f * (p[0] + p[1]);   // mix
+    return p[(size_t)(chan - 1)];
 }
 
 // ---------------------------------------------------------------- spectrogram FFT
@@ -509,7 +535,280 @@ inline uint32_t spectroColor(float db, int cr, int cg, int cb) {   // Audacity d
     return 0xFF000000u | ((uint32_t)std::min(255, (int)(b * 255.f)) << 16) | ((uint32_t)std::min(255, (int)(g * 255.f)) << 8) | (uint32_t)std::min(255, (int)(r * 255.f));
 }
 
-// ---------------------------------------------------------------- engine
+// ---------------------------------------------------------------- editor spectrogram (stable analysis + GPU texture)
+// One STFT for the WHOLE FILE with parameters that follow the FILE (window = next power of two of
+// fileFrames/8, clamped 256..4096; hop = window/8; fixed log-frequency rows), never the zoom.
+// Zooming and panning only re-sample this same analysis - so a harmonic keeps its color at every
+// zoom level. (The previous draft made the window follow the zoom: sharper in theory, but the
+// re-analysis at every step repainted the same audio in different colors.)
+// The analysis is computed PROGRESSIVELY (a few milliseconds of FFT work per redraw, the visible
+// range first) and cached as quantized dB per analysis frame; the view render maps it into a
+// per-pixel RGBA image that the editor uploads to a GPU texture once per view change (ONE quad
+// per frame, see ui_texture.h).
+
+struct EditorSpectroImg {
+    long long key = -1;
+    int w = 0, h = 0;
+    std::vector<uint32_t> rgba;
+};
+
+// The spectrogram's tunable parameters (Audacity's Preferences > Spectrograms, adapted):
+// analysis: window size / type / zero padding; view: frequency range and scale, threshold +
+// range, the per-octave frequency gain and the color scheme. Analysis parameters change the
+// cached STFT (it is rebuilt); view parameters only resample the same analysis, so colors stay
+// stable while panning and zooming.
+struct EditorSpecSettings {
+    int win = 0;              // 0 = auto (next pow2 of fileFrames/8, clamped 256..4096), else 256..16384
+    int winType = 5;          // 0 none, 1 blackman, 2 gaussian a=2.5, 3 a=3.5, 4 a=4.5, 5 hann, 6 hamming
+    int zeroPad = 1;          // 1 or 2: the FFT runs over N*zeroPad points (finer frequency interpolation)
+    int chan = 0;             // 0 = mono mix, else the 1-based channel the analysis is computed on
+    double minHz = 20.0, maxHz = 20000.0;    // the frequency range the view shows
+    double minDb = -100.0;    // min threshold: everything below reads as the colormap's floor
+    double rangeDb = 90.0;    // dB from the threshold up to the colormap's top
+    double freqGainDb = 8.0;  // frequency gain: dB added per octave above 1 kHz (lifts the highs)
+    int scale = 1;            // 0 linear, 1 logarithmic, 2 mel
+    int color = 0;            // 0 roseus (Audacity's default), 1 classic, 2 spectral, 3 inferno, 4 grayscale
+};
+
+struct EditorSpecCache {                           // per-file analysis, keyed by gen ^ path ^ stamp ^ settings
+    long long key = -1;
+    int sr = 0, N = 0, rows = 0, zeroPad = 1;
+    double hopSec = 0.0;
+    long long nFrames = 0, cursor = 0;
+    std::vector<unsigned char> done;               // per analysis frame: computed?
+    std::vector<unsigned char> db;                 // frame * rows + row: quantized dB (-110..-10 -> 0..255)
+    std::vector<float> winFn;                      // window coefficients (type follows the settings)
+    std::vector<double> binLo, binHi;
+};
+
+inline float editorSpecDb(const EditorSpecCache& c, long long fi, int r) {
+    if (fi < 0 || fi >= c.nFrames || !c.done[(size_t)fi]) return -110.f;   // not computed yet: floor (black)
+    return -110.f + (float)c.db[(size_t)fi * (size_t)c.rows + (size_t)r] * (100.f / 255.f);
+}
+
+inline uint32_t editorInferno(float x) {   // x 0..1: matplotlib's inferno stops, linearly interpolated
+    static const unsigned char st[11][3] = {
+        {0, 0, 4}, {22, 11, 57}, {66, 10, 104}, {106, 23, 110}, {147, 38, 95}, {188, 55, 84},
+        {221, 81, 58}, {243, 120, 25}, {252, 165, 10}, {250, 214, 55}, {252, 255, 164}};
+    x = std::max(0.f, std::min(1.f, x));
+    const float f = x * 10.f;
+    const int i = std::min(9, (int)f);
+    const float t = f - (float)i;
+    const int r = (int)std::lround((float)st[i][0] + ((float)st[i + 1][0] - (float)st[i][0]) * t);
+    const int g = (int)std::lround((float)st[i][1] + ((float)st[i + 1][1] - (float)st[i][1]) * t);
+    const int b = (int)std::lround((float)st[i][2] + ((float)st[i + 1][2] - (float)st[i][2]) * t);
+    return 0xFF000000u | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r;
+}
+
+inline uint32_t editorLerpCol(uint32_t a, uint32_t b, float t) {
+    const int ar = (int)(a & 0xFF), ag = (int)((a >> 8) & 0xFF), ab = (int)((a >> 16) & 0xFF);
+    const int br = (int)(b & 0xFF), bg = (int)((b >> 8) & 0xFF), bb = (int)((b >> 16) & 0xFF);
+    return 0xFF000000u | ((uint32_t)(int)(ab + (float)(bb - ab) * t) << 16) | ((uint32_t)(int)(ag + (float)(bg - ag) * t) << 8) | (uint32_t)(int)(ar + (float)(br - ar) * t);
+}
+
+// The color schemes (Audacity's names; control-point tables, linearly interpolated):
+// spectral: dark blue -> purple -> red -> orange -> yellow -> near white; pastel: soft washed
+// tones; contrast: steep gray for maximum separation; rbw: blue -> white -> red; inferno
+// (matplotlib's, kept as an option); grayscale.
+inline uint32_t editorSpecColor(float x, int scheme) {
+    if (scheme == 3) return editorInferno(x);
+    // Audacity's schemes (control points, linearly interpolated):
+    // roseus (Audacity's default): black -> deep plum -> magenta -> pink -> cream white;
+    // classic: the old Audacity look, black -> blue -> cyan -> white; spectral: the classic
+    // dark blue -> red -> yellow -> white; grayscale.
+    static const unsigned char roseus[]  = {0, 0, 0, 24, 9, 33, 62, 25, 79, 116, 57, 122, 168, 104, 164, 213, 158, 190, 244, 211, 224, 255, 246, 246};
+    static const unsigned char classic[] = {0, 0, 0, 8, 8, 55, 16, 55, 125, 24, 105, 185, 60, 160, 215, 140, 210, 240, 220, 240, 250, 255, 255, 255};
+    static const unsigned char spectral[] = {0, 0, 8, 10, 18, 96, 28, 66, 180, 84, 142, 235, 132, 92, 215, 192, 62, 132, 236, 96, 60, 250, 166, 40, 252, 226, 122, 255, 255, 236};
+    static const unsigned char gray[]     = {0, 0, 0, 64, 64, 64, 128, 128, 128, 192, 192, 192, 255, 255, 255};
+    static const unsigned char* tabs[5] = {roseus, classic, spectral, nullptr, gray};
+    static const int counts[5] = {8, 8, 10, 11, 5};
+    scheme = std::max(0, std::min(4, scheme));
+    const unsigned char* st = tabs[scheme];
+    const int n = counts[scheme];
+    x = std::max(0.f, std::min(1.f, x));
+    const float f = x * (float)(n - 1);
+    const int i = std::min(n - 2, (int)f);
+    const float t = f - (float)i;
+    const int r = (int)std::lround((float)st[i * 3] + ((float)st[(i + 1) * 3] - (float)st[i * 3]) * t);
+    const int g = (int)std::lround((float)st[i * 3 + 1] + ((float)st[(i + 1) * 3 + 1] - (float)st[i * 3 + 1]) * t);
+    const int b = (int)std::lround((float)st[i * 3 + 2] + ((float)st[(i + 1) * 3 + 2] - (float)st[i * 3 + 2]) * t);
+    return 0xFF000000u | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r;
+}
+
+// Builds / advances the per-file analysis: metadata on a key change (window size / type / zero
+// padding come from the settings), then up to ~8 ms of FFT work per call - the visible range
+// first (so what the user looks at appears immediately), then the rest from a rolling cursor.
+// Never re-computes a frame: colors cannot drift with the view.
+inline void editorSpecEnsure(const float* samples, int channels, int srIn, size_t nTotal, long long key, EditorSpecCache& c, double t0, double t1, const EditorSpecSettings& s) {
+    if (!samples || nTotal == 0) return;
+    const int sr = std::max(8000, srIn);
+    const size_t totalFrames = nTotal;
+    if (c.key != key) {
+        c.key = key;
+        c.sr = sr;
+        int N = 256;   // auto: the window follows the file length, never the view
+        while (N < 4096 && (double)N < (double)totalFrames / 8.0) N <<= 1;
+        if (s.win >= 256) N = std::min(16384, s.win);   // a manual window size wins
+        c.N = N;
+        c.zeroPad = s.zeroPad == 2 ? 2 : 1;
+        c.rows = 256;   // fixed: the row count must not depend on the view height either
+        const long long hopF = std::max((long long)(N / 8), (long long)std::ceil((double)totalFrames / 90000.0));
+        c.hopSec = (double)hopF / (double)sr;
+        c.nFrames = (long long)std::ceil((double)totalFrames / (double)hopF) + 1;
+        c.cursor = 0;
+        c.done.assign((size_t)c.nFrames, 0);
+        c.db.assign((size_t)c.nFrames * (size_t)c.rows, 0);
+        c.winFn.assign((size_t)N, 0.f);
+        const double dn = (double)(N - 1), wm = dn * 0.5;
+        for (int k = 0; k < N; ++k) {
+            const double xk = (double)k, c2 = 6.283185307179586 * xk / dn;
+            double w = 0.5 * (1.0 - std::cos(c2));   // hann (default)
+            switch (s.winType) {
+                case 0: w = 1.0; break;   // none (rectangular)
+                case 1: w = 0.42 - 0.5 * std::cos(c2) + 0.08 * std::cos(2.0 * c2); break;   // blackman
+                case 2: w = std::exp(-0.5 * 2.5 * 2.5 * std::pow((xk - wm) / wm, 2)); break;   // gaussian a=2.5
+                case 3: w = std::exp(-0.5 * 3.5 * 3.5 * std::pow((xk - wm) / wm, 2)); break;   // gaussian a=3.5
+                case 4: w = std::exp(-0.5 * 4.5 * 4.5 * std::pow((xk - wm) / wm, 2)); break;   // gaussian a=4.5
+                case 6: w = 0.54 - 0.46 * std::cos(c2); break;   // hamming
+                default: break;
+            }
+            c.winFn[(size_t)k] = (float)w;
+        }
+        const double fHi = std::min(20000.0, sr * 0.5), fLo = 20.0;
+        c.binLo.assign((size_t)c.rows, 0.0);
+        c.binHi.assign((size_t)c.rows, 0.0);
+        for (int r = 0; r < c.rows; ++r) {
+            const double a = fLo * std::pow(fHi / fLo, (double)r / (double)c.rows);
+            const double b = fLo * std::pow(fHi / fLo, (double)(r + 1) / (double)c.rows);
+            c.binLo[(size_t)r] = a / (double)sr * (double)(N * c.zeroPad);
+            c.binHi[(size_t)r] = b / (double)sr * (double)(N * c.zeroPad);
+        }
+    }
+    if (c.nFrames <= 0) return;
+    static std::vector<float> buf, pad, mag;   // scratch (single UI thread)
+    buf.assign((size_t)c.N, 0.f);
+    pad.assign((size_t)c.N * (size_t)c.zeroPad, 0.f);
+    mag.resize((size_t)(c.N * c.zeroPad / 2 + 1));
+    const auto tstart = std::chrono::steady_clock::now();
+    auto budgetLeft = [&]() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - tstart).count() < 0.008;
+    };
+    auto computeFrame = [&](long long fi) {
+        if (fi < 0 || fi >= c.nFrames || c.done[(size_t)fi]) return;
+        const long long centre = (long long)((double)fi * c.hopSec * (double)sr);
+        for (int k = 0; k < c.N; ++k) {
+            const long long f = centre + k - c.N / 2;
+            buf[(size_t)k] = (f >= 0 && f < (long long)totalFrames) ? specChanAt(samples, channels, (size_t)f, s.chan) * c.winFn[(size_t)k] : 0.f;
+        }
+        const int fftN = c.N * c.zeroPad;
+        if (c.zeroPad == 2) {   // zero padding: the windowed block plus a zero tail -> finer frequency interpolation
+            std::memcpy(pad.data(), buf.data(), (size_t)c.N * sizeof(float));
+            fftMag(pad.data(), mag.data(), fftN);
+        } else {
+            fftMag(buf.data(), mag.data(), fftN);
+        }
+        unsigned char* out = c.db.data() + (size_t)fi * (size_t)c.rows;
+        const int nBins = fftN / 2;
+        for (int r = 0; r < c.rows; ++r) {
+            const long long b0 = std::max(1LL, (long long)std::floor(c.binLo[(size_t)r]));
+            const long long b1 = std::min((long long)nBins, (long long)std::ceil(c.binHi[(size_t)r]));
+            float best = 0.f;
+            for (long long b = b0; b <= b1; ++b) best = std::max(best, mag[(size_t)b]);
+            if (c.binHi[(size_t)r] - c.binLo[(size_t)r] < 1.5) {   // sub-bin rows: frequency-interpolate the two nearest bins
+                const double fb = 0.5 * (c.binLo[(size_t)r] + c.binHi[(size_t)r]);
+                const long long bi = std::min((long long)nBins, std::max(1LL, (long long)std::lround(fb)));
+                const long long bj = std::min((long long)nBins, bi + 1);
+                const float t = (float)(fb - (double)bi);
+                best = std::max(best, mag[(size_t)bi] * (1.f - t) + mag[(size_t)bj] * t);
+            }
+            const float dbv = 20.f * std::log10(std::max(1e-7f, best * (4.f / (float)fftN)));   // full-scale sine ~ 0 dB
+            out[(size_t)r] = (unsigned char)std::lround(std::max(0.f, std::min(1.f, (dbv + 110.f) / 100.f)) * 255.f);
+        }
+        c.done[(size_t)fi] = 1;
+    };
+    const double hopSec = std::max(1e-9, c.hopSec);
+    const long long vf0 = std::max(0LL, (long long)std::floor(std::min(t0, t1) / hopSec) - 1);
+    const long long vf1 = std::min(c.nFrames, (long long)std::ceil(std::max(t0, t1) / hopSec) + 1);
+    for (long long fi = vf0; fi < vf1 && budgetLeft(); ++fi) computeFrame(fi);
+    while (c.cursor < c.nFrames && budgetLeft()) { computeFrame(c.cursor); ++c.cursor; }
+}
+
+// Renders the view (t0..t1 into w*h pixels) from the stable analysis. Zoomed in, columns
+// interpolate between the two bracketing analysis frames; zoomed out, they max-hold over the
+// frames the pixel covers (stride-sampled: with hop <= N/8 a transient spans >= 8 frames, so a
+// stride of n/16 cannot miss one). The settings drive the y-axis scale (linear / log / mel),
+// the frequency range, the per-octave frequency gain, the threshold / range mapping and the
+// color scheme - all applied per pixel while resampling the SAME analysis.
+inline const EditorSpectroImg& editorSpectroImage(const float* samples, int channels, int sr, size_t nTotal, long long viewKey, long long fileKey, double t0, double t1, int w, int h, const EditorSpecSettings& s) {
+    static EditorSpecCache cache;
+    editorSpecEnsure(samples, channels, sr, nTotal, fileKey, cache, t0, t1, s);
+    static EditorSpectroImg img;
+    if (img.key == viewKey && img.w == w && img.h == h) return img;
+    img.key = viewKey;
+    img.w = w;
+    img.h = h;
+    img.rgba.assign((size_t)w * (size_t)h, 0xFF000000u);   // black floor
+    if (cache.nFrames <= 0 || !samples || nTotal == 0 || w <= 0 || h <= 0) return img;
+    const int rows = cache.rows;
+    const double hopSec = std::max(1e-9, cache.hopSec);
+    const double ts0 = std::min(t0, t1);
+    const double span = std::max(1e-9, std::fabs(t1 - t0));
+    const long long maxFi = cache.nFrames - 1;
+    const double fpp = span / (double)w / hopSec;   // analysis frames per pixel column
+    const double fMax = std::min(std::max(s.maxHz, 10.0), cache.sr * 0.5);
+    const double fMin = std::min(std::max(s.minHz, 1.0), fMax - 1.0);
+    const double fLo = 20.0, fHi = std::min(20000.0, cache.sr * 0.5);   // the analysis' fixed log-frequency grid
+    const double logLo = std::log(fLo), logHi = std::log(fHi);
+    auto freqAt = [&](double u) {   // u: 0 at the bottom pixel, 1 at the top
+        if (s.scale == 0) return fMax * u;   // linear
+        if (s.scale == 2) {                  // mel: 2595*log10(1 + f/700)
+            const double mMax = 2595.0 * std::log10(1.0 + fMax / 700.0);
+            const double mMin = 2595.0 * std::log10(1.0 + fMin / 700.0);
+            const double m = mMin + (mMax - mMin) * u;
+            return 700.0 * (std::pow(10.0, m / 2595.0) - 1.0);
+        }
+        return fMin * std::pow(fMax / fMin, u);   // logarithmic
+    };
+    std::vector<float> rowDb((size_t)rows);
+    const float minDb = (float)s.minDb, rangeDb = (float)std::max(10.0, s.rangeDb);
+    const float freqGain = (float)s.freqGainDb;
+    for (int x = 0; x < w; ++x) {
+        const double fa = (ts0 + (double)x / (double)w * span) / hopSec;
+        const double fb = (ts0 + (double)(x + 1) / (double)w * span) / hopSec;
+        if (fpp <= 1.0) {   // zoomed in: linearly interpolate the two bracketing frames
+            const long long i = std::min(maxFi, std::max(0LL, (long long)std::floor(fa)));
+            const long long j = std::min(maxFi, i + 1);
+            const float ft = (float)std::max(0.0, std::min(1.0, fa - (double)i));
+            for (int r = 0; r < rows; ++r)
+                rowDb[(size_t)r] = editorSpecDb(cache, i, r) * (1.f - ft) + editorSpecDb(cache, j, r) * ft;
+        } else {   // zoomed out: max over the frames the column covers (stride-sampled, endpoints included)
+            const long long a = std::max(0LL, (long long)std::floor(fa));
+            const long long b = std::min(maxFi, std::max(a, (long long)std::ceil(fb)));
+            const long long stride = std::max(1LL, (b - a) / 16);
+            for (int r = 0; r < rows; ++r) rowDb[(size_t)r] = -110.f;
+            for (long long fi = a;; fi += stride) {
+                if (fi > b) fi = b;
+                for (int r = 0; r < rows; ++r) rowDb[(size_t)r] = std::max(rowDb[(size_t)r], editorSpecDb(cache, fi, r));
+                if (fi >= b) break;
+            }
+        }
+        // per pixel: the frequency from the scale, its position on the log-frequency analysis
+        // grid (y = 0 is the top: high frequencies), the frequency gain, then the colormap
+        for (int y = 0; y < h; ++y) {
+            const double f = std::max(0.5, freqAt(1.0 - (double)y / (double)h));
+            const double ru = std::max(0.0, std::min(1.0, (std::log(f) - logLo) / (logHi - logLo)));
+            const float rf = (float)(ru * (double)(rows - 1));
+            const int ri = std::min(rows - 1, (int)rf);
+            const int rj = std::min(rows - 1, ri + 1);
+            const float t = rf - (float)ri;
+            const float db = rowDb[(size_t)ri] * (1.f - t) + rowDb[(size_t)rj] * t + freqGain * std::log2(std::max(f, 20.0) / 1000.0);
+            img.rgba[(size_t)y * (size_t)w + (size_t)x] = editorSpecColor((db - minDb) / rangeDb, s.color);
+        }
+    }
+    return img;
+}
+
+
 struct VoiceSpec {
     int trackId = 0, clipId = 0;
     int kind = 0;                       // 0 whole clip (managed by the timeline), 1 sampler note, 2 manual audition (unmanaged)
@@ -571,8 +870,9 @@ public:
     // the audio frame clock: frames rendered by the shared callback since the engine was created
     double timeSeconds() const { return (double)frames_.load(std::memory_order_relaxed) / (double)std::max(8000, sr_.load(std::memory_order_relaxed)); }
 
-    void render(float* out, int frames, int channels) noexcept {
+    void render(float* out, int frames, int channels, bool force = false) noexcept {
         if (!out || frames <= 0 || channels <= 0) return;
+        if (!force && offline_.load(std::memory_order_acquire)) return;   // an offline freeze render owns the clock: the live streams stay silent
         frames_.fetch_add(frames, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(mu_);
         const double invSr = 1.0 / (double)std::max(8000, sr_.load(std::memory_order_relaxed));
@@ -682,6 +982,12 @@ public:
                     g.clipId = v.spec.clipId;
                     g.data = v.data;
                     g.outSrc = v.spec.outSrc;
+                    if (gr.out > 0.5) {   // the grain's own output channel (play: ... , out): out1..out8 (1-based).
+                                           // It plays the file's first channel on that output; the virtual
+                                           // soundcard fold (channel k -> k mod N) applies at the master.
+                        g.outSrc.fill(-1);
+                        g.outSrc[(size_t)std::min(7, std::max(0, (int)std::lround(gr.out) - 1))] = 0;
+                    }
                     g.normalize = v.spec.normalize;
                     g.t0 = v.spec.t0 + gr.at;
                     const double now = v.spec.t0 + v.rel;
@@ -785,10 +1091,12 @@ public:
                         : (outC < (int)v.spec.outSrc.size() ? v.spec.outSrc[(size_t)outC] : -1);
                     if (src < 0 || src >= nIn) continue;   // that output is silent (or its input does not exist)
                     const float w = processed[src];
-                    if (outC < channels) out[(size_t)i * (size_t)channels + (size_t)outC] += w;
+                    out[(size_t)i * (size_t)channels + (size_t)(outC % channels)] += w;   // the virtual soundcard fold: output k plays on the mix channel k mod N
                     if (feedOn) {   // per-track handoff for VSTe inputs (post track gain, pre master)
                         auto& fb = feedAcc_[v.spec.trackId];
-                        if (fb.size() >= (size_t)frames * 8) fb[(size_t)i * 8 + (size_t)outC] += w;
+                        const size_t need = (size_t)frames * 8;
+                        if (fb.size() < need) fb.resize(need, 0.f);
+                        fb[(size_t)i * 8 + (size_t)outC] += w;
                     }
                     // per-track meter peak (per OUTPUT channel, after the track gain)
                     {
@@ -831,16 +1139,17 @@ public:
             if (voices_.size() >= 256) break;   // runaway guard (e.g. every 0.001 with a huge grain count)
             voices_.push_back(makeVoice(g));
         }
-        // per-track handoff: one callback per track that had a voice this block
+        // VSTe inputs are always stereo, independent of the device's output channel count.
         if (feedOn)
             for (const auto& kv : feedAcc_) {
                 const size_t need = (size_t)frames * 8;
                 if (kv.second.size() < need) continue;
-                feedBuf_.resize((size_t)frames * (size_t)channels);
-                for (int i = 0; i < frames; ++i)
-                    for (int c = 0; c < channels && c < 8; ++c)
-                        feedBuf_[(size_t)i * (size_t)channels + (size_t)c] = kv.second[(size_t)i * 8 + (size_t)c];
-                feedFn_(kv.first, feedBuf_.data(), frames, channels);
+                feedBuf_.resize((size_t)frames * 2);
+                for (int i = 0; i < frames; ++i) {
+                    feedBuf_[(size_t)i * 2] = kv.second[(size_t)i * 8];
+                    feedBuf_[(size_t)i * 2 + 1] = kv.second[(size_t)i * 8 + 1];
+                }
+                feedFn_(kv.first, feedBuf_.data(), frames, 2);
             }
         // Manual clip auditions (kind 2) sound with the transport STOPPED; the VST effects wired
         // to that track still have to render them. Published every block for the rack's awake check.
@@ -850,6 +1159,7 @@ public:
     }
 
     // ---- control (UI thread)
+    void setOffline(bool o) { offline_.store(o, std::memory_order_release); }   // the offline sample freeze owns the engine clock while set
     void clearAll() { std::lock_guard<std::mutex> lock(mu_); voices_.clear(); trackGains_.clear(); }
     // live per-track gain multiplier (track volume automation, updated every tick without restarting voices)
     void setTrackGain(int trackId, float gain) {
@@ -946,6 +1256,7 @@ private:
     std::map<int, std::vector<float>> feedAcc_;                 // per-track block accumulators (8-channel stride)
     std::vector<float> feedBuf_;                                // interleaved scratch for the feed callback
     std::atomic<int> sr_{48000};
+    std::atomic<bool> offline_{false};   // an offline (faster than real time) freeze render owns the engine clock
     std::atomic<long long> frames_{0};
     std::atomic<int> manualVoices_{0};   // manual auditions (kind 2) sounding this block - read by the VST rack's awake check
 

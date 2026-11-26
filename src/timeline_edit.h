@@ -14,11 +14,14 @@
 // A drag is reconstructed from its starting snapshot on every frame, so moving
 // back and forth or crossing tracks never moves a point twice.
 struct ClipAutomationMove {
-    struct TaggedPoint { AutoPoint point; int clipId = 0; };
+    // clipId > 0: the dot belongs to a moved clip. clipId == -1: a selected dot that is not owned by a moved
+    // clip - it follows the drag in time and stays on its own track. picked = it was selected (kept selected).
+    struct TaggedPoint { AutoPoint point; int clipId = 0; bool picked = false; };
     std::map<int, std::map<std::string, std::vector<TaggedPoint>>> lanes;
     std::map<int, std::map<std::string, CawParam>> ranges;
 
-    void capture(const Project& project, const std::set<int>& selected) {
+    using DotSelection = std::map<std::pair<int, std::string>, std::set<int>>;
+    void capture(const Project& project, const std::set<int>& selected, const DotSelection* dots = nullptr) {
         lanes.clear();
         ranges.clear();
         for (const Track& track : project.tracks) {
@@ -29,7 +32,11 @@ struct ClipAutomationMove {
             auto& snapshot = lanes[track.id];
             for (const auto& lane : track.automation) {
                 auto& saved = snapshot[lane.first];
-                for (const AutoPoint& point : lane.second) {
+                const std::set<int>* laneDots = nullptr;
+                if (dots) { const auto d = dots->find({track.id, lane.first}); if (d != dots->end()) laneDots = &d->second; }
+                for (int pointIndex = 0; pointIndex < (int)lane.second.size(); ++pointIndex) {
+                    const AutoPoint& point = lane.second[(size_t)pointIndex];
+                    const bool picked = laneDots && laneDots->count(pointIndex) > 0;
                     int owner = 0;
                     for (const Clip& clip : track.clips) {
                         if (selected.count(clip.id) && channels[clip.id].count(lane.first) &&
@@ -38,13 +45,16 @@ struct ClipAutomationMove {
                             break;
                         }
                     }
-                    saved.push_back({point, owner});
+                    if (!owner && picked) owner = -1;
+                    saved.push_back({point, owner, picked});
                 }
             }
         }
     }
 
-    void apply(Project& project, double dt, const std::map<int, double>* individualShifts = nullptr) const {
+    // selectedOut (optional): the new indices of the picked dots after the move (the lanes are re-sorted).
+    void apply(Project& project, double dt, const std::map<int, double>* individualShifts = nullptr,
+               DotSelection* selectedOut = nullptr) const {
         std::map<int, Track*> tracks;
         std::map<int, int> clipTracks;
         for (Track& track : project.tracks) {
@@ -52,6 +62,7 @@ struct ClipAutomationMove {
             for (const Clip& clip : track.clips) clipTracks[clip.id] = track.id;
             track.automation.clear();
         }
+        std::map<std::pair<int, std::string>, std::vector<std::pair<AutoPoint, bool>>> rebuilt;
         for (const auto& original : lanes) {
             if (!tracks.count(original.first)) continue;
             for (const auto& lane : original.second) {
@@ -59,7 +70,9 @@ struct ClipAutomationMove {
                 for (const TaggedPoint& tagged : lane.second) {
                     AutoPoint point = tagged.point;
                     int target = original.first;
-                    if (tagged.clipId && clipTracks.count(tagged.clipId)) {
+                    if (tagged.clipId == -1) {   // a selected free dot: same track, shifted like the drag
+                        point.t = std::max(0.0, point.t + (individualShifts ? 0.0 : dt));
+                    } else if (tagged.clipId && clipTracks.count(tagged.clipId)) {
                         double shift = dt;
                         if (individualShifts) {
                             const auto it = individualShifts->find(tagged.clipId);
@@ -73,14 +86,19 @@ struct ClipAutomationMove {
                             if (range != sourceRanges->second.end()) tracks[target]->automationRanges[lane.first] = range->second;
                         }
                     }
-                    tracks[target]->automation[lane.first].push_back(point);
+                    rebuilt[{target, lane.first}].push_back({point, tagged.picked});
                 }
             }
         }
-        for (Track& track : project.tracks)
-            for (auto& lane : track.automation)
-                std::stable_sort(lane.second.begin(), lane.second.end(),
-                    [](const AutoPoint& a, const AutoPoint& b) { return a.t < b.t; });
+        if (selectedOut) selectedOut->clear();
+        for (auto& [key, pts] : rebuilt) {
+            std::stable_sort(pts.begin(), pts.end(), [](const auto& a, const auto& b) { return a.first.t < b.first.t; });
+            auto& dest = tracks[key.first]->automation[key.second];
+            for (int k = 0; k < (int)pts.size(); ++k) {
+                dest.push_back(pts[(size_t)k].first);
+                if (selectedOut && pts[(size_t)k].second) (*selectedOut)[key].insert(k);
+            }
+        }
     }
 };
 
@@ -219,13 +237,14 @@ inline void mapExportChannels(const T* input, size_t frames, int source, int tar
         } else if (source == 1) {
             out[0] = out[1] = in[0];
         } else if (target == 2 && source > 2) {
+            // The virtual soundcard fold: channel k plays on export channel k mod 2 - SUM the
+            // pairs (ch1+ch3 -> left, ch2+ch4 -> right), exactly like the live master does.
             double left = 0, right = 0;
-            int nl = 0, nr = 0;
             for (int i = 0; i < source; ++i) {
-                if (i % 2 == 0) { left += in[i]; ++nl; }
-                else { right += in[i]; ++nr; }
+                if (i % 2 == 0) left += in[i];
+                else right += in[i];
             }
-            out[0] = (T)(left / nl); out[1] = (T)(right / nr);
+            out[0] = (T)(left); out[1] = (T)(right);
         } else {
             for (int i = 0; i < std::min(source, target); ++i) out[i] = in[i];
         }
