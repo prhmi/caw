@@ -337,6 +337,36 @@ struct MonitorFrameAssembler {
 #include <string>
 #include <system_error>
 #include <vector>
+#if defined(__APPLE__)
+#include <cstdlib>
+#include <cstring>
+#include <locale.h>
+#include <xlocale.h>
+#endif
+
+// std::from_chars(float) is marked "introduced in macOS 26" by Apple's libc++, so it cannot be used with
+// a normal deployment target. On macOS use strtof_l with the "C" locale (still locale-independent).
+struct MonitorFloatParse { const char* ptr; bool ok; };
+inline MonitorFloatParse monitorParseFloat(const char* first, const char* last, float& value) {
+#if defined(__APPLE__)
+    static locale_t cLocale = newlocale(LC_ALL_MASK, "C", nullptr);
+    char buf[64];
+    size_t n = 0;
+    while (first + n != last && !std::isspace(static_cast<unsigned char>(first[n]))) {
+        if (n + 1 >= sizeof(buf)) return {first, false};
+        buf[n] = first[n]; ++n;
+    }
+    buf[n] = 0;
+    if (n == 0 || buf[0] == '+' || std::strpbrk(buf, "xX")) return {first, false}; // match from_chars: no '+', no hex
+    char* end = nullptr;
+    value = strtof_l(buf, &end, cLocale);
+    if (end == buf) return {first, false};
+    return {first + (end - buf), true};
+#else
+    auto r = std::from_chars(first, last, value, std::chars_format::general);
+    return {r.ptr, r.ec == std::errc()};
+#endif
+}
 
 // Locale-independent fast parsing for the high-volume raw monitor lines.
 // Other Csound messages retain their existing parser.
@@ -356,8 +386,8 @@ inline bool parseRawMonitorValues(const char* first, const char* last,
         spaces();
         if (first == last) break;
         float value = 0;
-        auto parsed = std::from_chars(first, last, value, std::chars_format::general);
-        if (parsed.ec != std::errc() || parsed.ptr == first ||
+        auto parsed = monitorParseFloat(first, last, value);
+        if (!parsed.ok || parsed.ptr == first ||
             values.size() >= (size_t)MonitorFrameAssembler::chunkSize) return false;
         values.push_back(value);
         first = parsed.ptr;

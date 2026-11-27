@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(caw LANGUAGES C CXX)
 if(APPLE)
+  # OBJC too: GLFW's .m files must compile as Objective-C. With only OBJCXX enabled CMake compiled them as
+  # Objective-C++ and they failed ("assigning to 'id' from incompatible type 'void *'").
+  enable_language(OBJC)
   enable_language(OBJCXX)   # the VST3 SDK's macOS module loader (module_mac.mm) is Objective-C++
 endif()
 
@@ -253,7 +256,9 @@ if(CAW_VST3)
  elseif(APPLE)
   # the plugin editor window: an NSWindow (vst_editor_mac.mm, Objective-C++ with ARC)
   target_sources(caw PRIVATE ${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting/module_mac.mm src/vst_editor_mac.mm)
-  set_source_files_properties(src/vst_editor_mac.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+  # both files need ARC: the SDK's module_mac.mm stops with "#error this file needs to be compiled with automatic reference counting"
+  set_source_files_properties(src/vst_editor_mac.mm ${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting/module_mac.mm
+                              PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
  else()
   # the plugin editor window: an X11 window the plugin embeds into (vst_editor_x11.cpp)
   find_package(X11 REQUIRED)

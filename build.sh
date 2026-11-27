@@ -14,14 +14,25 @@ if [ "$OS" = "Darwin" ]; then
   GEN=()
   command -v ninja >/dev/null && GEN=(-G Ninja)
   EXTRA=(-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0)
+  # The VST3 SDK asks `xcodebuild -version`, which fails with only the Command Line Tools (no full Xcode).
+  # Then tell it a version ourselves (it reads the env var to skip its own check, and the cmake variable for the value).
+  if ! xcodebuild -version 2>/dev/null | grep -q "^Xcode"; then
+    export XCODE_VERSION=15.0
+    EXTRA+=(-DXCODE_VERSION=15.0)
+  fi
   [ -n "$CAW_UNIVERSAL" ] && EXTRA+=("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64")
 else
   GEN=(); command -v ninja >/dev/null && GEN=(-G Ninja)
   EXTRA=()
 fi
 
+CMAKE_ARGS=(); for a in "$@"; do [ "$a" = "nostart" ] || CMAKE_ARGS+=("$a"); done
 echo "=== Configuring (dependencies are cached in ~/.caw_deps) ==="
-cmake -B build "${GEN[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 "${EXTRA[@]}" "$@" 2>&1 | tee caw_configure.log
+cmake -B build "${GEN[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 "${EXTRA[@]}" "${CMAKE_ARGS[@]}" 2>&1 | tee caw_configure.log
+[ "${PIPESTATUS[0]}" = "0" ] || {
+  echo; echo "[FAILED] CMake configure failed, so nothing was built. The real error is in caw_configure.log:"
+  grep -n -m 15 -E "CMake Error|FATAL_ERROR|fatal:|Could not|failed" caw_configure.log
+  exit 1; }
 echo "=== Building ==="
 cmake --build build --config Release -j "$JOBS" 2>&1 | tee caw_build.log
 [ "${PIPESTATUS[0]}" = "0" ] || { echo "[FAILED] see caw_build.log (first error)"; exit 1; }
