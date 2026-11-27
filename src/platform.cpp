@@ -62,6 +62,8 @@ std::string bundledFfmpeg() {
 #endif
 }
 
+std::string cawOwnFolder();   // defined below
+
 std::string bundledLibpd() {
 #ifdef _WIN32
     // Installed layout first: <caw.exe folder>\PureData\libpd.dll (made by the installer, together with
@@ -77,6 +79,23 @@ std::string bundledLibpd() {
     }
     return std::string();
 #else
+    // macOS / Linux packages (AppImage, CAW.app, the .tar.gz): <caw folder>/PureData/libpd.so|.dylib,
+    // or ../Resources/PureData (inside CAW.app), or ../lib/caw/PureData (an installed AppImage tree).
+    const std::string own = cawOwnFolder();
+    if (own.empty()) return {};
+    const fs::path dir = fs::u8path(own);
+#ifdef __APPLE__
+    const char* name = "libpd.dylib";
+#else
+    const char* name = "libpd.so";
+#endif
+    std::error_code ec;
+    for (const fs::path& library : {dir / "PureData" / name, dir / name,
+                                    dir.parent_path() / "Resources" / "PureData" / name,
+                                    dir.parent_path() / "lib" / "caw" / "PureData" / name}) {
+        ec.clear();
+        if (fs::is_regular_file(library, ec) && !ec) return library.u8string();
+    }
     return {};
 #endif
 }
@@ -99,6 +118,21 @@ std::string bundledCsound() {
         const fs::path candidate = dir / rel;
         ec.clear();
         if (fs::is_regular_file(candidate, ec) && !ec) return candidate.u8string();
+    }
+#else
+    // macOS / Linux packages: a private Csound beside caw (<caw folder>/Csound/bin/csound, its
+    // libcsound64.so/.dylib next to it), or inside CAW.app (../Resources/Csound), or in the
+    // AppImage tree (../lib/caw/Csound). CAW loads the API library that sits beside this program.
+    const std::string own = cawOwnFolder();
+    if (!own.empty()) {
+        const fs::path dir = fs::u8path(own);
+        std::error_code ec;
+        for (const fs::path& base : {dir / "Csound", dir.parent_path() / "Resources" / "Csound", dir.parent_path() / "lib" / "caw" / "Csound"})
+            for (const fs::path& rel : {fs::path("bin") / "csound", fs::path("csound")}) {
+                const fs::path candidate = base / rel;
+                ec.clear();
+                if (fs::is_regular_file(candidate, ec) && !ec) return candidate.u8string();
+            }
     }
 #endif
     return {};
@@ -168,7 +202,28 @@ void prepareCsoundEnvironment(const std::string& csoundExe) {
         SetEnvironmentVariableW(L"OPCODE7DIR64", plugins.wstring().c_str());
     }
 #else
-    (void)csoundExe;
+    // macOS / Linux packages: a Csound copied beside caw keeps its opcode plugins in
+    // <Csound>/lib/csound/plugins64-7.0 (or similar). Point Csound at that folder - but only for
+    // the bundled copy, never for a system-installed Csound (it knows its own plugin path).
+    const std::string own = cawOwnFolder();
+    if (own.empty() || csoundExe.empty()) return;
+    std::error_code ec;
+    const fs::path exe = fs::weakly_canonical(fs::u8path(csoundExe), ec);
+    const fs::path app = fs::weakly_canonical(fs::u8path(own).parent_path(), ec);
+    if (exe.empty() || app.empty() || exe.native().rfind(app.native(), 0) != 0) return;
+    const fs::path root = exe.parent_path().filename() == "bin" ? exe.parent_path().parent_path() : exe.parent_path();
+    for (const fs::path& base : {root / "lib" / "csound", root / "lib", root}) {
+        ec.clear();
+        if (!fs::is_directory(base, ec) || ec) continue;
+        for (fs::directory_iterator it(base, ec), end; !ec && it != end; it.increment(ec)) {
+            const std::string name = it->path().filename().string();
+            if (it->is_directory(ec) && name.rfind("plugins", 0) == 0) {
+                setenv("OPCODE6DIR64", it->path().c_str(), 1);
+                setenv("OPCODE7DIR64", it->path().c_str(), 1);
+                return;
+            }
+        }
+    }
 #endif
 }
 
@@ -356,7 +411,11 @@ std::string superColliderSclang() {
     // SuperCollider install has no CAW host pump (caw_sc_world_new...), so it is only the last resort.
     std::vector<fs::path> roots;
     const std::string own = cawOwnFolder();
-    if (!own.empty()) roots.push_back(fs::u8path(own) / "SuperCollider");
+    if (!own.empty()) {
+        roots.push_back(fs::u8path(own) / "SuperCollider");
+        roots.push_back(fs::u8path(own).parent_path() / "Resources" / "SuperCollider");   // inside CAW.app
+        roots.push_back(fs::u8path(own).parent_path() / "lib" / "caw" / "SuperCollider");  // AppImage tree
+    }
     const std::string home = getEnv("HOME");
     if (!home.empty()) roots.push_back(fs::u8path(home) / ".caw_deps" / "supercollider" / "runtime-x64");
     for (const fs::path& root : roots) {

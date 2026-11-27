@@ -1,9 +1,19 @@
-# Windows installer
+# Installers
 
-1. `build.bat` (project root) builds `build\Release\caw.exe`.
-2. `1-PREPARE.bat` collects caw.exe, the SuperCollider runtime, libpd and a Csound copy into `stage\`, and downloads the VC++ runtime into `redist\`.
-3. `2-BUILD-INSTALLER.bat` packs them with Inno Setup into `Output\CAW-Setup-<version>.exe`.
+| System | Folder | Steps | Result |
+|---|---|---|---|
+| Windows | `installer\` | `1-PREPARE.bat` → `2-BUILD-INSTALLER.bat` (Inno Setup) | `Output\CAW-Setup-<version>.exe` |
+| Linux | `installer/linux/` | `1-prepare.sh` → `2-build-appimage.sh` (or `2-build-tarball.sh`) | `Output/CAW-<version>-x86_64.AppImage` |
+| macOS | `installer/macos/` | `1-prepare.sh` → `2-build-dmg.sh` | `Output/CAW-<version>.dmg` |
 
-**Needs:** `CAW-Setup.iss`, the Inno Setup script. It isn't in this repository yet: copy yours into this folder.
+Each one bundles CAW together with **Csound 7**, **libpd** and **CAW's SuperCollider**, so users install nothing else. Build CAW and the engines first (see `HOW to Build.md`). Step 1 warns about anything missing.
 
-The engines come from `tools\windows\` (SuperCollider, libpd) and an installed Csound 7.
+**Windows:** copy your Inno Setup script `CAW-Setup.iss` into `installer\`. It isn't in this repository yet.
+
+CAW looks for the bundled engines next to itself first:
+
+| System | Folders |
+|---|---|
+| Windows | `Csound\`, `PureData\`, `SuperCollider\` beside `caw.exe` |
+| Linux (AppImage) | `usr/lib/caw/` |
+| macOS | `CAW.app/Contents/Resources/` |
