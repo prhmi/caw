@@ -14,8 +14,11 @@ tools="$here/tools"; mkdir -p "$tools"
 ld="$tools/linuxdeploy-$arch.AppImage"
 if [ ! -x "$ld" ]; then
   echo "Downloading linuxdeploy..."
-  curl -fL -o "$ld" "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$arch.AppImage"
-  chmod +x "$ld"
+  url="https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$arch.AppImage"
+  if command -v curl >/dev/null; then curl -fL -o "$ld.part" "$url"
+  elif command -v wget >/dev/null; then wget -O "$ld.part" "$url"
+  else echo "[ERROR] Neither curl nor wget is installed: sudo apt install curl"; exit 1; fi
+  mv -f "$ld.part" "$ld"; chmod +x "$ld"
 fi
 
 app="$here/AppDir"; rm -rf "$app"
