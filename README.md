@@ -211,18 +211,16 @@ Named streams can be set up under **Edit cawscore**. A signal stream is plotted 
 
 ## Build
 
-**Windows:** install Visual Studio with *Desktop development with C++* and Git, then run `build.bat`.
+**The full step-by-step guide is in [HOW to Build.md](HOW%20to%20Build.md).** It covers Windows, Linux and macOS, the engines (Csound 7, Pure Data, SuperCollider), the Windows installer and common errors.
 
-**macOS / Linux:** install CMake, Ninja and Git, plus on Linux the ALSA, JACK, GL and X11/Wayland development packages. Then run:
+Short version:
 
-```bash
-chmod +x build.sh
-./build.sh            # ./build.sh nostart -DCAW_VST3=OFF  builds without VST
-```
+| System | Build CAW | Engines (optional) |
+|---|---|---|
+| Windows | `build.bat` | `tools\windows\BUILD-CSOUND.bat`, `BUILD-LIBPD.bat`, `BUILD-LIBSCSYNTH.bat` |
+| Linux / macOS | `./build.sh` | `tools/unix/build-engines.sh` |
 
-The first build downloads ImGui, PortAudio, GLFW and the VST3 SDK into `~/.caw_deps`. Later builds work offline.
-
-**Current macOS / Linux limits:** plugin windows don't open (plugins still play), and a crashing plugin crashes CAW (on Windows CAW catches it).
+The VST3 SDK, Dear ImGui, PortAudio and GLFW are downloaded and built by CAW's own build. CAW runs without the engines; only their tracks are unavailable.
 
 ---
 
