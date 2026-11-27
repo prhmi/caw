@@ -40,6 +40,9 @@
 #include "pluginterfaces/vst/ivstevents.h"
 #include "pluginterfaces/vst/ivstmidicontrollers.h"
 #include "crash_dump.h"   // cawcrash::sehSwallowRecord: a faulting plugin is recorded, not fatal
+#if defined(__linux__)
+#include <sys/select.h>   // CawRunLoop: polling the plugin editor's file descriptors
+#endif
 #if !defined(_WIN32)
 #include "vst_editor_native.h"   // the plugin editor window on macOS (Cocoa) / Linux (X11)
 #endif
@@ -245,8 +248,6 @@ public:
 // Linux VST3: the host must offer Steinberg::Linux::IRunLoop through the IPlugFrame. Plugin editors
 // (VSTGUI, JUCE...) register their X11 connection's file descriptor and their redraw timers here;
 // without it they open blank or never animate. CAW runs it from the UI thread every frame.
-#include <sys/select.h>
-#include <chrono>
 class CawRunLoop : public Steinberg::Linux::IRunLoop {
 public:
     tresult PLUGIN_API registerEventHandler(Steinberg::Linux::IEventHandler* h, Steinberg::Linux::FileDescriptor fd) override {
