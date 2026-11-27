@@ -3003,6 +3003,22 @@ bool isSystemSuperColliderPath(const std::string& path) {
 }
 
 
+// Reads a saved engine path (~/.caw_libpd_path, ~/.caw_sclang_path, ~/.caw_scsynth_path, also on
+// Windows in %USERPROFILE%). The file may have been written by a build script or by hand: strip a
+// trailing "\r", spaces and quotes, and expand a leading "~/". Empty = nothing usable.
+static std::string readSavedPath(const std::filesystem::path& file) {
+    if (file.empty()) return {};
+    std::ifstream in(file, std::ios::binary);
+    if (!in) return {};
+    std::string saved; std::getline(in, saved);
+    auto isTrim = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '"' || c == '\''; };
+    while (!saved.empty() && isTrim(saved.back())) saved.pop_back();
+    size_t b = 0; while (b < saved.size() && isTrim(saved[b])) ++b;
+    saved = saved.substr(b);
+    if (saved.rfind("~/", 0) == 0) { const std::string home = plat::getEnv("HOME"); if (!home.empty()) saved = home + saved.substr(1); }
+    return saved;
+}
+
 void appInit() {
     const auto began = std::chrono::steady_clock::now();
     logLine("[caw] CAW build: " + std::string(caw_brand::buildTag) +
@@ -3058,36 +3074,49 @@ void appInit() {
     });
     g_pdLibraryPath = plat::bundledLibpd();
     g_scLangPath = plat::superColliderSclang();
-    const auto scConfig = scConfigPath();
-    if (!scConfig.empty()) {
-        std::ifstream in(scConfig, std::ios::binary);
-        if (in) {
-            std::string saved; std::getline(in, saved);
-            std::error_code ec;
-            if (!saved.empty() && !isSystemSuperColliderPath(saved) && std::filesystem::is_regular_file(std::filesystem::u8path(saved), ec) && !ec)
-                g_scLangPath = saved;
-        }
+    // Saved engine paths (Settings > Programs, or written by the engine build scripts). A path that
+    // is set but unusable is reported in the console, so "CAW cannot find it" is never silent.
+    auto usable = [](const std::string& path, const char* what, const char* file) -> bool {
+        if (path.empty()) return false;
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(std::filesystem::u8path(path), ec) && !ec) return true;
+        logLine(std::string("[caw] ") + what + ": the saved path in ~/" + file + " does not exist: " + path);
+        return false;
+    };
+    {
+        const std::string saved = readSavedPath(scConfigPath());
+        if (!saved.empty() && isSystemSuperColliderPath(saved))
+            logLine("[caw] SuperCollider: the saved sclang is a normal SuperCollider install (no CAW driver) - ignored: " + saved);
+        else if (usable(saved, "SuperCollider", ".caw_sclang_path")) g_scLangPath = saved;
     }
-    const auto scSynthConfig = scSynthConfigPath();
-    if (!scSynthConfig.empty()) {
-        std::ifstream in(scSynthConfig, std::ios::binary);
-        if (in) {
-            std::string saved; std::getline(in, saved);
-            std::error_code ec;
-            if (!saved.empty() && !isSystemSuperColliderPath(saved) && std::filesystem::is_regular_file(std::filesystem::u8path(saved), ec) && !ec)
-                g_scSynthPath = saved;
-        }
+    {
+        const std::string saved = readSavedPath(scSynthConfigPath());
+        if (!saved.empty() && isSystemSuperColliderPath(saved))
+            logLine("[caw] SuperCollider: the saved libscsynth is a normal SuperCollider install - ignored: " + saved);
+        else if (usable(saved, "SuperCollider", ".caw_scsynth_path")) g_scSynthPath = saved;
     }
-    const auto pdConfig = pdConfigPath();
-    if (!pdConfig.empty()) {
-        std::ifstream in(pdConfig, std::ios::binary);
-        if (in) {
-            std::string saved; std::getline(in, saved);
-            std::error_code ec;
-            if (!saved.empty() && std::filesystem::is_regular_file(std::filesystem::u8path(saved), ec) && !ec)
-                g_pdLibraryPath = saved;
-        }
+    {
+        const std::string saved = readSavedPath(pdConfigPath());
+        if (usable(saved, "Pure Data", ".caw_libpd_path")) g_pdLibraryPath = saved;
     }
+    // Nothing saved: CAW's own build folders (tools/unix/build-*.sh), so a fresh build is found
+    // even without the settings files.
+    if (!plat::isWindows) {
+        const std::string home = plat::getEnv("HOME");
+        std::error_code ec;
+        const char* pdName = plat::isMac ? "libpd.dylib" : "libpd.so";
+        if (g_pdLibraryPath.empty() && !home.empty()) {
+            const auto f = std::filesystem::u8path(home) / ".caw_deps" / "libpd" / pdName;
+            if (std::filesystem::is_regular_file(f, ec)) g_pdLibraryPath = f.u8string();
+        }
+        const auto scDir = std::filesystem::u8path(home) / ".caw_deps" / "supercollider" / "runtime-x64" / "SuperCollider";
+        const char* scName = plat::isMac ? "libscsynth.dylib" : "libscsynth.so";
+        if (!home.empty() && (g_scLangPath.empty() || g_scLangPath == "sclang") && std::filesystem::is_regular_file(scDir / "sclang", ec)) g_scLangPath = (scDir / "sclang").u8string();
+        if (!home.empty() && g_scSynthPath.empty() && std::filesystem::is_regular_file(scDir / scName, ec)) g_scSynthPath = (scDir / scName).u8string();
+    }
+    logLine("[caw] Engine paths: Pure Data = " + (g_pdLibraryPath.empty() ? std::string("(not found)") : g_pdLibraryPath) +
+            " | sclang = " + (g_scLangPath.empty() ? std::string("(not found)") : g_scLangPath) +
+            " | libscsynth = " + (g_scSynthPath.empty() ? std::string("(auto)") : g_scSynthPath));
     for (float& v : g_specSm) v = -120.f;
     historyReset();
     g_savedSnap = serializeProject(g_proj);

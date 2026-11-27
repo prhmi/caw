@@ -315,6 +315,8 @@ CAW_UNIVERSAL=1 ./build.sh nostart       # Apple Silicon + Intel in one app
 - Result: **`build/caw.app`**. The script signs it locally, so Apple Silicon Macs run it.
 - **First start:** right-click `caw.app` → **Open** → **Open**. macOS blocks apps not signed by a registered Apple developer.
 - If VST blocks the build, try `./build.sh nostart -DCAW_VST3=OFF` first.
+- **Full Xcode isn't needed.** With only the Command Line Tools, `build.sh` gives the VST3 SDK an Xcode version itself (`XCODE_VERSION=15.0`).
+- If setup (configure) fails, `build.sh` stops and shows the first errors from `caw_configure.log`.
 
 ### 3.3 Engines
 
@@ -422,6 +424,7 @@ Deleting `.caw_deps` makes the next build download everything again.
 | Message | Cause | Fix |
 |---|---|---|
 | `Csound API library not found` / `cannot compile abs or sqrt` | no Csound library found | build or install Csound 7, **restart CAW**, or pick `libcsound64.so` / `csound64.dll` in Settings → Programs |
+| CAW says Pure Data / SuperCollider **not found** (Linux / macOS) | the saved path is wrong, or CAW was started before the engine was built | restart CAW; the console prints `[caw] Engine paths: ...` at start and a line for any saved path it rejects. Fix it in **Settings → Programs** or rerun the engine script |
 | `This libpd was not built with MULTI=true` | an ordinary libpd | build it with the script (`make MULTI=true`) |
 | `missing CAW's host-pump entry points` / `old CAW audio ABI` | a normal or old SuperCollider | build CAW's SuperCollider (section 4) |
 | `Unrecognised audio API: external` | the CAW patch wasn't applied | use the current `build-libscsynth.sh`; it checks each edit |

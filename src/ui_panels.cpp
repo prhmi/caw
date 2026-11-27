@@ -1,6 +1,7 @@
 #include "app_shared.h"
 #include <mutex>
 #include <ctime>
+#include <vector>
 #include "platform.h"
 
 // src/ui_panels.cpp (phase 2: extracted from app.cpp; the shared state is app_state.h, the
@@ -2178,11 +2179,11 @@ void drawSettings() {
                     if (inputStr("##sc_sclang", g_scLangPath, 0)) saveScLangPath();
                     ImGui::SameLine();
                     if (ImGui::Button("Browse##scsclang")) {
-                        const auto path = plat::chooseFile(false, "Choose SuperCollider language", "SuperCollider language", {"exe"}, "");
+                        const auto path = plat::chooseFile(false, "Choose SuperCollider language", "SuperCollider language", plat::isWindows ? std::vector<std::string>{"exe"} : std::vector<std::string>{}, "");
                         if (!path.empty()) { g_scLangPath = path; saveScLangPath(); }
                     }
                     if (g_scEngine.embedded()) ImGui::EndDisabled();
-                    ImGui::TextDisabled("Choose sclang.exe from the CAW SuperCollider build. CAW embeds libscsynth and shares its PortAudio output with Csound and PD.");
+                    ImGui::TextDisabled(plat::isWindows ? "Choose sclang.exe from the CAW SuperCollider build. CAW embeds libscsynth and shares its PortAudio output with Csound and PD." : "Choose sclang from CAW's SuperCollider build (~/.caw_deps/supercollider/runtime-x64/SuperCollider/sclang). A normal SuperCollider install does not work.");
                     row("SuperCollider synthesis library");
                     if (g_scEngine.embedded()) ImGui::BeginDisabled();
                     ImGui::SetNextItemWidth(S(330));
@@ -2196,7 +2197,7 @@ void drawSettings() {
                     ImGui::SameLine();
                     if (ImGui::Button("Auto##scsynthlib")) { g_scSynthPath.clear(); saveScSynthPath(); }
                     if (g_scEngine.embedded()) ImGui::EndDisabled();
-                    ImGui::TextDisabled("Usually libscsynth.dll beside sclang.exe. Auto finds it in CAW's cached build/runtime folders.");
+                    ImGui::TextDisabled(plat::isWindows ? "Usually libscsynth.dll beside sclang.exe. Auto finds it in CAW's cached build/runtime folders." : "Usually libscsynth.so / .dylib beside sclang. Auto finds it in ~/.caw_deps/supercollider.");
                 }
                 if (g_langPd) {
                     static std::string pdTestResult;
@@ -2207,7 +2208,7 @@ void drawSettings() {
                     if (inputStr("##pd_library", g_pdLibraryPath, 0)) { savePdLibraryPath(); pdTestResult.clear(); }
                     ImGui::SameLine();
                     if (ImGui::Button("Browse##pdlib")) {
-                        const auto path = plat::chooseFile(false, "Choose libpd library", "Library", {"dll", "so", "dylib"}, "");
+                        const auto path = plat::chooseFile(false, "Choose libpd library", "Library", plat::isWindows ? std::vector<std::string>{"dll"} : plat::isMac ? std::vector<std::string>{"dylib"} : std::vector<std::string>{"so"}, "");
                         if (!path.empty()) { g_pdLibraryPath = path; savePdLibraryPath(); pdTestResult.clear(); }
                     }
                     ImGui::SameLine();
