@@ -62,11 +62,14 @@ struct IPlugin {
     virtual const std::vector<PluginParam>& params() const = 0;
     virtual void setParam(int index, double normalized) = 0;
     virtual double getParam(int index) const = 0;
-    // The plugin's own window (Windows). Used to look at the plugin and to "learn" a parameter: turn a knob, takeTouchedParam() says which one.
+    // The plugin's own window (Windows: HWND, macOS: NSView, Linux: X11). Used to look at the plugin and to "learn" a parameter: turn a knob, takeTouchedParam() says which one.
     virtual bool showEditor(const std::string& title, std::string& err) = 0;
     // Close the plugin's own window; showEditor() opens it again. The plugin keeps its settings
     // (used to reattach an editor after a DPI mode change, or when its window drew wrong).
     virtual void closeEditor() {}
+    // macOS / Linux: service the editor window (its close button, a user resize). Called every UI
+    // frame on the UI thread. Windows windows get their messages through the message loop instead.
+    virtual void pumpEditor() {}
     virtual bool editorVisible() const = 0;
     virtual void setLearnEnabled(bool enabled) = 0;
     virtual int takeTouchedParam() = 0;                    // plugin parameter index touched in the editor since the last call, or -1

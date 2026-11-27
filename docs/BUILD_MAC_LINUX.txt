@@ -1,5 +1,7 @@
-CAW - BUILD INSTRUCTIONS FOR macOS AND LINUX
-============================================
+CAW - BUILD INSTRUCTIONS FOR macOS AND LINUX (short version)
+============================================================
+The full, current guide is "HOW to Build.md" (and "HOW to Build detailed.md") in the project folder.
+
 
 Source: caw_clean.zip (the clean version with all changes).
 The first build needs internet: it downloads ImGui, PortAudio, GLFW and the
@@ -62,8 +64,8 @@ PART 1 - macOS
    - System Settings > Privacy & Security > Microphone: allow CAW if you
      use audio input.
    - VST3 plugins load from /Library/Audio/Plug-Ins/VST3 and
-     ~/Library/Audio/Plug-Ins/VST3. They play, but plugin WINDOWS do not open
-     yet on macOS (needs Mac window code - next step after the build works).
+     ~/Library/Audio/Plug-Ins/VST3. "Open" in the VST panel shows the plugin's
+     own editor in a Cocoa window (new - not tested yet).
 
 
 ------------------------------------------------------------
@@ -123,7 +125,8 @@ WHAT TO EXPECT
   macOS / Linux build will most likely show a few errors. Send the log,
   I fix them, you build again - repeat until it builds.
 - Known limits on macOS / Linux (for now):
-    * VST plugin windows do not open (plugins still play).
+    * VST plugin editor windows are new on macOS (Cocoa) and Linux (X11) and
+      not tested yet. Linux needs an X11 or XWayland session for them.
     * A crashing plugin crashes CAW (on Windows CAW catches it).
     * Csound, Pure Data, SuperCollider and FFmpeg must be installed
       separately and set in Settings > Programs.

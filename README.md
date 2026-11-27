@@ -5,7 +5,8 @@ A timeline DAW where every clip is **code**. Csound, Pure Data, SuperCollider, V
 - **Engines:** Csound (libcsound64) · Pure Data (libpd) · SuperCollider (libscsynth)· host engine (two seperated engines; one for *.vst3 (effects and instrument) and another for sample tracks. + master host).
 - **Live coding:** edit a clip while it plays, press **Run** (Alt+Enter), and the engine takes the new code at once (some functions are not live)
 - **Virtual soundcard:** projects can be 1–64 channels; anything wider than your audio setting folds down (channel k → k mod N)
-- **Platforms:** Windows (main). macOS and Linux build with `build.sh` (see *Build*)
+- **VST3 host:** VST3 instruments and effects, with their own editor windows on every system: Windows (HWND), macOS (Cocoa) and Linux (X11)
+- **Platforms:** Windows (main, tested). macOS and Linux build with `build.sh` (see *Build*); the Linux build runs, macOS and the Linux/macOS editor windows are new and not tested yet
 
 ---
 
@@ -163,6 +164,22 @@ out2 = in1
 every 0.1 { play: rnd(10), 0.2, 1, rnd(4) + 1 }   # granular: start (s), duration, speed (<0 = reverse), output channel
 ```
 
+### VST plugins
+
+Pick a plugin in the track's VST panel. **Open / Show** opens the plugin's own **editor window**, with its knobs and graphics. Closing it keeps the plugin, its sound and its settings.
+
+- Knob moves in the editor reach the sound live, and are saved with the project.
+- **Parameter mapping…** picks up to 8 parameters as `P1`…`P8`. They can then be driven from CAW code, automation lanes and MIDI CC.
+- **Learn:** arm a slot, then turn a knob in the editor; that parameter becomes the slot.
+
+| System | Editor window | Plugin folders scanned |
+|---|---|---|
+| Windows | native window (HWND) | `C:\Program Files\Common Files\VST3`, `%LOCALAPPDATA%\Programs\Common\VST3` |
+| macOS | Cocoa window (NSView) | `/Library/Audio/Plug-Ins/VST3`, `~/Library/Audio/Plug-Ins/VST3` |
+| Linux | X11 window (X11 or XWayland) | `~/.vst3`, `/usr/lib/vst3`, `/usr/local/lib/vst3` |
+
+You can add more folders in **Settings → Programs → VST3**. A plugin has to be built for the system it runs on: a Windows `.vst3` doesn't load on Linux or macOS.
+
 ### VST output routing
 
 **Routing…** in the VST panel maps plugin channels to track outputs. Press **Run** (or Ctrl+Enter) to apply it live:
@@ -273,7 +290,9 @@ Named streams can be set up under **Edit cawscore**. A signal stream is plotted 
 
 ## Build
 
-**The full step-by-step guide is in [HOW to Build.md](HOW%20to%20Build.md).** It covers Windows, Linux and macOS, the engines (Csound 7, Pure Data, SuperCollider), the Windows installer and common errors.
+**Build guides:**
+- **[HOW to Build.md](HOW%20to%20Build.md)**: the short version, the commands for Windows, Linux and macOS.
+- **[HOW to Build detailed.md](HOW%20to%20Build%20detailed.md)**: every step, what each script does, where files go, and the common errors with their fixes.
 
 Short version:
 
@@ -282,7 +301,11 @@ Short version:
 | Windows | `build.bat` | `tools\windows\BUILD-CSOUND.bat`, `BUILD-LIBPD.bat`, `BUILD-LIBSCSYNTH.bat` |
 | Linux / macOS | `./build.sh` | `tools/unix/build-engines.sh` |
 
-The VST3 SDK, Dear ImGui, PortAudio and GLFW are downloaded and built by CAW's own build. CAW runs without the engines; only their tracks are unavailable.
+**Packages with everything inside:** Windows `installer\` (Inno Setup `.exe`) · Linux `installer/linux/` (AppImage) · macOS `installer/macos/` (`.dmg`).
+
+The VST3 SDK, Dear ImGui, PortAudio and GLFW are downloaded and built by CAW's own build, including the plugin editor windows (X11 on Linux, Cocoa on macOS). CAW runs without the engines; only their tracks are unavailable.
+
+**Current limits on macOS / Linux:** a crashing plugin crashes CAW (on Windows CAW catches it). The macOS build, the Linux/macOS plugin editor windows and the Linux/macOS packages are new and not tested yet.
 
 ---
 

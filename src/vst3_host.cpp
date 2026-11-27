@@ -40,6 +40,9 @@
 #include "pluginterfaces/vst/ivstevents.h"
 #include "pluginterfaces/vst/ivstmidicontrollers.h"
 #include "crash_dump.h"   // cawcrash::sehSwallowRecord: a faulting plugin is recorded, not fatal
+#if !defined(_WIN32)
+#include "vst_editor_native.h"   // the plugin editor window on macOS (Cocoa) / Linux (X11)
+#endif
 using namespace Steinberg; using namespace Steinberg::Vst;
 
 // ---- SEH trampolines for the plugin-facing calls -------------------------------------------
@@ -238,6 +241,72 @@ public:
 };
 #endif
 
+#if defined(__linux__)
+// Linux VST3: the host must offer Steinberg::Linux::IRunLoop through the IPlugFrame. Plugin editors
+// (VSTGUI, JUCE...) register their X11 connection's file descriptor and their redraw timers here;
+// without it they open blank or never animate. CAW runs it from the UI thread every frame.
+#include <sys/select.h>
+#include <chrono>
+class CawRunLoop : public Steinberg::Linux::IRunLoop {
+public:
+    tresult PLUGIN_API registerEventHandler(Steinberg::Linux::IEventHandler* h, Steinberg::Linux::FileDescriptor fd) override {
+        if (!h) return kInvalidArgument;
+        h->addRef(); fds_.push_back({h, fd}); return kResultTrue;
+    }
+    tresult PLUGIN_API unregisterEventHandler(Steinberg::Linux::IEventHandler* h) override {
+        bool any = false;
+        for (auto it = fds_.begin(); it != fds_.end();) { if (it->h == h) { it->h->release(); it = fds_.erase(it); any = true; } else ++it; }
+        return any ? kResultTrue : kInvalidArgument;
+    }
+    tresult PLUGIN_API registerTimer(Steinberg::Linux::ITimerHandler* h, Steinberg::Linux::TimerInterval ms) override {
+        if (!h) return kInvalidArgument;
+        h->addRef(); timers_.push_back({h, std::max<Steinberg::uint64>(1, ms), now() + ms}); return kResultTrue;
+    }
+    tresult PLUGIN_API unregisterTimer(Steinberg::Linux::ITimerHandler* h) override {
+        bool any = false;
+        for (auto it = timers_.begin(); it != timers_.end();) { if (it->h == h) { it->h->release(); it = timers_.erase(it); any = true; } else ++it; }
+        return any ? kResultTrue : kInvalidArgument;
+    }
+    // One pass: every ready file descriptor, then every due timer. Never blocks.
+    void run() {
+        if (!fds_.empty()) {
+            fd_set set; FD_ZERO(&set); int maxFd = -1;
+            for (const auto& f : fds_) if (f.fd >= 0 && f.fd < FD_SETSIZE) { FD_SET(f.fd, &set); maxFd = std::max(maxFd, f.fd); }
+            if (maxFd >= 0) {
+                timeval tv{0, 0};
+                if (select(maxFd + 1, &set, nullptr, nullptr, &tv) > 0) {
+                    const auto snapshot = fds_;   // a handler may unregister itself
+                    for (const auto& f : snapshot) if (f.fd >= 0 && f.fd < FD_SETSIZE && FD_ISSET(f.fd, &set)) f.h->onFDIsSet(f.fd);
+                }
+            }
+        }
+        const Steinberg::uint64 t = now();
+        const auto snapshot = timers_;
+        for (const auto& tm : snapshot) {
+            if (t < tm.next) continue;
+            for (auto& live : timers_) if (live.h == tm.h) live.next = t + live.ms;
+            tm.h->onTimer();
+        }
+    }
+    bool empty() const { return fds_.empty() && timers_.empty(); }
+    tresult PLUGIN_API queryInterface(const TUID _iid, void** obj) override {
+        QUERY_INTERFACE(_iid, obj, FUnknown::iid, Steinberg::Linux::IRunLoop)
+        QUERY_INTERFACE(_iid, obj, Steinberg::Linux::IRunLoop::iid, Steinberg::Linux::IRunLoop)
+        *obj = nullptr; return kNoInterface;
+    }
+    uint32 PLUGIN_API addRef() override { return 1000; }      // owned by the EditorHandler
+    uint32 PLUGIN_API release() override { return 1000; }
+private:
+    struct Fd { Steinberg::Linux::IEventHandler* h; Steinberg::Linux::FileDescriptor fd; };
+    struct Tm { Steinberg::Linux::ITimerHandler* h; Steinberg::uint64 ms; Steinberg::uint64 next; };
+    static Steinberg::uint64 now() {
+        return (Steinberg::uint64)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    std::vector<Fd> fds_;
+    std::vector<Tm> timers_;
+};
+#endif
+
 // What the plugin calls back while its window is open: which parameter the user touches, and "please resize my window".
 class EditorHandler : public IComponentHandler, public IPlugFrame {
 public:
@@ -282,8 +351,14 @@ public:
         QUERY_INTERFACE(_iid, obj, FUnknown::iid, IComponentHandler)
         QUERY_INTERFACE(_iid, obj, IComponentHandler::iid, IComponentHandler)
         QUERY_INTERFACE(_iid, obj, IPlugFrame::iid, IPlugFrame)
+#if defined(__linux__)
+        if (FUnknownPrivate::iidEqual(_iid, Steinberg::Linux::IRunLoop::iid)) { *obj = static_cast<Steinberg::Linux::IRunLoop*>(&runLoop); return kResultOk; }
+#endif
         *obj = nullptr; return kNoInterface;
     }
+#if defined(__linux__)
+    CawRunLoop runLoop;   // offered to the plugin's editor (see CawRunLoop)
+#endif
     uint32 PLUGIN_API addRef() override { return 1000; }      // lives as long as the plugin object: never deleted by the plugin
     uint32 PLUGIN_API release() override { return 1000; }
 };
@@ -366,6 +441,10 @@ public:
         if (hwnd_) { DestroyWindow(hwnd_); hwnd_ = nullptr; }
         lastScale_ = 0.f; lastWidth_ = lastHeight_ = -1;
         vstLog("editor: closed (reattach)");
+#else
+        if (view_) { view_->setFrame(nullptr); if (viewAttached_) view_->removed(); viewAttached_ = false; view_ = nullptr; }
+        if (edWin_) { cawed::destroy(edWin_); edWin_ = nullptr; }
+        vstLog("editor: closed");
 #endif
     }
     ~Vst3Plugin() override {
@@ -991,7 +1070,7 @@ public:
 #ifdef _WIN32
         return hwnd_ && IsWindowVisible(hwnd_);
 #else
-        return false;
+        return edWin_ && cawed::visible(edWin_);
 #endif
     }
     void setLiveEditHook(std::function<void(int, double)> hook) override { liveHook_ = std::move(hook); }
@@ -1106,9 +1185,88 @@ public:
         ShowWindow(hwnd_, SW_SHOW); SetForegroundWindow(hwnd_);
         return true;
 #else
-        err = "the plugin window is only available on Windows for now"; return false;
+#if defined(__APPLE__)
+        const FIDString platform = kPlatformTypeNSView;
+#else
+        const FIDString platform = kPlatformTypeX11EmbedWindowID;
+#endif
+        if (!ctrl_) { err = "this plugin has no controller"; return false; }
+        if (!view_) {
+            handler_.indexOf = [this](ParamID id) { const auto it = paramIndexById_.find(id); return it == paramIndexById_.end() ? -1 : it->second; };
+            seh_setComponentHandler(ctrl_.get(), &handler_);
+            Steinberg::IPlugView* view = nullptr;
+            if (!seh_createView(ctrl_.get(), ViewType::kEditor, &view) || !view) {
+                err = "The plugin did not provide an editor. Use its parameters in CAW's panel.";
+                return false;
+            }
+            view_ = owned(view);
+            if (view_->isPlatformTypeSupported(platform) != kResultTrue) {
+                view_ = nullptr;
+                err = "This plugin's editor does not support this system's windows.";
+                return false;
+            }
+            ViewRect initial{0, 0, 400, 300};
+            view_->getSize(&initial);
+            int w = initial.right - initial.left, h = initial.bottom - initial.top;
+            if (w <= 0 || h <= 0 || w > 16384 || h > 16384) { w = 400; h = 300; }
+            edResizable_ = view_->canResize() == kResultTrue;
+            vstLog("editor: create window " + std::to_string(w) + "x" + std::to_string(h) + (edResizable_ ? " (resizable)" : ""));
+            edWin_ = cawed::create(title.c_str(), w, h, edResizable_);
+            if (!edWin_) { view_ = nullptr; err = "could not create the window (no display?)"; return false; }
+            lastWidth_ = w; lastHeight_ = h;
+            handler_.resize = [this](IPlugView* v, ViewRect* r) -> tresult {
+                if (!view_ || v != view_.get() || !r || !edWin_) return kResultFalse;
+                const int nw = r->right - r->left, nh = r->bottom - r->top;
+                if (nw <= 0 || nh <= 0 || nw > 16384 || nh > 16384) return kResultFalse;
+                cawed::resize(edWin_, nw, nh, edResizable_);
+                lastWidth_ = nw; lastHeight_ = nh;
+                ViewRect done{0, 0, nw, nh};
+                if (viewAttached_) view_->onSize(&done);
+                return kResultOk;
+            };
+            view_->setFrame(&handler_);
+            viewAttached_ = true;   // a plugin may call resizeView synchronously during attached()
+            if (view_->attached(cawed::nativeHandle(edWin_), platform) != kResultOk) {
+                viewAttached_ = false; view_->setFrame(nullptr); view_ = nullptr;
+                cawed::destroy(edWin_); edWin_ = nullptr;
+                err = "the plugin refused to open its window"; return false;
+            }
+            ViewRect r{0, 0, lastWidth_, lastHeight_};
+            view_->onSize(&r);
+            vstLog("editor: attached");
+        }
+        cawed::setTitle(edWin_, title.c_str());
+        cawed::show(edWin_);
+        return true;
 #endif
     }
+#if !defined(_WIN32)
+    // Called every UI frame (vstui::pumpEditorWindows): the window's close button and a user
+    // resize reach the plugin here, on the UI thread, outside the plugin's own callbacks.
+    void pumpEditor() override {
+#if defined(__linux__)
+        handler_.runLoop.run();   // the plugin's display fd + redraw timers (they may also run while closing)
+#endif
+        if (!edWin_) return;
+        int w = 0, h = 0;
+        const int f = cawed::poll(edWin_, &w, &h);
+        if (f & 1) { touchEditor(); closeEditor(); return; }   // closed: the instance and its patch stay
+        if ((f & 2) && view_ && viewAttached_) {
+            std::lock_guard<std::mutex> api(editorApiMutex_);
+            ViewRect r{0, 0, w, h};
+            if (view_->checkSizeConstraint(&r) == kResultTrue) {
+                const int cw = r.right - r.left, ch = r.bottom - r.top;
+                if (cw != w || ch != h) cawed::resize(edWin_, cw, ch, edResizable_);
+                w = cw; h = ch;
+            }
+            if (w != lastWidth_ || h != lastHeight_) {
+                lastWidth_ = w; lastHeight_ = h;
+                ViewRect done{0, 0, w, h};
+                view_->onSize(&done);
+            }
+        }
+    }
+#endif
     // SEPARATED ENGINES: the full component state (Kontakt's loaded .nki, an FX preset, GUI-only
     // state - binary, NOT expressible as parameters). Captured from the EDITOR instance and
     // applied to the ENGINE instance (at engine creation via VstJob::stateBlob, or between blocks
@@ -1168,6 +1326,12 @@ private:
     std::chrono::steady_clock::time_point nextLearnPoll_{};
     EditorHandler handler_;
     Steinberg::IPtr<IPlugView> view_;
+#if !defined(_WIN32)
+    cawed::EdWin* edWin_ = nullptr;   // the native editor window (Cocoa / X11)
+    bool edResizable_ = false;
+    bool viewAttached_ = false;
+    int lastWidth_ = -1, lastHeight_ = -1;
+#endif
 #ifdef _WIN32
     HWND hwnd_ = nullptr;
     bool viewAttached_ = false, resizing_ = false;

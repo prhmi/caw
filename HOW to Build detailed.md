@@ -1,6 +1,8 @@
-# How to build CAW
+# How to build CAW (detailed)
 
-This guide builds CAW and the sound engines it uses, on **Windows**, **Linux** and **macOS**.
+This is the **detailed** guide: every step, with what each script does inside. For the short version, see [HOW to Build.md](HOW%20to%20Build.md).
+
+It builds CAW and the sound engines it uses, on **Windows**, **Linux** and **macOS**.
 
 CAW is one program. The engines are libraries it loads **at run time**, so you can build CAW first and add the engines later:
 
@@ -13,7 +15,7 @@ CAW is one program. The engines are libraries it loads **at run time**, so you c
 
 The engines are **independent**. Each is a separate library with its own build script, so build only those you need, one at a time. On Linux/macOS, `build-engines.sh` can also run all three in one go. Without an engine, CAW still runs; its tracks just say the engine wasn't found. VST and sample tracks need no engine.
 
-> **Status:** the Windows build of CAW is the tested one. The Linux build of CAW has been built and run on Ubuntu 24.10. The engine scripts for Windows, the Linux SuperCollider script and everything on macOS are new and not fully tested yet. If a step fails, the log tells you why (see [When something fails](#when-something-fails)).
+> **Status:** the Windows build of CAW is the tested one. The Linux build of CAW has been built and run on Ubuntu 24.10. These parts are new and not fully tested yet: the engine scripts for Windows, the Linux SuperCollider script, the VST3 editor windows on Linux (X11) and macOS (Cocoa), the Linux/macOS packages, and everything on macOS. If a step fails, the log tells you why (see [When something fails](#when-something-fails)).
 
 ---
 
@@ -251,7 +253,25 @@ To fix a failed one, run its own script again; the output is easier to read that
 
 **After any engine script:** close CAW completely and start it again, because it looks for the engines only when it starts.
 
-### 2.4 VST3 plugins
+### 2.4 Linux package (optional)
+
+Makes **one file**, `CAW-<version>-x86_64.AppImage`, that contains CAW and the engines, so users install nothing else.
+
+1. Build CAW (2.2) and the engines (2.3).
+2. Run:
+   ```bash
+   cd installer/linux
+   chmod +x *.sh
+   ./1-prepare.sh          # collects caw, Csound, libpd, SuperCollider into stage/CAW
+   ./2-build-appimage.sh   # packs it with linuxdeploy (downloaded once)
+   ```
+3. The file is in **`installer/linux/Output/`**. Users run `chmod +x CAW-*.AppImage` and start it.
+
+`1-prepare.sh` warns about anything missing, the same as `1-PREPARE` on Windows. Instead of the AppImage, `./2-build-tarball.sh` makes a `.tar.gz` folder. That version needs the system packages from 2.1 on the target PC.
+
+Build the AppImage on the **oldest** Linux you want to support: it runs on that glibc version and newer ones.
+
+### 2.5 VST3 plugins
 
 Nothing to build: the VST3 SDK is inside `caw`. You need **Linux** `.vst3` plugins (Windows plugins don't load). CAW scans:
 - `~/.vst3`
@@ -260,7 +280,13 @@ Nothing to build: the VST3 SDK is inside `caw`. You need **Linux** `.vst3` plugi
 
 To test, install `sudo apt install lsp-plugins-vst3`.
 
-### 2.5 Running in VirtualBox
+**Editor windows:** **Open** in the VST panel shows the plugin's own editor in an **X11** window (`src/vst_editor_x11.cpp`). This needs `libx11-dev` at build time, which is in the 2.1 list. At run time it needs an X11 or XWayland session; Ubuntu's Wayland desktop has XWayland on by default.
+
+CAW also gives plugins the Linux **run loop** (`IRunLoop`), which they use for redrawing and timers. Without it, most editors would open blank.
+
+If an editor opens empty, send the `editor:` lines from `caw_vst_log.txt`.
+
+### 2.6 Running in VirtualBox
 
 - **No window or an OpenGL error:** shut the VM down, then **Settings → Display → Enable 3D Acceleration**. Or start CAW with `LIBGL_ALWAYS_SOFTWARE=1 ./build/caw`.
 - **No sound:** **Settings → Audio → Enable Audio Output**, then choose the device in CAW.
@@ -305,13 +331,31 @@ SC_TAG=Version-3.13.0 ./build-supercollider.sh # SuperCollider (libscsynth.dylib
 
 The results are `.dylib` files instead of `.so`; the folders are the same as on Linux. Csound installs to `/usr/local`. On Apple Silicon Homebrew lives in `/opt/homebrew`, but the scripts handle that.
 
-### 3.4 VST3 plugins
+### 3.4 macOS package (optional)
+
+Makes **`CAW-<version>.dmg`**: users open it and drag CAW to Applications. The engines are inside the app.
+
+1. Build CAW (3.2) and the engines (3.3).
+2. Run:
+   ```bash
+   cd installer/macos
+   chmod +x *.sh
+   ./1-prepare.sh       # copies the engines into CAW.app/Contents/Resources and bundles Homebrew's libraries
+   ./2-build-dmg.sh
+   ```
+3. The file is in **`installer/macos/Output/`**.
+
+The app is signed ad hoc, so users right‑click **CAW** → **Open** the first time. Signing with an Apple Developer ID and notarizing removes that step (see `installer/macos/README.md`).
+
+### 3.5 VST3 plugins
 
 CAW scans these folders for **macOS** `.vst3` plugins:
 - `~/Library/Audio/Plug-Ins/VST3`
 - `/Library/Audio/Plug-Ins/VST3`
 
-### 3.5 Permissions
+**Editor windows:** **Open** in the VST panel shows the plugin's own editor in a **Cocoa** window (`src/vst_editor_mac.mm`, compiled as Objective‑C++ with ARC). Nothing extra to install: Xcode's tools include Cocoa.
+
+### 3.6 Permissions
 
 **System Settings → Privacy & Security → Microphone:** allow CAW if you use audio input.
 
@@ -384,11 +428,14 @@ Deleting `.caw_deps` makes the next build download everything again.
 | `CMakeCache.txt directory ... does not match the source` | the build folder came from another path | delete `build/`, or let `build.bat` reconfigure it |
 | `apt update`: `no longer has a Release file` | an old Ubuntu version | see Ubuntu 24.10 in 2.1 |
 | `LoadLibraryW failed ... module could not be found` (a plugin) | a DLL the plugin needs is missing | put the plugin's DLLs (for example Csound's) on PATH or beside it |
+| `Could NOT find X11` (Linux, configure) | the X11 development files are missing | `sudo apt install libx11-dev` |
+| plugin editor opens **blank** (Linux) | the plugin needs something CAW's run loop doesn't give it | send the `editor:` lines from `caw_vst_log.txt` |
+| `This plugin's editor does not support this system's windows` | the plugin has no X11 / Cocoa editor | use its parameters in CAW's panel |
 | no window on Linux in a VM | no OpenGL 3 | VirtualBox 3D acceleration, or `LIBGL_ALWAYS_SOFTWARE=1` |
 
 **Current limits on Linux / macOS:**
-- Plugin windows don't open (plugins still play and are controlled from CAW's panel).
+- The VST3 editor windows are new (Cocoa on macOS, X11 on Linux) and not tested yet. On Linux, CAW needs an X11 or XWayland session for them.
 - A crashing plugin crashes CAW (on Windows CAW catches it).
-- There's no installer yet (AppImage / `.dmg` are planned).
+- The Linux and macOS packages are new and untested; report problems with the step 1 output.
 
 When you report a problem, include the system, the step, and the log lines above.

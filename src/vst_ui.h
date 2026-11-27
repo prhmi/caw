@@ -993,7 +993,21 @@ inline void serviceLearn(Project& project) {
 #endif
 }
 
+// macOS / Linux: the plugin editor windows are native windows outside CAW's GLFW window. Their
+// close button and user resizes are read here, once per UI frame, on the UI thread.
+inline void pumpEditorWindows() {
+#if defined(CAW_VST3) && !defined(_WIN32)
+    std::vector<std::shared_ptr<caw::IPlugin>> open;
+    {
+        std::lock_guard<std::mutex> lk(slotsMutex());
+        for (auto& kv : slots()) if (kv.second.plugin) open.push_back(kv.second.plugin);
+    }
+    for (auto& p : open) { try { p->pumpEditor(); } catch (...) {} }
+#endif
+}
+
 inline void drawWindows(Project& proj) {
+    pumpEditorWindows();
     for (Track& t : proj.tracks) {
         if (t.kind != 3 && t.kind != 4) continue;
         Slot& s = slots()[slotKey(t.id, 0)];   // the panel's own state lives on the stage-0 slot

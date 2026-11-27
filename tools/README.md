@@ -3,8 +3,10 @@
 ```
 tools/
 ├── supercollider/   CAW's SuperCollider driver + patch (shared by all systems)
-├── unix/            Linux / macOS: build-engines.sh (Csound 7, libpd, SuperCollider)
-└── windows/         Windows: BUILD-LIBSCSYNTH.bat, BUILD-LIBPD.bat
+├── unix/            Linux / macOS: build-csound.sh, build-libpd.sh, build-supercollider.sh, build-engines.sh (all three)
+└── windows/         Windows: BUILD-CSOUND.bat, BUILD-LIBPD.bat, BUILD-LIBSCSYNTH.bat
 ```
 
-The VST3 SDK isn't here. CAW's own CMake build downloads and compiles it on every system.
+Each engine is a separate library with its own script. See **HOW to Build detailed.md** for every step.
+
+The VST3 SDK and the plugin editor windows aren't here. CAW's own CMake build downloads and compiles them on every system.
