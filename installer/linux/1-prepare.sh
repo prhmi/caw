@@ -42,8 +42,10 @@ else
 fi
 
 step "Pure Data (libpd)"
-pd=""; [ -f "$HOME/.caw_libpd_path" ] && pd="$(head -1 "$HOME/.caw_libpd_path")"
-[ -f "$pd" ] || pd="$deps/libpd/libpd.so"
+pd=""; [ -f "$HOME/.caw_libpd_path" ] && pd="$(head -1 "$HOME/.caw_libpd_path" | tr -d '\r' | sed 's/[[:space:]]*$//')"
+for c in "$deps/libpd/libpd.so" "$deps/libpd/source/libs/libpd.so" "$HOME/libpd/libs/libpd.so"; do
+  [ -f "$pd" ] && break; pd="$c"
+done
 if [ -f "$pd" ]; then
   mkdir -p "$stage/PureData"; cp -L "$pd" "$stage/PureData/libpd.so"
   nm -D --defined-only "$stage/PureData/libpd.so" | grep -q libpd_new_instance || warn "this libpd is not MULTI=true - CAW refuses it"

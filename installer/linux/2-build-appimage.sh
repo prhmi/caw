@@ -19,7 +19,7 @@ if [ ! -x "$ld" ]; then
 fi
 
 app="$here/AppDir"; rm -rf "$app"
-mkdir -p "$app/usr/bin" "$app/usr/lib/caw" "$app/usr/share/applications" "$app/usr/share/icons/hicolor/256x256/apps"
+mkdir -p "$app/usr/bin" "$app/usr/lib/caw" "$app/usr/share/applications"
 cp "$stage/caw" "$app/usr/bin/caw"
 for d in Csound PureData SuperCollider examples; do [ -d "$stage/$d" ] && cp -a "$stage/$d" "$app/usr/lib/caw/"; done
 cp "$stage"/*.txt "$stage"/*.md "$app/usr/lib/caw/" 2>/dev/null || true
@@ -37,7 +37,11 @@ MimeType=application/x-caw-project;
 Terminal=false
 EOF
 icon="$root/res/caw.png"
-[ -f "$icon" ] && cp "$icon" "$app/usr/share/icons/hicolor/256x256/apps/caw.png"
+[ -f "$icon" ] || { echo "[ERROR] $icon is missing (the AppImage needs an icon)."; exit 1; }
+# linuxdeploy checks that the icon's pixel size matches its folder: read it from the PNG header
+px=$(od -An -tu1 -j16 -N4 "$icon" | awk '{print $1*16777216+$2*65536+$3*256+$4}')
+icondir="$app/usr/share/icons/hicolor/${px}x${px}/apps"; mkdir -p "$icondir"
+cp "$icon" "$icondir/caw.png"
 
 # Engine libraries are loaded at run time (dlopen), so linuxdeploy cannot see them: pass them
 # explicitly so their own dependencies (libsndfile, fftw, ...) are bundled too.
@@ -51,9 +55,11 @@ export VERSION APPIMAGE_EXTRACT_AND_RUN=1
 cd "$here"
 "$ld" --appdir "$app" --executable "$app/usr/bin/caw" \
       --desktop-file "$app/usr/share/applications/caw.desktop" \
-      --icon-file "$app/usr/share/icons/hicolor/256x256/apps/caw.png" \
+      --icon-file "$icondir/caw.png" \
       "${extra[@]}" --output appimage
 mkdir -p "$here/Output"
 mv -f "$here"/CAW*.AppImage "$here/Output/" 2>/dev/null || mv -f "$here"/*.AppImage "$here/Output/"
 echo; echo "[SUCCESS] $(ls "$here"/Output/*.AppImage)"
 echo "Users: chmod +x the file, then run it. CAW finds the engines inside it."
+echo "If it says 'dlopen(): error loading libfuse.so.2': sudo apt install libfuse2t64  (Ubuntu 24.04+; libfuse2 on older)"
+echo "  or run it without FUSE:  ./CAW-*.AppImage --appimage-extract-and-run"
