@@ -18,11 +18,11 @@
 
 inline Project g_proj;
 
-inline bool g_langCsound = true, g_langPd = true, g_langSc = true;   // every engine is on by default: DSP starts all of them
+inline bool g_langCsound = true, g_langPd = false, g_langSc = false;
 
 inline bool g_langVst = true;      // VST3 instruments (VSTi, the VST engine) and effects (VSTe, Csound rack)
 
-inline bool g_langAudio = true;    // CAW: sample (the sample-track engine)
+inline bool g_langAudio = false;   // audio tracks (planned: nothing to load yet - kept so the choice round-trips)
 
 inline bool g_chooseLanguages = true, g_languageChoiceMade = false;
 
