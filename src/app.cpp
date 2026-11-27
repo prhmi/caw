@@ -1178,7 +1178,7 @@ bool startPdPatch(const std::string& patch, int clipId, std::string& error) {
         error = "Stop the legacy audio process, test sound, export, or another PD engine before auditioning a PD clip."; return false;
     }
     if (g_pdLibraryPath.empty()) g_pdLibraryPath = plat::bundledLibpd();
-    if (g_pdLibraryPath.empty()) { error = "libpd was not found. Select it in Settings > Programs, or copy libpd.dll (+ libwinpthread-1.dll) into <CAW folder>\\PureData\\."; return false; }
+    if (g_pdLibraryPath.empty()) { error = (plat::isWindows ? std::string("libpd was not found. Select it in Settings > Programs, or copy libpd.dll (+ libwinpthread-1.dll) into <CAW folder>\\PureData\\.") : std::string("libpd was not found. Build it with tools/unix/build-libpd.sh, or select libpd.so / libpd.dylib in Settings > Programs.")); return false; }
     if (g_proj.cs.outDev == -2) { error = "Select an audio output in Settings > Audio."; return false; }
     closeScSoloOutput();
     if (!g_pdPreview.start(g_pdLibraryPath, patch, pdAudioSettings())) { error = g_pdPreview.status(); restoreScSoloOutput(); return false; }
@@ -1252,8 +1252,20 @@ std::string writePrivateSclangConf() {
         "# CAW private SuperCollider configuration.\n"
         "# sclang is started with -l <this file>: ONLY the SCClassLibrary shipped with CAW is compiled.\n"
         "# Your own SuperCollider installation, quarks and Extensions are not read and not modified.\n"
-        "includePaths: []\n"
-        "excludePaths:\n";
+        "";
+    // Windows: the class library beside sclang.exe is sclang's own default. macOS / Linux: sclang's
+    // default is the folder compiled in at build time (<prefix>/share/SuperCollider), which may not
+    // hold the class library CAW ships (the "There is a discrepancy" error): name the one beside
+    // sclang explicitly and switch the compiled-in default off.
+    {
+        std::error_code ec;
+        const auto lib = std::filesystem::u8path(scLangExePath()).parent_path() / "SCClassLibrary";
+        if (!plat::isWindows && std::filesystem::is_directory(lib, ec)) {
+            conf += "includePaths:\n  - \"" + forward(lib.u8string()) + "\"\n";
+            conf += "excludeDefaultPaths: true\n";
+        } else conf += "includePaths: []\n";
+    }
+    conf += "excludePaths:\n";
     auto addExclude = [&](const std::string& base) {
         if (!base.empty()) conf += "  - \"" + forward(base) + "/SuperCollider/Extensions\"\n";
     };

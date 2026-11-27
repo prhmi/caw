@@ -98,7 +98,12 @@ cmake -S . -B "$BUILD" -DCMAKE_BUILD_TYPE=Release \
 cmake --build "$BUILD" -j "$JOBS"
 
 step "Collect the runtime"
-rm -rf "$OUT"; mkdir -p "$OUT/SuperCollider"
+rm -rf "$OUT"
+# Install into $OUT (the prefix compiled into sclang / scsynth): share/SuperCollider/SCClassLibrary and
+# lib/SuperCollider/plugins are where they look by default. A runtime without them gives
+# "ERROR: There is a discrepancy" in sclang and missing UGens in scsynth.
+cmake --install "$BUILD"
+mkdir -p "$OUT/SuperCollider"
 R="$OUT/SuperCollider"
 lib=$(find "$BUILD" -name 'libscsynth.so*' -o -name 'libscsynth*.dylib' | grep -v '\.a$' | head -1)
 [ -n "$lib" ] || die "libscsynth was not built"

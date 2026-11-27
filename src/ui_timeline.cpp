@@ -1397,7 +1397,7 @@ void drawTransport() {
                 if (g_pdLibraryPath.empty()) g_pdLibraryPath = plat::bundledLibpd();
                 std::string error;
                 std::vector<pd_timeline::Event> plan;
-                if (g_pdLibraryPath.empty()) playNotice("Choose libpd in Settings > Programs.");
+                if (g_pdLibraryPath.empty()) playNotice(plat::isWindows ? "Choose libpd in Settings > Programs." : "libpd not found: build it with tools/unix/build-libpd.sh, or choose libpd.so in Settings > Programs.", "Choose libpd in Settings > Programs.");
                 else if (!makePdPlan(plan, error, true)) playNotice(error, "PD clip problem: see the log");
                 else {
                     if (!g_audioDevicesReady) refreshAudioDevices(false);

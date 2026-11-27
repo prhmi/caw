@@ -2112,7 +2112,7 @@ void startEngine() {
             return;
         }
         if (g_pdLibraryPath.empty()) g_pdLibraryPath = plat::bundledLibpd();
-        if (g_pdLibraryPath.empty()) { logLine("[caw] libpd was not found. Select it in Settings > Programs, or copy libpd.dll (+ libwinpthread-1.dll) into <CAW folder>\\PureData\\."); return; }
+        if (g_pdLibraryPath.empty()) { logLine(plat::isWindows ? "[caw] libpd was not found. Select it in Settings > Programs, or copy libpd.dll (+ libwinpthread-1.dll) into <CAW folder>\\PureData\\." : "[caw] libpd was not found. Build it with tools/unix/build-libpd.sh, or select libpd.so / libpd.dylib in Settings > Programs."); return; }
         int bad=0;
         // Include muted clips, flagged: M / S inside the shared engine is a live replan, never
         // a "clips changed" restart of Csound + PD + the device.

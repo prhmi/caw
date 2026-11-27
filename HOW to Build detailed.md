@@ -424,6 +424,7 @@ Deleting `.caw_deps` makes the next build download everything again.
 | Message | Cause | Fix |
 |---|---|---|
 | `Csound API library not found` / `cannot compile abs or sqrt` | no Csound library found | build or install Csound 7, **restart CAW**, or pick `libcsound64.so` / `csound64.dll` in Settings → Programs |
+| SuperCollider: `ERROR: There is a discrepancy` | sclang compiled a class library that doesn't match it | rebuild with the current `build-libscsynth.sh` (it installs `share/SuperCollider`); CAW now points sclang at the `SCClassLibrary` beside it |
 | CAW says Pure Data / SuperCollider **not found** (Linux / macOS) | the saved path is wrong, or CAW was started before the engine was built | restart CAW; the console prints `[caw] Engine paths: ...` at start and a line for any saved path it rejects. Fix it in **Settings → Programs** or rerun the engine script |
 | `This libpd was not built with MULTI=true` | an ordinary libpd | build it with the script (`make MULTI=true`) |
 | `missing CAW's host-pump entry points` / `old CAW audio ABI` | a normal or old SuperCollider | build CAW's SuperCollider (section 4) |

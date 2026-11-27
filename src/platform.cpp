@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <filesystem>
 
 #ifdef _WIN32
@@ -82,17 +83,31 @@ std::string bundledLibpd() {
     // macOS / Linux packages (AppImage, CAW.app, the .tar.gz): <caw folder>/PureData/libpd.so|.dylib,
     // or ../Resources/PureData (inside CAW.app), or ../lib/caw/PureData (an installed AppImage tree).
     const std::string own = cawOwnFolder();
-    if (own.empty()) return {};
-    const fs::path dir = fs::u8path(own);
+    const fs::path dir = own.empty() ? fs::path() : fs::u8path(own);
 #ifdef __APPLE__
     const char* name = "libpd.dylib";
 #else
     const char* name = "libpd.so";
 #endif
     std::error_code ec;
-    for (const fs::path& library : {dir / "PureData" / name, dir / name,
-                                    dir.parent_path() / "Resources" / "PureData" / name,
-                                    dir.parent_path() / "lib" / "caw" / "PureData" / name}) {
+    std::vector<fs::path> candidates = {dir / "PureData" / name, dir / name,
+                                        dir.parent_path() / "Resources" / "PureData" / name,
+                                        dir.parent_path() / "lib" / "caw" / "PureData" / name};
+    // the folder tools/unix/build-libpd.sh builds into, and its saved path
+    const std::string home = getEnv("HOME");
+    if (!home.empty()) {
+        const fs::path h = fs::u8path(home);
+        std::ifstream saved(h / ".caw_libpd_path");
+        std::string line;
+        if (saved && std::getline(saved, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\n')) line.pop_back();
+            if (!line.empty()) candidates.push_back(fs::u8path(line));
+        }
+        candidates.push_back(h / ".caw_deps" / "libpd" / name);
+        candidates.push_back(h / ".caw_deps" / "libpd" / "source" / "libs" / name);
+        candidates.push_back(h / "libpd" / "libs" / name);   // a by-hand clone in the home folder
+    }
+    for (const fs::path& library : candidates) {
         ec.clear();
         if (fs::is_regular_file(library, ec) && !ec) return library.u8string();
     }

@@ -12,7 +12,7 @@ A timeline DAW where every clip is **code**. Csound, Pure Data, SuperCollider, V
 
 ## Quick start
 
-1. **Settings → Engines…:** tick the engines you want: **Csound**, **Pure Data**, **SuperCollider**, **CAW: VST**, **CAW: sample**. Only ticked engines start. With none ticked, CAW only edits and makes scores.
+1. **Settings → Engines…:** every engine is ticked by default: **Csound**, **Pure Data**, **SuperCollider**, **CAW: VST**, **CAW: sample**. Untick the ones you don't use, so DSP doesn't start them. With none ticked, CAW only edits and makes scores.
 2. **Settings → Programs:** set the paths to Csound, Pure Data and SuperCollider if CAW didn't find them. VST3 folders are scanned automatically.
 3. **Settings → Audio:** pick the output device, sample rate and channel count (2 = stereo).
 4. Press **DSP** to start the ticked engines. The status at the top right shows **DSP: starting…** and then **DSP: on**.
