@@ -11,12 +11,74 @@ A timeline DAW where every clip is **code**. Csound, Pure Data, SuperCollider, V
 
 ## Quick start
 
-1. **Settings → Programs:** set the paths to Csound, and to Pure Data / SuperCollider if you use them. VST3 folders are scanned automatically.
-2. **Settings → Audio:** pick the output device and the channel count (2 = stereo).
-3. Add a track (**+**), choose its kind, right‑click the lane → **Add clip**, and write its code.
-4. Press **Play**. Edit a clip and press **Run** to hear the change live.
-5. **Automation:** a name used in code with `cawget` appears in the track's **+** menu as a lane. Draw it, or record it with **R**.
-6. **File → Export:** render the project offline (WAV/MP3), as the stereo mixdown or every channel.
+1. **Settings → Engines…:** tick the engines you want: **Csound**, **Pure Data**, **SuperCollider**, **CAW: VST**, **CAW: sample**. Only ticked engines start. With none ticked, CAW only edits and makes scores.
+2. **Settings → Programs:** set the paths to Csound, Pure Data and SuperCollider if CAW didn't find them. VST3 folders are scanned automatically.
+3. **Settings → Audio:** pick the output device, sample rate and channel count (2 = stereo).
+4. Press **DSP** to start the ticked engines. The status at the top right shows **DSP: starting…** and then **DSP: on**.
+5. Add a track (**+**), choose its kind, right‑click the lane → **Add clip**, and write its code.
+6. Press **Play**. Edit a clip and press **Run** (Alt+Enter) to apply the change live.
+7. **Automation:** a name used in code with `cawget` appears in the track's **+** menu as a lane. Draw it, or record it with **R**.
+8. **File → Export → Audio export…:** render the project to WAV, FLAC or MP3, either **offline** or as a **real-time capture** (see [Working with the engines](#working-with-the-engines)).
+
+---
+
+## Working with the engines
+
+### The DSP button
+
+**DSP** starts and stops the sound engines: every engine ticked in **Settings → Engines**, together, mixed into one audio output. Press it again to stop them all.
+
+- **DSP off:**
+  - **Play** still moves the playhead and the timeline runs, but nothing sounds.
+  - A clip's **Run** plays that clip once. If its engine isn't running, Run starts it first.
+- **DSP on:**
+  - **Play** sounds every engine.
+  - **Run** only **applies** the edited code; it doesn't play the clip by itself. A clip that is playing restarts with the new code; otherwise the new code is used the next time the playhead reaches the clip.
+- **A track whose engine isn't ticked** is skipped when you press Play, with a message such as *"Enable SuperCollider in Settings > Engines"*. The other engines still play.
+- **Changing the ticked engines while DSP is on** stops everything. Press DSP again to run the new set.
+- **Locked tracks (LKD)** play their rendered WAV and need no engine.
+
+| Engine | What it plays | Runs |
+|---|---|---|
+| Csound | Csound tracks (one Csound with all clips) | `libcsound64` / `csound64.dll` |
+| Pure Data | PD tracks (one Pd instance per clip) | libpd (`MULTI=true`) |
+| SuperCollider | SC tracks: `sclang` sends to a `scsynth` running inside CAW's audio callback | CAW's `libscsynth` |
+| CAW: VST | VSTi and VSTe tracks (CAW's own VST3 host) | inside CAW |
+| CAW: sample | sample tracks (audio files, grains, CAW code) | inside CAW |
+
+Every engine writes into the same **virtual soundcard**: the project's channels `out1…outN`. That's mixed once, put through the master volume and FX, and sent to the audio device. A device with fewer outputs gets the wider channels folded onto it: `out3 → out1`, `out4 → out2`, and so on.
+
+### Offline render and real-time capture
+
+**File → Export → Audio export…** has two **Render mode**s:
+
+| | **Offline** (faster than real time) | **Real-time capture** |
+|---|---|---|
+| How | each track is rendered on its own by its engine's **offline** pipeline, then CAW mixes the parts into the file | the transport plays once from the start, and the final master mix (every engine live) is recorded |
+| Speed | as fast as the CPU allows | as long as the song |
+| DSP | not needed | needed; the export **starts the ticked engines by itself** and waits for them |
+| Engines | Csound: offline Csound host · PD: C++ host · SuperCollider: **NRT** (`sclang` + `scsynth -N`, so `scsynth` must sit next to `sclang`) · VST and samples: offline rack | exactly what you hear live |
+| Best for | final mixes, long pieces | checking that the file sounds exactly like playback, live input, things that only exist in real time |
+
+Both modes follow the export settings:
+
+| Setting | Meaning |
+|---|---|
+| **Format** | WAV 16/24/32‑bit, FLAC 16/24‑bit, MP3 with bitrate |
+| **Source** | **as virtual** = the master mixdown · **as real routing** = the whole virtual soundcard at the project's channel count, every track at its routed outputs |
+| **Convert** | fold to Mono / Stereo / Quadro (channel k → k mod M) |
+| **Files** | one file, or one mono file per channel |
+| **Channels** | channel count of the file |
+| **Start / End / Tail** | the range, and extra seconds after the last clip |
+
+### Locking a track (LKD)
+
+**LKD** on a track renders it into a WAV, using the same render mode, and **locks** it. A locked track then plays that WAV instead of running its engine:
+- It saves CPU.
+- It keeps a sound fixed while you change other things.
+- It lets a project play on a computer without that engine.
+
+On a **VSTe** track, LKD renders the effect together with its sources. Press LKD again to unlock the track.
 
 ---
 

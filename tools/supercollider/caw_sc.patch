@@ -1,0 +1,56 @@
+diff --git a/lang/CMakeLists.txt b/lang/CMakeLists.txt
+--- a/lang/CMakeLists.txt
++++ b/lang/CMakeLists.txt
+@@ -125,7 +125,7 @@ if(AUDIOAPI STREQUAL "default")
+     endif(APPLE)
+ endif()
+ 
+-if(NOT AUDIOAPI MATCHES "^(jack|coreaudio|portaudio|bela|webaudio)$")
++if(NOT AUDIOAPI MATCHES "^(jack|coreaudio|portaudio|bela|webaudio|external)$")
+     message(FATAL_ERROR "Unrecognised audio API: ${AUDIOAPI}")
+ endif()
+ 
+diff --git a/server/scsynth/CMakeLists.txt b/server/scsynth/CMakeLists.txt
+--- a/server/scsynth/CMakeLists.txt
++++ b/server/scsynth/CMakeLists.txt
+@@ -31,7 +31,7 @@ if(AUDIOAPI STREQUAL "default")
+     endif(APPLE)
+ endif()
+ 
+-if(NOT AUDIOAPI MATCHES "^(jack|coreaudio|portaudio|bela|webaudio)$")
++if(NOT AUDIOAPI MATCHES "^(jack|coreaudio|portaudio|bela|webaudio|external)$")
+     message(FATAL_ERROR "Unrecognised audio API: ${AUDIOAPI}")
+ endif()
+ 
+@@ -148,6 +148,10 @@ elseif (AUDIOAPI STREQUAL webaudio)
+     )
+ endif()
+ 
++if(AUDIOAPI STREQUAL external)
++ list(APPEND scsynth_sources SC_ExternalDriver.cpp)
++endif()
++
+ set (FINAL_BUILD 0) # disable final build for scsynth
+ 
+ if (LIBSCSYNTH)
+@@ -192,6 +196,9 @@ endif()
+ 
+ # Used in SC_Export.h and SC_Unit.h. Must be PRIVATE because we
+ # do not want libscsynth clients to see this definition.
++if(AUDIOAPI STREQUAL external)
++ target_compile_definitions(libscsynth PRIVATE "SC_AUDIO_API=SC_AUDIO_API_EXTERNAL")
++endif()
+ target_compile_definitions(libscsynth PRIVATE BUILDING_SCSYNTH)
+ 
+ target_compile_definitions(libscsynth PUBLIC SC_MEMORY_ALIGNMENT=32)
+diff --git a/server/scsynth/SC_CoreAudio.h b/server/scsynth/SC_CoreAudio.h
+--- a/server/scsynth/SC_CoreAudio.h
++++ b/server/scsynth/SC_CoreAudio.h
+@@ -36,6 +36,7 @@
+ #define SC_AUDIO_API_COREAUDIOIPHONE 5
+ #define SC_AUDIO_API_BELA 6
+ #define SC_AUDIO_API_WEBAUDIO 7
++#define SC_AUDIO_API_EXTERNAL 8
+ 
+ #ifdef SC_IPHONE
+ #    define SC_AUDIO_API SC_AUDIO_API_COREAUDIOIPHONE

@@ -1,0 +1,13 @@
+build/
+caw_build.log
+caw_configure.log
+caw_log.txt
+caw_vst_log.txt
+caw_crash.*
+installer/stage/
+installer/redist/
+installer/Output/
+*.user
+.vs/
+.vscode/
+.DS_Store

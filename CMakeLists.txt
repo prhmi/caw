@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(caw LANGUAGES C CXX)
+if(APPLE)
+  enable_language(OBJCXX)   # the VST3 SDK's macOS module loader (module_mac.mm) is Objective-C++
+endif()
 
 # CMake 4 refuses old projects (PortAudio 19.7 declares CMake 3.1). This lets them configure anyway.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)

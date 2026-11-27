@@ -350,12 +350,35 @@ std::string superColliderSclang() {
         }
     }
     return std::string();
-#elif defined(__APPLE__)
+#else
+    // macOS / Linux: CAW's own SuperCollider runtime first (tools/build-libscsynth.sh installs it in
+    // ~/.caw_deps/supercollider/runtime-x64, or a "SuperCollider" folder next to caw). A normal
+    // SuperCollider install has no CAW host pump (caw_sc_world_new...), so it is only the last resort.
+    std::vector<fs::path> roots;
+    const std::string own = cawOwnFolder();
+    if (!own.empty()) roots.push_back(fs::u8path(own) / "SuperCollider");
+    const std::string home = getEnv("HOME");
+    if (!home.empty()) roots.push_back(fs::u8path(home) / ".caw_deps" / "supercollider" / "runtime-x64");
+    for (const fs::path& root : roots) {
+        ec.clear();
+        if (!fs::is_directory(root, ec) || ec) continue;
+        for (const fs::path& rel : {fs::path("sclang"), fs::path("bin") / "sclang"}) {
+            const fs::path candidate = root / rel;
+            ec.clear();
+            if (fs::is_regular_file(candidate, ec) && !ec) return candidate.u8string();
+        }
+        ec.clear();
+        fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+        for (; !ec && it != end; it.increment(ec)) {
+            if (it.depth() > 6) { it.disable_recursion_pending(); continue; }
+            if (it->is_regular_file(ec) && !ec && it->path().filename() == "sclang") return it->path().u8string();
+        }
+    }
+#if defined(__APPLE__)
     const fs::path app = "/Applications/SuperCollider.app/Contents/MacOS/sclang";
     ec.clear();
     if (fs::is_regular_file(app, ec) && !ec) return app.string();
-    return findOnPath("sclang");
-#else
+#endif
     return findOnPath("sclang");
 #endif
 }
