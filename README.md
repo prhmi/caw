@@ -4,7 +4,7 @@ A timeline DAW where every clip is **code**. Csound, Pure Data, SuperCollider, V
 
 - **Engines:** Csound (libcsound64) · Pure Data (libpd) · SuperCollider (libscsynth)· host engine (two seperated engines; one for *.vst3 (effects and instrument) and another for sample tracks. + master host).
 - **Live coding:** edit a clip while it plays, press **Run** (Alt+Enter), and the engine takes the new code at once (some functions are not live)
-- **Virtual soundcard:** projects can be 1–64 channels; anything wider than your audio setting folds down (channel k → k mod N)
+- **Virtual ouput channels:** projects can be 1–64 channels; anything wider than your audio setting folds down (channel k → k mod N)
 - **VST3 host:** VST3 instruments and effects, with their own editor windows on every system: Windows (HWND), macOS (Cocoa) and Linux (X11)
 - **Platforms:** Windows (main, tested). macOS and Linux build with `build.sh` (see *Build*); the Linux build runs, macOS and the Linux/macOS editor windows are new and not tested yet
 
